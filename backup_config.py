@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Standalone backup watcher configuration for nTof.
+Standalone backup watcher configuration for the P2 SPS beam test.
 Edit the constants below, then run this script to regenerate config/backup_config.json.
 The flask UI's Start Backup button reads that JSON to launch backup_watcher.py.
 """
@@ -9,10 +9,12 @@ The flask UI's Start Backup button reads that JSON to launch backup_watcher.py.
 import json
 import os
 
-SOURCE_DIR     = '/mnt/data/x17/beam_july/'
-EOS_DIR        = '/eos/experiment/ntof/data/x17/july_beam/'
-CERN_PRINCIPAL = 'dneff@CERN.CH'
-GPG_PASS_FILE  = '/home/mx17/.cern_pass.gpg'
+from run_config_beam import BASE_DATA_DIR
+
+SOURCE_DIR     = BASE_DATA_DIR
+EOS_DIR        = '/eos/TODO_SPS/p2_sps_beam/'      # TODO-SPS: EOS destination
+CERN_PRINCIPAL = 'TODO@CERN.CH'                    # TODO-SPS: your CERN principal
+GPG_PASS_FILE  = os.path.expanduser('~/.cern_pass.gpg')  # TODO-SPS: create with gpg --encrypt
 
 CONFIG = {
     # Local top-level data directory

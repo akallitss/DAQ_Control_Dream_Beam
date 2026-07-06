@@ -24,6 +24,7 @@ import threading
 from Server import Server
 import socket
 from common_functions import *
+from sim.fake_dream_daq import run_simulated_daq
 
 
 def main():
@@ -136,9 +137,15 @@ def main():
                             )
                             copy_files_on_the_fly_thread.start()
                         server.send('Dream DAQ starting')
-                        print(f'Starting Dream DAQ with command: {run_command}')
-                        prepare_terminal()
-                        ret = subprocess.call(run_command)
+                        if effective_info.get('simulate'):
+                            # Local test mode: no RunCtrl/FEUs — replay sample fdfs
+                            # into the run directory instead (see sim/fake_dream_daq.py).
+                            ret = run_simulated_daq(sub_run_dir, sub_run_name, run_time,
+                                                    effective_info)
+                        else:
+                            print(f'Starting Dream DAQ with command: {run_command}')
+                            prepare_terminal()
+                            ret = subprocess.call(run_command)
 
                         # while True:
                         #     output = process.stdout.readline()

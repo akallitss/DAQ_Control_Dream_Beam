@@ -15,8 +15,19 @@ import csv
 
 from Server import Server
 from caen_hv_py.CAENHVController import CAENHVController
+from sim.fake_caen import FakeCAENHVController
 
 # from run_config import Config
+
+
+def get_hv_controller(hv_info):
+    """Real CAEN controller, or the simulator when the run config asks for it."""
+    ip_address = hv_info['ip']
+    username = hv_info['username']
+    password = hv_info['password']
+    if hv_info.get('simulate') or ip_address == 'sim':
+        return FakeCAENHVController(ip_address, username, password)
+    return CAENHVController(ip_address, username, password)
 
 
 def main():
@@ -30,12 +41,9 @@ def main():
                 server.send('HV control connected')
                 hv_info = server.receive_json()
 
-                ip_address = hv_info['ip']
-                username = hv_info['username']
-                password = hv_info['password']
                 caen_lock = threading.Lock()
 
-                with CAENHVController(ip_address, username, password) as caen_hv:
+                with get_hv_controller(hv_info) as caen_hv:
                     print('HV Connected')
                     res = server.receive()
                     while 'Finished' not in res:

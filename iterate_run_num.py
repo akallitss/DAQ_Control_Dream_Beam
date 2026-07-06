@@ -14,8 +14,7 @@ from pathlib import Path
 
 from run_config_beam import Config
 
-# BASE_DIR = '/local/home/banco/dylan/Cosmic_Bench_DAQ_Control'
-BASE_DIR = '/home/mx17/PycharmProjects/nTof_x17_DAQ'
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 RUNCONFIG_PY = os.path.join(BASE_DIR, 'run_config_beam.py')
 
 

@@ -12,7 +12,12 @@ Usage:
 
 Config keys (see qa_config.py to generate the JSON):
   runs_dir                : top-level directory containing run_N/ subdirs
-  ntof_x17_dir            : path to the nTof_x17 repository
+  analysis_dir            : path to the repository holding the QA script
+                            ('ntof_x17_dir' still accepted for backward compat)
+  qa_script_rel_path      : QA entry script, relative to analysis_dir
+                            (default: 'ntof_daq_analysis/detector_qa.py')
+  qa_python_rel_path      : python interpreter, relative to analysis_dir
+                            (default: '.venv/bin/python')
   combined_hits_inner_dir : subdir for combined hits files  (default: 'combined_hits_root')
   qa_file_mode            : 'all' | 'first' | 'per_file'   (default: 'all')
                               all      — rerun QA on all accumulated files whenever a new one appears
@@ -79,7 +84,8 @@ def main():
 
 def run_watcher(config: dict, reset_signal_path: Path = None):
     runs_dir       = Path(config['runs_dir'])
-    ntof_x17_dir   = Path(config['ntof_x17_dir'])
+    # 'analysis_dir' is the new generic key; 'ntof_x17_dir' kept for backward compat.
+    analysis_dir   = Path(config.get('analysis_dir') or config['ntof_x17_dir'])
     combined_inner = config.get('combined_hits_inner_dir', 'combined_hits_root')
     mode           = config.get('qa_file_mode', 'all')
 
@@ -95,8 +101,9 @@ def run_watcher(config: dict, reset_signal_path: Path = None):
     if qa_threads is None and cpu_affinity:
         qa_threads = len(cpu_affinity)
 
-    qa_script  = ntof_x17_dir / 'ntof_daq_analysis' / 'detector_qa.py'
-    qa_python  = ntof_x17_dir / '.venv' / 'bin' / 'python'
+    # QA entry point and interpreter, relative to analysis_dir (defaults = nTof layout).
+    qa_script  = analysis_dir / config.get('qa_script_rel_path', 'ntof_daq_analysis/detector_qa.py')
+    qa_python  = analysis_dir / config.get('qa_python_rel_path', '.venv/bin/python')
 
     print(f"[qa_watcher] runs_dir        : {runs_dir}")
     print(f"[qa_watcher] qa_script       : {qa_script}")

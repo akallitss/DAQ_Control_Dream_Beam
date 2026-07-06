@@ -208,3 +208,12 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# P2 SPS: credentials and machine-generated configs (contain local paths / HV creds)
+hv_creds.txt
+.idea/
+config/backup_config.json
+config/pedestal_qa_config.json
+config/processor_config.json
+config/qa_config.json
+config/json_run_configs/

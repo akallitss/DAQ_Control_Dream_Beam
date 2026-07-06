@@ -33,8 +33,8 @@ from run_config_beam import Config, BASE_DATA_DIR
 from get_run_events import get_total_events_for_run
 from monitor import DaqMonitor, fetch_chat_id, get_bot_username
 
-# BASE_DIR = "/home/dylan/PycharmProjects/nTof_x17_DAQ"
-BASE_DIR = "/home/mx17/PycharmProjects/nTof_x17_DAQ"
+# Repo root (parent of flask_app/) — no per-machine edit needed.
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONFIG_TEMPLATE_DIR = f"{BASE_DIR}/config/json_templates"
 CONFIG_RUN_DIR = f"{BASE_DIR}/config/json_run_configs"
 CONFIG_PY_PATH = f"{BASE_DIR}/run_config_beam.py"
@@ -987,8 +987,8 @@ def system_stats():
             except Exception:
                 return None
 
-        ssd = disk_stats('/')          # OS/system SSD
-        hdd = disk_stats('/mnt/data')  # data HDD
+        ssd = disk_stats('/')            # OS/system SSD
+        hdd = disk_stats(BASE_DATA_DIR)  # data disk (from run_config_beam SITE)
         return jsonify({
             "success": True,
             "cpu_cores": cpu_pcts,

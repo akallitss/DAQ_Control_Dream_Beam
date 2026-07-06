@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Standalone processor configuration for nTof.
+Standalone processor configuration for the P2 SPS beam test.
 Edit the constants below, then run this script to regenerate config/processor_config.json.
 The flask UI's Start Processor button reads that JSON to launch processor_watcher.py.
 """
@@ -9,10 +9,10 @@ The flask UI's Start Processor button reads that JSON to launch processor_watche
 import json
 import os
 
-from run_config_beam import BASE_DATA_DIR
+from run_config_beam import BASE_DATA_DIR, RECONSTRUCTION_BUILD
 
-# --- Paths ---
-BASE_SOFT = '/home/mx17/CLionProjects/mm_strip_reconstruction/build/'
+# --- Paths (site-dependent, from run_config_beam SITE switch) ---
+BASE_SOFT = RECONSTRUCTION_BUILD
 BASE_DATA = BASE_DATA_DIR
 
 CONFIG = {

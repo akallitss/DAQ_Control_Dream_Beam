@@ -1,0 +1,281 @@
+================================================================================
+ PLAN: Transition DAQ_Control_Dream_Beam (nTOF x17) -> SPS beam test, P2 detectors
+ Written: 2026-07-06
+ Goal: same DAQ-control architecture (external trigger), reconfigured for P2
+       detectors, testable LOCALLY on this machine first, then deployed on the
+       SPS DAQ computer.
+================================================================================
+
+ARCHITECTURE RECAP (what stays the same)
+----------------------------------------
+The repo is a set of cooperating processes, usually each in its own tmux session
+(start_servers.sh):
+
+  daq_control.py        orchestrator: loops over sub_runs, asks hv_control to
+                        ramp+monitor, asks dream_daq_control to take data
+  hv_control.py         TCP server (port 1100): sets CAEN HV, ramp check,
+                        monitor thread -> hv_monitor.csv per subrun
+  dream_daq_control.py  TCP server (port 1101): builds .cfg from template,
+                        drives Dream RunCtrl, copies fdfs to run_out_dir
+  processor_watcher.py  watches runs/ for new fdfs: decode -> analyze_waveforms
+                        (hit trees) -> combine_feus_hits  (mm_dream_reconstruction
+                        C++ executables)
+  qa_watcher.py         watches combined_hits_root/ and runs a python QA script
+                        per subrun (currently nTof_x17/ntof_daq_analysis/detector_qa.py)
+  pedestal_watcher.py / backup_watcher.py / trigger_logger.py   auxiliaries
+  flask_app/            web GUI: start/stop run, watcher toggles, HV live plot,
+                        run/subrun progress
+
+All of this is generic. What is nTOF-specific and must change:
+  (a) run_config_beam.py   detectors, HV crate + channel map, IPs, paths, trigger
+  (b) processor_config.py  executable paths + data paths
+  (c) qa_config.py         QA repo path + QA entry script (nTOF -> P2)
+  (d) flask_app/app.py     BASE_DIR and BASE_DATA_DIR constants
+  (e) hardware-facing code has no simulation mode -> needed for local testing
+
+================================================================================
+TASK LIST
+================================================================================
+
+--- 1. Site configuration: one place to switch "local test" <-> "SPS machine" ---
+File: run_config_beam.py (keep the filename: processor_config.py, qa_config.py,
+flask_app/app.py, backup_config.py, pedestal_qa_config.py all import it; keeping
+the name minimises the diff against Dylan's upstream repo).
+
+Implementation:
+  * Replace the top constants block with a small SITE switch:
+        SITE = 'local'   # or 'sps'
+        SITES = {
+          'local': dict(base_disk='/local/home/ak271430/Documents/PostDocSaclay/data/sps_p2_test/',
+                        daq_host='127.0.0.1', hv_ip='sim', ...),
+          'sps':   dict(base_disk='/mnt/data/sps/', daq_host=<SPS DAQ ip>,
+                        hv_ip=<CAEN mainframe ip>, ...),
+        }
+    PROJECT = 'p2_sps_beam' ; BASE_DATA_DIR derived from these.
+  * All server IPs (dream_daq_info, processor_info, hv_control_info) come from
+    the SITE entry -> localhost for local testing.
+  * simulate flags (see task 7) also live in the SITE entry so 'local' runs in
+    full simulation and 'sps' talks to real hardware.
+
+--- 2. P2 detector definitions in run_config_beam.py ---
+Source of truth: Cosmic_Bench_DAQ_Control/run_config.py (detector 'P2_1').
+
+Implementation:
+  * Replace the four mx17_A..D detector dicts with the P2 detector(s) for SPS:
+    copy the P2_1 dict (det_type 'P2', dream_feus c_1_bot..c_10_top spread over
+    FEUs, dream_feu_orientation 'rotated_inverted', hv_channels mesh/drift) and
+    adapt FEU/connector numbers + HV card/channel numbers to the SPS cabling.
+  * beam_type = 'sps_beam' (or muons/pions/...), gas, target_type = 'none',
+    trigger = description of the SPS trigger (scintillators?).
+  * sub_runs schedule: start with a simple template (1 short subrun at nominal
+    mesh/drift) plus a commented HV-scan block modeled on the cosmic bench one.
+  * hv_channels: nested per-card dict as in cosmic bench P2 (mesh, drift; plus
+    scintillator/PMT bias channels if HV-powered at SPS).
+  * set_feus_from_detectors stays on; trigger_feu: depends on SPS trigger
+    formation (None if trigger arrives on TCM like nTOF; FEU number if a
+    dedicated trigger FEU like cosmic bench M3).  OPEN QUESTION -> placeholder
+    with both options and a comment.
+
+OPEN QUESTIONS for you (placeholders will be clearly marked in the code):
+  Q1: how many P2 detectors at SPS, their names, and FEU/connector cabling?
+  Q2: SPS trigger formation: TCM external trigger (like nTOF) or trigger FEU?
+  Q3: HV crate at SPS: model/IP, n_cards, and card/channel assignments?
+  Q4: n_samples_per_waveform + sample_period for beam (nTOF used 400 @ 20 ns,
+      cosmic bench 32 @ 60 ns)?
+
+--- 3. HV control & monitoring ---
+Files: hv_control.py, flask_app (HV plot).
+
+Implementation:
+  * hv_control.py logic is generic (set_hvs / ramp check / monitor_hvs -> csv).
+    Only change: honour hv_info['simulate'] by constructing a FakeCAEN (task 7)
+    instead of CAENHVController.  Real mode untouched.
+  * hv_info in run_config: n_cards / n_channels_per_card / ip from SITE entry;
+    monitor_interval ~1 s.
+  * flask HV plot already takes detector-named traces from the run config's
+    detectors + hv_channels, so it follows automatically once task 2 is done.
+    Verify P2 'mesh' channel type is picked up (nTOF used 'resist'); adjust the
+    channel-role labels in flask_app if they are hardcoded to drift/resist.
+
+--- 4. Dream DAQ config template for P2 ---
+Files: dream_daq_control.py (no changes expected), plus a data-area file
+<BASE_DATA_DIR>/dream_config/Sps_P2.cfg.
+
+Implementation:
+  * Copy the P2 cosmic template (CosmicTb_P2.cfg from the cosmic bench data
+    area, /mnt/cosmic_data/P2/dream_config/) into the new data tree as the
+    starting point; the SPS trigger lines get edited at CERN.
+    If the cosmic disk is not mounted locally, ship a placeholder .cfg and mark
+    it TODO — for local simulation the template is only string-processed, and a
+    generic Dream .cfg is enough to exercise the code path.
+  * run_config dream_daq_info: daq_config_template_path -> the new .cfg,
+    run_directory -> a path on the SPS DAQ CPU (SITE entry; local dummy for sim),
+    zero_suppress / pedestals options copied from cosmic bench P2 practice.
+
+--- 5. On-the-fly processing (hit trees) ---
+Files: processor_config.py, mm_dream_reconstruction build.
+
+Implementation:
+  * Build the missing executable locally:
+      cd mm_dream_reconstruction/build && cmake .. && make
+    (decode + analyze_waveforms exist; feu_hit_combiner/combine_feus_hits is in
+    CMakeLists but not yet built in build/.)
+  * processor_config.py: BASE_SOFT ->
+      /local/home/ak271430/Documents/PostDocSaclay/mm_dream_reconstruction/build/
+    (SITE-dependent, SPS machine path goes in the 'sps' entry), runs_dir from
+    BASE_DATA_DIR, pedestal_loc 'find' with pedestal_dir under BASE_DATA_DIR.
+  * run_config processor_info: decode path -> same local build; process_on_fly
+    True so daq_control drives it, OR leave process_on_fly False and rely on
+    processor_watcher (recommended: watcher, matches current nTOF usage).
+  * Regenerate config/processor_config.json by running processor_config.py.
+
+--- 6. QA watcher -> P2 QA ---
+Files: qa_config.py, qa_watcher.py, and a QA entry script on the analysis side.
+
+Implementation:
+  * qa_watcher.py currently hardcodes  <repo>/ntof_daq_analysis/detector_qa.py
+    and <repo>/.venv/bin/python.  Generalise: read 'qa_script_rel_path' and
+    'qa_python_rel_path' from qa_config.json (default to the current nTOF values
+    so Dylan's usage is not broken).
+  * qa_config.py: point 'analysis_dir' (renamed from ntof_x17_dir, kept
+    backward-compatible) to
+      /local/home/ak271430/Documents/PostDocSaclay/P2_basket_analysis/cosmic_bench_analysis
+    and qa_script to a P2 beam QA entry point.
+  * P2 QA entry point: a new thin script p2_beam_qa.py in this repo (or in the
+    analysis repo) with the SAME CLI contract detector_qa.py has
+    (subrun_dir, run_config_path, out_dir, [--file_num]), which loads the
+    combined-hits tree and produces the basic plots (per-connector amplitude
+    maps / hit maps / event rate) reusing functions from p2_channel_qa.py.
+    First version can be minimal (occupancy + amplitude per channel) — the point
+    is exercising the pipeline; deep QA stays offline.
+
+--- 7. Simulation mode for local testing (no hardware attached) ---
+New files: sim/fake_caen.py, sim/fake_dream_daq.py (or flags inside existing).
+
+Implementation:
+  * FakeCAENHVController: same methods used by hv_control.py
+    (get/set_ch_pw, set_ch_v0, get_ch_vmon, get_ch_imon, context manager).
+    vmon ramps toward v0 at a configurable V/s with gaussian noise, imon ~ few
+    nA noise + spikes.  Selected when hv_info['ip'] == 'sim' or
+    hv_info.get('simulate').  -> lets you test ramping, monitoring csv, and the
+    flask HV plot end to end.
+  * Dream DAQ simulation: dream_daq_control.py talks to the Dream RunCtrl
+    binary/CPU.  Add dream_daq_info['simulate']: instead of launching RunCtrl,
+    a stub thread copies sample .fdf files (config key 'sim_source_fdf_dir',
+    pointing at a directory with a few real P2 fdfs from the cosmic bench) into
+    the raw_daq_data dir every N seconds for the requested run_time, respecting
+    the fdf naming convention (_datrun_/file numbers) so daq_control's
+    file-watching logic and the processor see realistic input.
+  * With both stubs, a full local dry run is:
+      start_servers.sh -> flask Start Run -> fake HV ramp -> fake fdfs appear ->
+      processor_watcher decodes/analyzes/combines them -> qa_watcher makes plots.
+
+--- 8. Flask GUI ---
+File: flask_app/app.py (+ templates if labels are nTOF-specific).
+
+Implementation:
+  * BASE_DIR is hardcoded to /home/mx17/PycharmProjects/nTof_x17_DAQ ->
+    derive from os.path.dirname of the file (repo root), no per-machine edit.
+  * BASE_DATA_DIR / ANALYSIS_DIR / RUN_DIR already come from run_config_beam
+    import -> follow task 1 automatically.
+  * Grep templates/static for 'nTof'/'x17' labels and neutralise to 'P2 SPS'.
+  * Check monitor.py / daq_status.py for hardcoded paths the same way.
+
+--- 9. Directory scaffolding + credentials ---
+Implementation:
+  * Create the local test data tree:
+      <BASE>/runs/  <BASE>/pedestals/  <BASE>/dream_config/
+      <BASE>/config/detectors/
+    plus copy the detector-info files needed by the processor (detector_info_dir)
+    for P2 — from the cosmic bench config/detectors if reachable, otherwise
+    generate from run_config json (write_all_detectors_to_json path).
+  * hv_creds.txt: run_config_beam.py reads it unconditionally -> make the read
+    tolerant (missing file + simulate mode = dummy creds), keep it gitignored.
+  * Put a few sample P2 fdf files (from a cosmic run) under
+    <BASE>/sim_fdfs/ for the DAQ simulator.  OPEN QUESTION Q5: which cosmic run
+    should I use as the sample source (need path reachable from this machine)?
+
+--- 10. Auxiliaries ---
+  * pedestal_qa_config.py / backup_config.py: repoint paths at BASE_DATA_DIR /
+    SITE constants; backup destination for SPS (EOS?) left as TODO.
+  * trigger_logger.py and weiner_ps_monitor.py are nTOF/cosmic-bench specific
+    hardware monitors: leave in place, not started by start_servers.sh; only
+    enable at SPS if the same hardware exists.
+  * n1081b/ (CAEN N1081B trigger unit code): keep — likely relevant if the SPS
+    trigger uses the same logic unit; otherwise ignore.
+
+--- 11. Docs ---
+  * README.md: replace the 3-line stub with: architecture diagram (the process
+    list above), local simulation quick-start, and an "SPS deployment checklist"
+    (SITE='sps', real IPs, .cfg trigger lines, hv_creds.txt, build
+    mm_dream_reconstruction on the DAQ machine, mount points).
+
+================================================================================
+IMPLEMENTATION ORDER & LOCAL VERIFICATION AT EACH STEP
+================================================================================
+ 1. Task 1 + 2 + 9   run_config_beam.py rewrite + local tree
+                     CHECK: python run_config_beam.py writes json, prints schedule
+ 2. Task 5           build combine_feus_hits; regenerate processor_config.json
+                     CHECK: executables run with --help / on a sample fdf
+ 3. Task 7 (HV sim)  fake CAEN + hv_control
+                     CHECK: python hv_control.py + daq_control ramps fake HV,
+                     hv_monitor.csv fills
+ 4. Task 7 (DAQ sim) fake fdf producer
+                     CHECK: full daq_control run end-to-end locally
+ 5. Task 6           P2 QA entry + qa_config
+                     CHECK: qa_watcher picks up combined hits, plots appear
+ 6. Task 8 + 3       flask GUI on localhost
+                     CHECK: browser: start run, watch progress, HV plot,
+                     watcher toggles
+ 7. Task 10 + 11     auxiliaries + README
+
+Open questions recap (answers can come later; placeholders marked 'TODO SPS'):
+  Q1 detector count/names + FEU cabling      Q2 trigger formation at SPS
+  Q3 HV crate ip/cards/channel map           Q4 waveform samples/period for SPS
+  Q5 source of sample P2 fdfs for simulation
+================================================================================
+
+================================================================================
+IMPLEMENTATION STATUS (2026-07-06)
+================================================================================
+DONE:
+  Task 1+2  run_config_beam.py rewritten: SITE switch ('local'/'sps'), P2_1
+            detector (cosmic-bench cabling, FEUs 3/4/6), 32 samples @ 60 ns,
+            trigger_feu=None (external trigger on TCM), mesh 440 V / drift 600 V
+            schedule, tolerant hv_creds.txt read. TODO-SPS markers on HV crate
+            IP/cards, data disk, DAQ host, HV channels.
+  Task 3    hv_control.py selects sim/fake_caen.FakeCAENHVController when
+            hv_info['simulate'] (or ip == 'sim').
+  Task 4    CosmicTb_P2.cfg fetched from rays to <base>/dream_config/ (already
+            'Sys DaqRun Trig Ext'; FEU 1/M3 dropped automatically by
+            set_feus_from_detectors). SPS trigger-line edits remain for CERN.
+  Task 5    mm_dream_reconstruction rebuilt locally — decode, analyze_waveforms,
+            combine_feus_hits, clusterize1d all present in build/.
+            processor_config.py points at it via RECONSTRUCTION_BUILD.
+  Task 6    qa_watcher.py generalized (analysis_dir / qa_script_rel_path /
+            qa_python_rel_path, nTof defaults kept). New QA entry point
+            p2_daq_analysis/detector_qa.py (adapted from Dylan's, mx17 position
+            mapping removed, sample_period from run_config). qa_config.py points
+            at this repo + its venv. uproot/awkward/matplotlib/scipy added to
+            requirements + venv.
+  Task 7    sim/fake_caen.py (ramping, noisy vmon/imon) and sim/fake_dream_daq.py
+            (replays sample fdfs with growing files, RunCtrl naming convention).
+            dream_daq_control.py branches on dream_daq_info['simulate'].
+  Task 8    flask BASE_DIR now self-locating (repo root); data-disk stats use
+            BASE_DATA_DIR; header rebranded 'P2 DAQ / SPS'. iterate_run_num.py
+            BASE_DIR also self-locating.
+  Task 9    Local data tree at ~/Documents/PostDocSaclay/data/sps_p2_test/
+            (runs/, pedestals_06-25-26_19-00-41 fetched from rays, dream_config/,
+            config/detectors/{p2.json,p2_map.txt,m3.json}, sim_fdfs/ with real
+            P2 datrun+pedthr fdfs from p2_det1_mesh_hv_scan_7-2-26).
+  Task 10   pedestal_qa_config.py + backup_config.py repointed (backup EOS
+            destination left TODO-SPS).
+  Task 11   README rewritten: architecture, local simulation quick-start,
+            SPS deployment checklist.
+
+ANSWERS RECORDED (from Alexandra):
+  Q1 one P2 detector, same connector cabling as cosmic bench
+  Q2 external trigger in TCM (like nTof) -> trigger_feu = None
+  Q3 HV crate unknown -> TODO-SPS placeholders, fill at the beam
+  Q4 waveform settings same as cosmic bench: 32 samples @ 60 ns
+  Q5 sample fdfs fetched from rays (sedipcaa28) /mnt/cosmic_data/P2/Run/

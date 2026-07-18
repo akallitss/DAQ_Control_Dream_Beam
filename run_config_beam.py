@@ -12,10 +12,10 @@ Site switching: set SITE below.
             replays sample fdfs), for testing the whole chain without hardware.
   'sps'   — the banco machine (dedippcq196 = banco_daplxa, user banco), the
             DAQ computer for the SPS beam test. Its DAQ NIC (enp2s0,
-            192.168.10.8/16, MTU 9000) is a private LAN where the DREAM FEUs
-            get plugged in at SPS (it also carries the BANCO Xilinx readout at
-            .113-.115). Fields marked TODO-SPS must be filled in once the
-            beam-area cabling / HV crate details are known.
+            192.168.10.8/16, MTU 9000) is a private LAN with the DREAM FEUs
+            (Ids 101/102/103 at 192.168.10.113-.115, per SelfTcm.cfg in
+            ~/Feu/.../bin/EicP2Bt/) and the CAEN HV crate (192.168.10.199).
+            Fields marked TODO-SPS must be filled in at the beam area.
 
 @author: Alexandra Kallitsopoulou (based on Dylan Neff's nTof config)
 """
@@ -47,8 +47,11 @@ SITES = {
         # between runs, never record onto it directly (FAT32, ~106 MB/s, SMR).
         'base_data_dir': '/local/home/banco/p2_sps_beam/',
         'daq_host': '192.168.10.8',                  # banco's IP on its DAQ LAN (enp2s0)
-        'hv_ip': '192.168.10.81',                    # TODO-SPS: CAEN mainframe IP at SPS
-        'hv_n_cards': 4,                             # TODO-SPS: number of cards in SPS crate
+        'hv_ip': '192.168.10.199',                   # CAEN mainframe on banco's DAQ LAN (web login on :80)
+        # Crate probed 2026-07-18: 16-slot mainframe, 12-ch cards in slots 8 and
+        # 12 only. n_cards bounds range() sweeps (e.g. power-off-all), so it must
+        # reach slot 12; empty slots read power=off and are skipped harmlessly.
+        'hv_n_cards': 13,
         'simulate': False,
         'reconstruction_build': '/local/home/banco/mm_dream_reconstruction/build/',  # TODO-SPS: clone + build on banco
     },
@@ -72,10 +75,14 @@ POST_SUBRUN_PAUSE_MIN = 0   # optional pause AFTER each sub-run (minutes); 0 = n
 MESH_V = 440    # V, P2 mesh
 DRIFT_V = 600   # V, P2 drift (drift gap = drift - mesh = 160 V)
 
-# P2 HV channels: (card, channel). TODO-SPS: update once the SPS crate is cabled.
+# P2 HV channels: (card, channel) on the SPS crate (192.168.10.199).
+# Live readings 2026-07-18: card 8 ch0 = 700 V (drift), ch1 = 450 V (mesh),
+# ch2/ch3 = 300 V each (resistive layers?, not modelled here yet) — a P2
+# detector was being biased on these channels. TODO-SPS: confirm which
+# physical detector, and whether ch2/ch3 need to join the run schedule.
 P2_HV = {
-    'mesh': (1, 0),
-    'drift': (1, 1),
+    'mesh': (8, 1),
+    'drift': (8, 0),
 }
 
 

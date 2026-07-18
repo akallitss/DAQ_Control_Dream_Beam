@@ -72,6 +72,19 @@ class Config(RunConfigBase):
             'pedestals': None,
         })
 
+        # Pedestals are per-FEU electronics baselines — take them on ALL
+        # connected FEUs, not only those cabled to the included detectors.
+        # Cfg Feu 3 (Id 101, 192.168.10.113) is connected but currently has no
+        # detector assigned; merge it in with all connectors active so its
+        # Dreams run as Dat. Detector-derived FEUs keep their connector maps.
+        extra_pedestal_feus = {3: list(range(1, 9))}
+        feu_conns = {int(k): list(v)
+                     for k, v in (self.dream_daq_info.get('feu_connectors') or {}).items()}
+        for feu, conns in extra_pedestal_feus.items():
+            feu_conns.setdefault(feu, conns)
+        self.dream_daq_info['feu_connectors'] = feu_conns
+        self.dream_daq_info['included_feus'] = sorted(feu_conns)
+
         # processor / hv info point at the pedestal output dir
         self.processor_info = copy.deepcopy(beam.processor_info)
         self.processor_info['run_dir'] = self.run_out_dir

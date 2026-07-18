@@ -273,7 +273,7 @@ class Config(RunConfigBase):
                 'name': 'P2_MID',
                 'description': 'P2 telescope middle detector (det3), SPS 2026. '
                                'Bulked 2-7-26; 2 insulations on the wall (half '
-                               'of the lights were working at a time).',
+                               'of the UV lamp lights were working at a time).',
                 'det_type': 'P2',
                 'resist_type': 'none',
                 'bulked_from': 'Alex+Enzo',

@@ -162,6 +162,18 @@ def main():
                                           effective_info.get('go_timeout', 300)),
                                     daemon=True,
                                 ).start()
+                            else:
+                                # Data run failsafe: banco's RunCtrl can drop to
+                                # its interactive prompt instead of exiting batch
+                                # mode. Stop it once the requested run time plus
+                                # max_run_time_addition has elapsed.
+                                deadline = run_time * 60 + float(
+                                    effective_info.get('max_run_time_addition', 300))
+                                threading.Thread(
+                                    target=run_timeout_watchdog,
+                                    args=(process, deadline),
+                                    daemon=True,
+                                ).start()
                             ret = process.wait()
 
                         # while True:
@@ -474,6 +486,23 @@ def pedestal_run_watchdog(process, sub_run_dir, included_feus, go_timeout, poll_
                     process.kill()
             return
         sleep(poll_s)
+
+
+def run_timeout_watchdog(process, deadline_s, poll_s=5):
+    """Failsafe for data runs: end RunCtrl if it outlives the requested run time
+    plus margin. RunCtrl normally stops itself after Sys DaqRun Time, but
+    banco's build can fall to its interactive '***' prompt instead of exiting
+    batch mode, which would hang the sub-run forever. SIGINT first so its
+    cleanup trap restores the terminal, then kill."""
+    start = time.time()
+    while process.poll() is None and time.time() - start < deadline_s:
+        sleep(poll_s)
+    if process.poll() is None:
+        print(f'\nWARNING: RunCtrl still running {deadline_s:.0f}s after start — stopping it.')
+        process.send_signal(signal.SIGINT)
+        sleep(10)
+        if process.poll() is None:
+            process.kill()
 
 
 def runctrl_batch_watchdog(process, go_timeout, tmux_pane):

@@ -45,7 +45,7 @@ SITES = {
         # Active runs write to the NVMe system disk (measured 1.4 GB/s direct
         # writes, >10x the 1 GbE FEU link) — back up to the Intenso USB drive
         # between runs, never record onto it directly (FAT32, ~106 MB/s, SMR).
-        'base_data_dir': '/local/home/banco/p2_sps_beam/',
+        'base_data_dir': '/local/home/banco/P2_data/Fe55/',
         'daq_host': '192.168.10.8',                  # banco's IP on its DAQ LAN (enp2s0)
         'hv_ip': '192.168.10.199',                   # CAEN mainframe on banco's DAQ LAN (web login on :80)
         # Crate probed 2026-07-18: 16-slot mainframe, 12-ch cards in slots 8 and
@@ -61,7 +61,7 @@ SITES = {
         # numbering: input 3 = Id 101, 4 = 102, 5 = 103) with Sys Name = P2Fe55
         # and the stale per-FEU PdFile/ZsFile refs cleared (each run's own
         # PedThr phase programs fresh pedestals/thresholds instead).
-        'dream_cfg_template': '/local/home/banco/p2_sps_beam/dream_config/P2SelfTrigger.cfg',
+        'dream_cfg_template': '/local/home/banco/P2_data/Fe55/dream_config/P2SelfTrigger.cfg',
     },
 }
 
@@ -74,14 +74,21 @@ SIMULATE = _SITE_CFG['simulate']
 # Run schedule
 #   HV_SCAN False: N_SUBRUNS identical sub-runs of SUBRUN_MIN minutes at the
 #                  nominal operating point (MESH_V/DRIFT_V).
-#   HV_SCAN True:  Fe55 self-trigger HV scan — one sub-run per mesh voltage in
-#                  MESH_SCAN_V, both detectors together, drift following the
-#                  mesh at a constant drift gap (DRIFT_GAP_V).
+#   HV_SCAN True:  Fe55 self-trigger mesh HV scan. Per detector, start AT the
+#                  operating (max) point and step mesh AND drift down together
+#                  by SCAN_STEP_V per point — the potential across the drift
+#                  gap (= drift − mesh) stays constant: 280 V for P2_OUT,
+#                  190 V for P2_MID.
 # ---------------------------------------------------------------------------
 HV_SCAN = True
-MESH_SCAN_V = list(range(420, 471, 10))  # V — ADJUST: mesh scan points, both detectors
-DRIFT_GAP_V = 250       # V — drift = mesh + gap (250 V matches the 450/700 bench point)
-SCAN_SUBRUN_MIN = 5     # minutes per scan point — ADJUST for wanted Fe55 statistics
+# Operating (= maximum safe) voltages per detector — scan starts here, goes DOWN.
+SCAN_START = {
+    'P2_OUT': {'mesh': 420, 'drift': 700},   # max: 420 mesh / 700 drift
+    'P2_MID': {'mesh': 510, 'drift': 700},   # max: 510 mesh / 700 drift
+}
+SCAN_STEP_V = 5         # V — mesh and drift both step down by this per point
+SCAN_POINTS = 12        # 12 points x 5 min = 1 h of data
+SCAN_SUBRUN_MIN = 5     # minutes per scan point
 
 N_SUBRUNS = 2       # number of identical sub-runs (HV_SCAN False)
 SUBRUN_MIN = 2      # run time per sub-run (minutes)
@@ -228,15 +235,25 @@ class Config(RunConfigBase):
 
         self.sub_runs = []
         if HV_SCAN:
-            # Fe55 self-trigger HV scan: one sub-run per mesh point, both
-            # detectors together, constant drift gap.
-            for mesh_v in MESH_SCAN_V:
-                drift_v = mesh_v + DRIFT_GAP_V
+            # Fe55 mesh HV scan: per-detector setpoints, starting at the
+            # operating point and stepping mesh+drift down together so the
+            # drift-gap potential (drift − mesh) stays constant.
+            for i in range(SCAN_POINTS):
+                off = i * SCAN_STEP_V
+                hvs, name_bits = {}, []
+                for det_name, start in SCAN_START.items():
+                    det_hv = P2_HV[det_name]
+                    mesh_v, drift_v = start['mesh'] - off, start['drift'] - off
+                    assert mesh_v <= start['mesh'] and drift_v <= start['drift'], \
+                        f'{det_name} scan point above its maximum'
+                    hvs.setdefault(str(det_hv['mesh'][0]), {})[str(det_hv['mesh'][1])] = mesh_v
+                    hvs.setdefault(str(det_hv['drift'][0]), {})[str(det_hv['drift'][1])] = drift_v
+                    name_bits.append(f'{det_name.rsplit("_", 1)[-1].lower()}{mesh_v}')
                 self.sub_runs.append({
-                    'sub_run_name': f'fe55_mesh_{mesh_v}V_drift_{drift_v}V',
+                    'sub_run_name': f'fe55_{i:02d}_mesh_' + '_'.join(name_bits),
                     'run_time': SCAN_SUBRUN_MIN,  # Minutes
                     'post_pause_s': int(round(POST_SUBRUN_PAUSE_MIN * 60)),
-                    'hvs': _both_det_hvs(mesh_v, drift_v),
+                    'hvs': hvs,
                 })
         else:
             for i in range(N_SUBRUNS):
@@ -379,8 +396,11 @@ if __name__ == '__main__':
     print(f'Gas: {config.gas}')
     print(f'Trigger: {config.trigger}')
     if HV_SCAN:
-        print(f'HV SCAN: mesh {MESH_SCAN_V[0]}-{MESH_SCAN_V[-1]} V in {len(MESH_SCAN_V)} points, '
-              f'drift = mesh + {DRIFT_GAP_V} V, both detectors')
+        last = (SCAN_POINTS - 1) * SCAN_STEP_V
+        for det, start in SCAN_START.items():
+            print(f'HV SCAN {det}: mesh {start["mesh"]}->{start["mesh"] - last} V, '
+                  f'drift {start["drift"]}->{start["drift"] - last} V '
+                  f'({SCAN_POINTS} points x -{SCAN_STEP_V} V, gap {start["drift"] - start["mesh"]} V const)')
     else:
         print(f'P2 mesh: {MESH_V} V   drift: {DRIFT_V} V   (gap = {DRIFT_V - MESH_V} V)')
     print(f'Sub-runs: {n_sub} x {config.sub_runs[0]["run_time"] if n_sub else 0} min '

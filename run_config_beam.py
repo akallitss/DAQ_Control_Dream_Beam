@@ -53,7 +53,9 @@ SITES = {
         # reach slot 12; empty slots read power=off and are skipped harmlessly.
         'hv_n_cards': 13,
         'simulate': False,
-        'reconstruction_build': '/local/home/banco/mm_dream_reconstruction/build/',  # TODO-SPS: clone + build on banco
+        # Built 2026-07-18 against ROOT 6.32.02 in ~/opt/root_v6.32.02 (binaries
+        # carry an rpath to it — no thisroot.sh needed to run them).
+        'reconstruction_build': '/local/home/banco/mm_dream_reconstruction/build/',
     },
 }
 
@@ -75,14 +77,12 @@ POST_SUBRUN_PAUSE_MIN = 0   # optional pause AFTER each sub-run (minutes); 0 = n
 MESH_V = 440    # V, P2 mesh
 DRIFT_V = 600   # V, P2 drift (drift gap = drift - mesh = 160 V)
 
-# P2 HV channels: (card, channel) on the SPS crate (192.168.10.199).
-# Live readings 2026-07-18: card 8 ch0 = 700 V (drift), ch1 = 450 V (mesh),
-# ch2/ch3 = 300 V each (resistive layers?, not modelled here yet) — a P2
-# detector was being biased on these channels. TODO-SPS: confirm which
-# physical detector, and whether ch2/ch3 need to join the run schedule.
+# Telescope HV channels: (card, channel) on the SPS crate (192.168.10.199).
+# Cabling confirmed 2026-07-18 (matches the live bias readings that day:
+# ch0 700 V / ch1 450 V on P2_OUT, ch2/ch3 parked at 300 V on P2_MID).
 P2_HV = {
-    'mesh': (8, 1),
-    'drift': (8, 0),
+    'P2_OUT': {'drift': (8, 0), 'mesh': (8, 1)},
+    'P2_MID': {'drift': (8, 2), 'mesh': (8, 3)},
 }
 
 
@@ -197,13 +197,16 @@ class Config(RunConfigBase):
                 print(f'WARNING: {creds_path} not found — using default admin/admin HV credentials.')
 
         # ----- Run schedule (built from module constants above) -----
+        # Both telescope detectors run at the same nominal point for now;
+        # TODO-SPS: per-detector setpoints once the test-run values are chosen.
         self.sub_runs = []
-        mesh_card, mesh_ch = P2_HV['mesh']
-        drift_card, drift_ch = P2_HV['drift']
         for i in range(N_SUBRUNS):
             hvs = {}
-            hvs.setdefault(str(mesh_card), {})[str(mesh_ch)] = MESH_V
-            hvs.setdefault(str(drift_card), {})[str(drift_ch)] = DRIFT_V
+            for det_hv in P2_HV.values():
+                mesh_card, mesh_ch = det_hv['mesh']
+                drift_card, drift_ch = det_hv['drift']
+                hvs.setdefault(str(mesh_card), {})[str(mesh_ch)] = MESH_V
+                hvs.setdefault(str(drift_card), {})[str(drift_ch)] = DRIFT_V
             self.sub_runs.append({
                 'sub_run_name': f'mesh_{MESH_V}V_drift_{DRIFT_V}V_{i:02d}',
                 'run_time': SUBRUN_MIN,  # Minutes
@@ -213,23 +216,41 @@ class Config(RunConfigBase):
 
         # --- HV scan template (uncomment and adapt at the beam) ---
         # for mesh_v in range(430, 465, 5):
+        #     hvs = {}
+        #     for det_hv in P2_HV.values():  # or a single detector's entry
+        #         hvs.setdefault(str(det_hv['mesh'][0]), {})[str(det_hv['mesh'][1])] = mesh_v
+        #         hvs.setdefault(str(det_hv['drift'][0]), {})[str(det_hv['drift'][1])] = mesh_v + 160
         #     self.sub_runs.append({
         #         'sub_run_name': f'mesh_{mesh_v}V_drift_{mesh_v + 160}V',
         #         'run_time': 20,
-        #         'hvs': {str(mesh_card): {str(mesh_ch): mesh_v},
-        #                 str(drift_card): {str(drift_ch): mesh_v + 160}},
+        #         'hvs': hvs,
         #     })
 
         self.bench_geometry = {
             'board_thickness': 5,  # mm  Thickness of PCB for test boards  Guess!
         }
 
-        self.included_detectors = ['P2_1']
+        self.included_detectors = ['P2_OUT', 'P2_MID']
+
+        # Telescope cabling (2026-07-18): each detector has connectors 4-7 read
+        # out, each connector on a bot/top Dream pair filling FEU connectors 1-8.
+        # P2_OUT -> FEU Id 103 (cfg Feu 6, 192.168.10.115)
+        # P2_MID -> FEU Id 102 (cfg Feu 4, 192.168.10.114)
+        # dream_feu_orientation carried over from the cosmic-bench P2 setup;
+        # TODO-SPS: verify orientations and survey coordinates on the telescope.
+        _telescope_dream_feus = lambda feu: {
+            f'c_{conn}_{pos}': (feu, 2 * (conn - 4) + (1 if pos == 'bot' else 2))
+            for conn in (4, 5, 6, 7) for pos in ('bot', 'top')
+        }
+        _telescope_orientation = {
+            f'c_{conn}_{pos}': 'rotated_inverted'
+            for conn in (4, 5, 6, 7) for pos in ('bot', 'top')
+        }
 
         self.detectors = [
             {
-                'name': 'P2_1',
-                'description': 'Bulked at 11-6-26 with footprint on the mesh from the frame gluing',
+                'name': 'P2_OUT',
+                'description': 'P2 telescope outer detector, SPS 2026',
                 'det_type': 'P2',
                 'resist_type': 'none',
                 'bulked_from': 'Alex+Arnaud',
@@ -243,55 +264,29 @@ class Config(RunConfigBase):
                     'y': 0,  # deg  Rotation about y axis
                     'z': 0,  # deg  Rotation about z axis
                 },
-                'hv_channels': {
-                    'mesh': P2_HV['mesh'],
-                    'drift': P2_HV['drift'],
+                'hv_channels': P2_HV['P2_OUT'],
+                'dream_feus': _telescope_dream_feus(6),
+                'dream_feu_orientation': dict(_telescope_orientation),
+            },
+            {
+                'name': 'P2_MID',
+                'description': 'P2 telescope middle detector, SPS 2026',
+                'det_type': 'P2',
+                'resist_type': 'none',
+                'bulked_from': 'Alex+Arnaud',
+                'det_center_coords': {  # Center of detector. TODO-SPS: beam-line survey coordinates
+                    'x': 0,  # mm
+                    'y': 0,  # mm
+                    'z': 0,  # mm
                 },
-                # Same connector cabling as the cosmic bench.
-                'dream_feus': {
-                    'c_1_bot': (3, 1),
-                    'c_1_top': (3, 2),
-                    'c_2_bot': (3, 3),
-                    'c_2_top': (3, 4),
-                    'c_3_bot': (3, 5),
-                    'c_3_top': (3, 6),
-                    'c_4_bot': (3, 7),
-                    'c_4_top': (3, 8),
-                    'c_5_bot': (4, 1),
-                    'c_5_top': (4, 2),
-                    'c_6_bot': (4, 3),
-                    'c_6_top': (4, 4),
-                    'c_7_bot': (4, 5),
-                    'c_7_top': (4, 6),
-                    'c_8_bot': (4, 7),
-                    'c_8_top': (4, 8),
-                    'c_9_bot': (6, 1),
-                    'c_9_top': (6, 2),
-                    'c_10_bot': (6, 3),
-                    'c_10_top': (6, 4),
+                'det_orientation': {
+                    'x': 0,  # deg  Rotation about x axis
+                    'y': 0,  # deg  Rotation about y axis
+                    'z': 0,  # deg  Rotation about z axis
                 },
-                'dream_feu_orientation': {  # If connector is normal, inverted, rotated, or rotated_inverted
-                    'c_1_bot': 'rotated_inverted',
-                    'c_1_top': 'rotated_inverted',
-                    'c_2_bot': 'rotated_inverted',
-                    'c_2_top': 'rotated_inverted',
-                    'c_3_bot': 'rotated_inverted',
-                    'c_3_top': 'rotated_inverted',
-                    'c_4_bot': 'rotated_inverted',
-                    'c_4_top': 'rotated_inverted',
-                    'c_5_bot': 'rotated_inverted',
-                    'c_5_top': 'rotated_inverted',
-                    'c_6_bot': 'rotated_inverted',
-                    'c_6_top': 'rotated_inverted',
-                    'c_7_bot': 'rotated_inverted',
-                    'c_7_top': 'rotated_inverted',
-                    'c_8_bot': 'rotated_inverted',
-                    'c_8_top': 'rotated_inverted',
-                    'c_9_bot': 'rotated_inverted',
-                    'c_9_top': 'rotated_inverted',
-                    'c_10_bot': 'rotated_inverted',
-                    'c_10_top': 'rotated_inverted',
-                },
+                'hv_channels': P2_HV['P2_MID'],
+                'dream_feus': _telescope_dream_feus(4),
+                'dream_feu_orientation': dict(_telescope_orientation),
             },
         ]
 

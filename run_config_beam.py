@@ -10,11 +10,12 @@ from Cosmic_Bench_DAQ_Control/run_config.py — same cabling as the cosmic bench
 Site switching: set SITE below.
   'local' — full simulation on this machine (fake CAEN HV + fake Dream DAQ that
             replays sample fdfs), for testing the whole chain without hardware.
-  'rays'  — real hardware on the cosmic bench rays machine (sedipcaa28 =
-            rays_daplxa, user usernsw). Same FEUs/HV crate as the running
-            Cosmic_Bench_DAQ_Control — do NOT run both DAQs at the same time.
-  'sps'   — real hardware at the SPS beam line. Fields marked TODO-SPS must be
-            filled in once the beam-area network / HV crate details are known.
+  'sps'   — the banco machine (dedippcq196 = banco_daplxa, user banco), the
+            DAQ computer for the SPS beam test. Its DAQ NIC (enp2s0,
+            192.168.10.8/16, MTU 9000) is a private LAN where the DREAM FEUs
+            get plugged in at SPS (it also carries the BANCO Xilinx readout at
+            .113-.115). Fields marked TODO-SPS must be filled in once the
+            beam-area cabling / HV crate details are known.
 
 @author: Alexandra Kallitsopoulou (based on Dylan Neff's nTof config)
 """
@@ -26,7 +27,7 @@ from run_config_base import RunConfigBase
 # ---------------------------------------------------------------------------
 # Site configuration — the ONE place to switch local test <-> SPS machine
 # ---------------------------------------------------------------------------
-SITE = os.environ.get('DAQ_SITE', 'local')  # 'local', 'rays' or 'sps'; export DAQ_SITE=rays on the rays machine
+SITE = os.environ.get('DAQ_SITE', 'local')  # 'local' or 'sps'; export DAQ_SITE=sps on banco
 
 SITES = {
     'local': {
@@ -39,23 +40,17 @@ SITES = {
         'reconstruction_build': '/local/home/ak271430/Documents/PostDocSaclay/'
                                 'mm_dream_reconstruction/build/',
     },
-    'rays': {
-        # Cosmic bench DAQ machine (sedipcaa28.extra.cea.fr, ssh alias rays_daplxa).
-        # Values confirmed 2026-07-16 against the live Cosmic_Bench_DAQ_Control setup.
-        'base_data_dir': '/mnt/cosmic_data/P2/sps_daq_test/',
-        'daq_host': '192.168.10.1',                  # rays' IP on the FEU/HV subnet
-        'hv_ip': '192.168.10.81',                    # CAEN mainframe (web login on :80)
-        'hv_n_cards': 4,
-        'simulate': False,
-        'reconstruction_build': '/local/home/usernsw/mm_dream_reconstruction/build/',
-    },
     'sps': {
-        'base_data_dir': '/mnt/data/p2_sps_beam/',   # TODO-SPS: data disk on DAQ machine
-        'daq_host': '127.0.0.1',                     # TODO-SPS: DAQ computer IP (as seen by clients)
+        # banco machine (dedippcq196.extra.cea.fr, ssh alias banco_daplxa).
+        # Active runs write to the NVMe system disk (measured 1.4 GB/s direct
+        # writes, >10x the 1 GbE FEU link) — back up to the Intenso USB drive
+        # between runs, never record onto it directly (FAT32, ~106 MB/s, SMR).
+        'base_data_dir': '/local/home/banco/p2_sps_beam/',
+        'daq_host': '192.168.10.8',                  # banco's IP on its DAQ LAN (enp2s0)
         'hv_ip': '192.168.10.81',                    # TODO-SPS: CAEN mainframe IP at SPS
         'hv_n_cards': 4,                             # TODO-SPS: number of cards in SPS crate
         'simulate': False,
-        'reconstruction_build': '/home/daq/mm_dream_reconstruction/build/',  # TODO-SPS
+        'reconstruction_build': '/local/home/banco/mm_dream_reconstruction/build/',  # TODO-SPS: clone + build on banco
     },
 }
 

@@ -105,7 +105,8 @@ def main():
                             effective_zs_type, effective_zs_check_sample, effective_latency,
                             effective_included_feus, effective_feu_connectors, effective_trigger_feu,
                             do_pedestal_threshold_run=effective_do_pedestal_threshold_run,
-                            do_data_run=effective_do_data_run)
+                            do_data_run=effective_do_data_run,
+                            self_trigger=effective_info.get('self_trigger', False))
                         shutil.copy(cfg_run_path, sub_run_out_raw_inner_dir)
 
                         if effective_pedestals_dir is not None:
@@ -554,7 +555,7 @@ def make_config_from_template(run_dir, cfg_template_file_path, cfg_file_run_time
                               samples_per_waveform=None, pedestal_subtraction=None,
                               common_noise_subtraction=None, zs_type=None, zs_check_sample=None,
                               latency=None, included_feus=None, feu_connectors=None, trigger_feu=None,
-                              do_pedestal_threshold_run=None, do_data_run=None):
+                              do_pedestal_threshold_run=None, do_data_run=None, self_trigger=False):
     print('Making config file from template...')
     dest = run_dir
     cfg_file_name = os.path.basename(cfg_template_file_path)
@@ -607,7 +608,11 @@ def make_config_from_template(run_dir, cfg_template_file_path, cfg_file_run_time
         clear_feu_mem_file_refs(cfg_file_path)
 
     if included_feus is not None:
-        set_active_feus(cfg_file_path, included_feus, feu_connectors=feu_connectors, trigger_feu=trigger_feu)
+        # Self-trigger mode: used connectors run as 'Trg' (trigger-contributing
+        # AND read out — matches the bench Fe55 self-trigger templates), else 'Dat'.
+        set_active_feus(cfg_file_path, included_feus, feu_connectors=feu_connectors,
+                        trigger_feu=trigger_feu,
+                        data_role='Trg' if self_trigger else 'Dat')
 
     return cfg_file_path
 
@@ -639,7 +644,8 @@ def clear_feu_mem_file_refs(filepath, output_path=None):
 CONNECTOR_DREAM_OFFSET = 1  # connector = dream_index + CONNECTOR_DREAM_OFFSET
 
 
-def set_active_feus(filepath, included_feus, feu_connectors=None, trigger_feu=None, output_path=None):
+def set_active_feus(filepath, included_feus, feu_connectors=None, trigger_feu=None, output_path=None,
+                    data_role='Dat'):
     """
     Enable only the given FEUs in a Dream .cfg, and set per-Dream roles, by editing lines in place.
 
@@ -670,9 +676,11 @@ def set_active_feus(filepath, included_feus, feu_connectors=None, trigger_feu=No
 
     def set_dream_roles(dreams_str, connectors):
         # Replace each "<dream_index> <whitespace> <role>" triplet's role, preserving spacing.
+        # data_role is 'Dat' for externally-triggered runs, 'Trg' for self-trigger
+        # (a 'Trg' dream both contributes trigger primitives and is read out).
         def repl(m):
             dream_idx = int(m.group(1))
-            role = 'Dat' if (dream_idx + CONNECTOR_DREAM_OFFSET) in connectors else 'Msk'
+            role = data_role if (dream_idx + CONNECTOR_DREAM_OFFSET) in connectors else 'Msk'
             return f'{m.group(1)}{m.group(2)}{role}'
         return re.sub(r'(\d+)(\s+)(?:Trg|Dat|Msk)', repl, dreams_str)
 

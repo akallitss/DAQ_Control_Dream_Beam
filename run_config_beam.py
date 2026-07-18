@@ -56,11 +56,12 @@ SITES = {
         # Built 2026-07-18 against ROOT 6.32.02 in ~/opt/root_v6.32.02 (binaries
         # carry an rpath to it — no thisroot.sh needed to run them).
         'reconstruction_build': '/local/home/banco/mm_dream_reconstruction/build/',
-        # Dream .cfg template maintained with the FEU software (source of truth
-        # for FEU Ids/IPs and TCM input numbering: input 3 = Id 101, 4 = 102,
-        # 5 = 103). set_feus_from_detectors activates/masks FEUs per run.
-        'dream_cfg_template': '/local/home/banco/Feu/Firmware/Implementation/'
-                              'Projects/Software/Linux/bin/EicP2Bt/SelfTcm.cfg',
+        # Dream .cfg template: P2SelfTrigger.cfg is a copy of the FEU software's
+        # EicP2Bt/SelfTcm.cfg (source of truth for FEU Ids/IPs and TCM input
+        # numbering: input 3 = Id 101, 4 = 102, 5 = 103) with Sys Name = P2Fe55
+        # and the stale per-FEU PdFile/ZsFile refs cleared (each run's own
+        # PedThr phase programs fresh pedestals/thresholds instead).
+        'dream_cfg_template': '/local/home/banco/p2_sps_beam/dream_config/P2SelfTrigger.cfg',
     },
 }
 
@@ -71,10 +72,18 @@ SIMULATE = _SITE_CFG['simulate']
 
 # ---------------------------------------------------------------------------
 # Run schedule
-#   N_SUBRUNS identical sub-runs of SUBRUN_MIN minutes at the nominal P2
-#   operating point. Short values for local simulation; set beam values at SPS.
+#   HV_SCAN False: N_SUBRUNS identical sub-runs of SUBRUN_MIN minutes at the
+#                  nominal operating point (MESH_V/DRIFT_V).
+#   HV_SCAN True:  Fe55 self-trigger HV scan — one sub-run per mesh voltage in
+#                  MESH_SCAN_V, both detectors together, drift following the
+#                  mesh at a constant drift gap (DRIFT_GAP_V).
 # ---------------------------------------------------------------------------
-N_SUBRUNS = 2       # number of identical sub-runs
+HV_SCAN = True
+MESH_SCAN_V = list(range(420, 471, 10))  # V — ADJUST: mesh scan points, both detectors
+DRIFT_GAP_V = 250       # V — drift = mesh + gap (250 V matches the 450/700 bench point)
+SCAN_SUBRUN_MIN = 5     # minutes per scan point — ADJUST for wanted Fe55 statistics
+
+N_SUBRUNS = 2       # number of identical sub-runs (HV_SCAN False)
 SUBRUN_MIN = 2      # run time per sub-run (minutes)
 POST_SUBRUN_PAUSE_MIN = 0   # optional pause AFTER each sub-run (minutes); 0 = no pause
 
@@ -118,8 +127,11 @@ class Config(RunConfigBase):
         self.beam_type = 'sps_beam'
         # self.beam_type = 'cosmics'
         self.target_type = 'none'
-        # External trigger arrives on the TCM (like nTof) — no dedicated trigger FEU.
-        self.trigger = 'SPS external trigger (TCM)'  # TODO-SPS: describe actual trigger formation
+        # Fe55 bench runs: self-trigger through the TCM — each FEU's 'Trg'
+        # Dreams send hit primitives, the TCM forms the trigger from its
+        # multiplicity window and distributes it on the sync line.
+        # TODO-SPS: switch back to the external beam trigger at the beam area.
+        self.trigger = 'Fe55 self trigger via TCM multiplicity'
 
         self.dream_daq_info = {
             'ip': _SITE_CFG['daq_host'],
@@ -148,6 +160,9 @@ class Config(RunConfigBase):
             'do_pedestal_threshold_run': True,   # Sys Action PedThrRun
             'do_trigger_threshold_run': False,   # Sys Action TrgThrRun
             'do_data_run': True,                 # Sys Action DataRun
+            # Self-trigger mode: used connectors get the 'Trg' Dream role
+            # (trigger-contributing AND read out) instead of 'Dat'.
+            'self_trigger': True,
             # Auto-select the active FEUs in the .cfg from the included detectors'
             # dream_feus maps (only P2 FEUs stay active; M3/trigger FEU lines are
             # commented out — the SPS trigger comes in externally on the TCM).
@@ -203,34 +218,34 @@ class Config(RunConfigBase):
                 print(f'WARNING: {creds_path} not found — using default admin/admin HV credentials.')
 
         # ----- Run schedule (built from module constants above) -----
-        # Both telescope detectors run at the same nominal point for now;
-        # TODO-SPS: per-detector setpoints once the test-run values are chosen.
-        self.sub_runs = []
-        for i in range(N_SUBRUNS):
+        def _both_det_hvs(mesh_v, drift_v):
+            """{card: {channel: V}} setting every included detector's mesh/drift."""
             hvs = {}
             for det_hv in P2_HV.values():
-                mesh_card, mesh_ch = det_hv['mesh']
-                drift_card, drift_ch = det_hv['drift']
-                hvs.setdefault(str(mesh_card), {})[str(mesh_ch)] = MESH_V
-                hvs.setdefault(str(drift_card), {})[str(drift_ch)] = DRIFT_V
-            self.sub_runs.append({
-                'sub_run_name': f'mesh_{MESH_V}V_drift_{DRIFT_V}V_{i:02d}',
-                'run_time': SUBRUN_MIN,  # Minutes
-                'post_pause_s': int(round(POST_SUBRUN_PAUSE_MIN * 60)),  # pause after this sub-run (seconds)
-                'hvs': hvs,
-            })
+                hvs.setdefault(str(det_hv['mesh'][0]), {})[str(det_hv['mesh'][1])] = mesh_v
+                hvs.setdefault(str(det_hv['drift'][0]), {})[str(det_hv['drift'][1])] = drift_v
+            return hvs
 
-        # --- HV scan template (uncomment and adapt at the beam) ---
-        # for mesh_v in range(430, 465, 5):
-        #     hvs = {}
-        #     for det_hv in P2_HV.values():  # or a single detector's entry
-        #         hvs.setdefault(str(det_hv['mesh'][0]), {})[str(det_hv['mesh'][1])] = mesh_v
-        #         hvs.setdefault(str(det_hv['drift'][0]), {})[str(det_hv['drift'][1])] = mesh_v + 160
-        #     self.sub_runs.append({
-        #         'sub_run_name': f'mesh_{mesh_v}V_drift_{mesh_v + 160}V',
-        #         'run_time': 20,
-        #         'hvs': hvs,
-        #     })
+        self.sub_runs = []
+        if HV_SCAN:
+            # Fe55 self-trigger HV scan: one sub-run per mesh point, both
+            # detectors together, constant drift gap.
+            for mesh_v in MESH_SCAN_V:
+                drift_v = mesh_v + DRIFT_GAP_V
+                self.sub_runs.append({
+                    'sub_run_name': f'fe55_mesh_{mesh_v}V_drift_{drift_v}V',
+                    'run_time': SCAN_SUBRUN_MIN,  # Minutes
+                    'post_pause_s': int(round(POST_SUBRUN_PAUSE_MIN * 60)),
+                    'hvs': _both_det_hvs(mesh_v, drift_v),
+                })
+        else:
+            for i in range(N_SUBRUNS):
+                self.sub_runs.append({
+                    'sub_run_name': f'mesh_{MESH_V}V_drift_{DRIFT_V}V_{i:02d}',
+                    'run_time': SUBRUN_MIN,  # Minutes
+                    'post_pause_s': int(round(POST_SUBRUN_PAUSE_MIN * 60)),  # pause after this sub-run (seconds)
+                    'hvs': _both_det_hvs(MESH_V, DRIFT_V),
+                })
 
         self.bench_geometry = {
             'board_thickness': 5,  # mm  Thickness of PCB for test boards  Guess!
@@ -362,8 +377,14 @@ if __name__ == '__main__':
     print(f'Site: {SITE}  (simulate={SIMULATE})')
     print(f'Base data dir: {BASE_DATA_DIR}')
     print(f'Gas: {config.gas}')
-    print(f'P2 mesh: {MESH_V} V   drift: {DRIFT_V} V   (gap = {DRIFT_V - MESH_V} V)')
-    print(f'Sub-runs: {n_sub} x {SUBRUN_MIN} min = {run_min} min (~{total_h:.2f} h + overhead)')
+    print(f'Trigger: {config.trigger}')
+    if HV_SCAN:
+        print(f'HV SCAN: mesh {MESH_SCAN_V[0]}-{MESH_SCAN_V[-1]} V in {len(MESH_SCAN_V)} points, '
+              f'drift = mesh + {DRIFT_GAP_V} V, both detectors')
+    else:
+        print(f'P2 mesh: {MESH_V} V   drift: {DRIFT_V} V   (gap = {DRIFT_V - MESH_V} V)')
+    print(f'Sub-runs: {n_sub} x {config.sub_runs[0]["run_time"] if n_sub else 0} min '
+          f'= {run_min} min (~{total_h:.2f} h + overhead)')
     print(f'Active FEUs: {config.get_active_feus()}')
 
     print('donzo')

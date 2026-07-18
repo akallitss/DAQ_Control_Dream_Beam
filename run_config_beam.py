@@ -125,7 +125,7 @@ class Config(RunConfigBase):
         self.save_fdfs = True  # True to save FDF files, False to delete after decoding
         self.start_time = None
         self.process_on_fly = False  # False: processor_watcher handles processing independently
-        self.power_off_hv_at_end = False  # True to power off all CAEN HV at the end of the run.
+        self.power_off_hv_at_end = True  # Power off all CAEN HV at the end of the run.
         self.resume = False  # True to resume an existing run: skip sub-runs already marked .subrun_complete.
         self.write_all_detectors_to_json = True  # Only when making run config json template. Maybe do always?
         self.gas = 'Ar/Iso 95/5'  # Gas type for run

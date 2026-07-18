@@ -10,6 +10,9 @@ from Cosmic_Bench_DAQ_Control/run_config.py — same cabling as the cosmic bench
 Site switching: set SITE below.
   'local' — full simulation on this machine (fake CAEN HV + fake Dream DAQ that
             replays sample fdfs), for testing the whole chain without hardware.
+  'rays'  — real hardware on the cosmic bench rays machine (sedipcaa28 =
+            rays_daplxa, user usernsw). Same FEUs/HV crate as the running
+            Cosmic_Bench_DAQ_Control — do NOT run both DAQs at the same time.
   'sps'   — real hardware at the SPS beam line. Fields marked TODO-SPS must be
             filled in once the beam-area network / HV crate details are known.
 
@@ -23,7 +26,7 @@ from run_config_base import RunConfigBase
 # ---------------------------------------------------------------------------
 # Site configuration — the ONE place to switch local test <-> SPS machine
 # ---------------------------------------------------------------------------
-SITE = 'local'  # 'local' or 'sps'
+SITE = os.environ.get('DAQ_SITE', 'local')  # 'local', 'rays' or 'sps'; export DAQ_SITE=rays on the rays machine
 
 SITES = {
     'local': {
@@ -35,6 +38,16 @@ SITES = {
         'simulate': True,           # fake HV + fake Dream DAQ (replay sample fdfs)
         'reconstruction_build': '/local/home/ak271430/Documents/PostDocSaclay/'
                                 'mm_dream_reconstruction/build/',
+    },
+    'rays': {
+        # Cosmic bench DAQ machine (sedipcaa28.extra.cea.fr, ssh alias rays_daplxa).
+        # Values confirmed 2026-07-16 against the live Cosmic_Bench_DAQ_Control setup.
+        'base_data_dir': '/mnt/cosmic_data/P2/sps_daq_test/',
+        'daq_host': '192.168.10.1',                  # rays' IP on the FEU/HV subnet
+        'hv_ip': '192.168.10.81',                    # CAEN mainframe (web login on :80)
+        'hv_n_cards': 4,
+        'simulate': False,
+        'reconstruction_build': '/local/home/usernsw/mm_dream_reconstruction/build/',
     },
     'sps': {
         'base_data_dir': '/mnt/data/p2_sps_beam/',   # TODO-SPS: data disk on DAQ machine

@@ -250,10 +250,11 @@ class Config(RunConfigBase):
         self.detectors = [
             {
                 'name': 'P2_OUT',
-                'description': 'P2 telescope outer detector, SPS 2026',
+                'description': 'P2 telescope outer detector (det2), SPS 2026. '
+                               'Bulked 25-6-26; has the misaligned wall.',
                 'det_type': 'P2',
                 'resist_type': 'none',
-                'bulked_from': 'Alex+Arnaud',
+                'bulked_from': 'Alex+Enzo',
                 'det_center_coords': {  # Center of detector. TODO-SPS: beam-line survey coordinates
                     'x': 0,  # mm
                     'y': 0,  # mm
@@ -270,10 +271,12 @@ class Config(RunConfigBase):
             },
             {
                 'name': 'P2_MID',
-                'description': 'P2 telescope middle detector, SPS 2026',
+                'description': 'P2 telescope middle detector (det3), SPS 2026. '
+                               'Bulked 2-7-26; 2 insulations on the wall (half '
+                               'of the lights were working at a time).',
                 'det_type': 'P2',
                 'resist_type': 'none',
-                'bulked_from': 'Alex+Arnaud',
+                'bulked_from': 'Alex+Enzo',
                 'det_center_coords': {  # Center of detector. TODO-SPS: beam-line survey coordinates
                     'x': 0,  # mm
                     'y': 0,  # mm

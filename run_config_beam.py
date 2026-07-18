@@ -238,11 +238,13 @@ class Config(RunConfigBase):
 
         self.included_detectors = ['P2_OUT', 'P2_MID']
 
-        # Telescope cabling (2026-07-18): each detector has connectors 4-7 read
-        # out, each connector on a bot/top Dream pair filling FEU connectors 1-8.
+        # Telescope cabling (2026-07-18, FEU assignment fixed later that day):
+        # each detector has connectors 4-7 read out, each connector on a
+        # bot/top Dream pair filling FEU connectors 1-8.
         # Cfg FEU numbers are TCM input ports (per SelfTcm.cfg):
-        # P2_OUT -> FEU Id 103 (cfg Feu 5, 192.168.10.115)
+        # P2_OUT -> FEU Id 101 (cfg Feu 3, 192.168.10.113)
         # P2_MID -> FEU Id 102 (cfg Feu 4, 192.168.10.114)
+        # FEU Id 103 (cfg Feu 5, .115) is currently detector-less.
         # dream_feu_orientation carried over from the cosmic-bench P2 setup;
         # TODO-SPS: verify orientations and survey coordinates on the telescope.
         _telescope_dream_feus = lambda feu: {
@@ -273,7 +275,7 @@ class Config(RunConfigBase):
                     'z': 0,  # deg  Rotation about z axis
                 },
                 'hv_channels': P2_HV['P2_OUT'],
-                'dream_feus': _telescope_dream_feus(5),
+                'dream_feus': _telescope_dream_feus(3),
                 'dream_feu_orientation': dict(_telescope_orientation),
             },
             {

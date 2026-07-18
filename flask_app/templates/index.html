@@ -69,36 +69,9 @@
         </div>
       </div>
 
-      <!-- Monitoring strip -->
-      <div class="panel monitor-strip" id="monitor-panel">
-        <div class="strip-row">
-      <span class="strip-label">Monitoring</span>
-      <button id="monitor-toggle" class="btn btn-sm btn-secondary">Off</button>
-      <span id="monitor-last-check" class="text-muted small"></span>
-      <span id="monitor-active-alerts" class="text-danger small fw-bold"></span>
-      <div class="ms-auto d-flex gap-2">
-        <button id="monitor-test" class="btn btn-sm btn-outline-info">Test Alert</button>
-        <button id="monitor-setup" class="btn btn-sm btn-outline-secondary" data-bs-toggle="collapse" data-bs-target="#monitor-setup-collapse">Setup</button>
-      </div>
-    </div>
-    <div class="collapse" id="monitor-setup-collapse">
-      <div class="collapse-body">
-        <div class="d-flex flex-wrap align-items-center gap-2 mt-1">
-          <span class="text-muted small">Chat ID:</span>
-          <span id="monitor-chat-id" class="small font-monospace"></span>
-          <button id="monitor-fetch-chat-id" class="btn btn-sm btn-outline-secondary">Auto-fetch</button>
-          <span class="text-muted small ms-2">or enter manually:</span>
-          <input id="monitor-chat-id-input" type="text" class="form-control form-control-sm"
-                 style="width:160px;" placeholder="chat ID">
-          <button id="monitor-set-chat-id" class="btn btn-sm btn-outline-secondary">Set</button>
-          <span id="monitor-bot-name" class="text-muted small ms-3"></span>
-        </div>
-        <p class="text-muted small mt-2 mb-0">
-          To auto-fetch: open Telegram, find the bot, send it any message, then click Auto-fetch.
-        </p>
-      </div>
-        </div>
-      </div>
+      <!-- Monitoring strip (Telegram alert engine) removed 2026-07-18 — not
+           used for the SPS setup. Backend /monitor/* routes remain but are
+           unreferenced. -->
     </div>
   </div>
 
@@ -465,14 +438,16 @@ async function updateHVPlots() {
 }
 
 async function loadRuns() {
-    // Hack to only allow run_config_beam.json
+  // "auto": the backend resolves the run config whose run dir has the freshest
+  // hv_monitor.csv, so the HV panel follows whatever is running (beam run,
+  // pedestals, ...) instead of being pinned to run_config_beam.json.
   const runSelect = document.getElementById("run-select");
   runSelect.innerHTML = "";
   const opt = document.createElement("option");
-  opt.value = "run_config_beam.json";
-  opt.textContent = "run_config_beam.json";
+  opt.value = "auto";
+  opt.textContent = "auto (active run)";
   runSelect.appendChild(opt);
-  runSelect.value = "run_config_beam.json";
+  runSelect.value = "auto";
   loadSubruns();
 }
 
@@ -1127,88 +1102,7 @@ setInterval(async () => {
 setInterval(updateStatus, 1000);  // update every 1s
 updateStatus();
 
-// ---------------------------------------------------------------------------
-// Monitor panel
-// ---------------------------------------------------------------------------
-
-async function updateMonitorStatus() {
-  const res = await fetch("/monitor/status");
-  const d = await res.json();
-
-  const btn = document.getElementById("monitor-toggle");
-  if (d.running) {
-    btn.textContent = "On";
-    btn.className = "btn btn-sm btn-success";
-  } else {
-    btn.textContent = "Off";
-    btn.className = "btn btn-sm btn-secondary";
-  }
-
-  const lastCheck = document.getElementById("monitor-last-check");
-  lastCheck.textContent = d.last_check ? `Last check: ${d.last_check}` : "";
-
-  const alertsEl = document.getElementById("monitor-active-alerts");
-  if (d.active_alerts && d.active_alerts.length > 0) {
-    alertsEl.textContent = "⚠ Active alerts: " + d.active_alerts.join(", ");
-  } else {
-    alertsEl.textContent = "";
-  }
-
-  const chatIdEl = document.getElementById("monitor-chat-id");
-  chatIdEl.textContent = d.chat_id ? `${d.chat_id}` : "(not set)";
-}
-
-document.getElementById("monitor-toggle").addEventListener("click", async () => {
-  await fetch("/monitor/toggle", { method: "POST" });
-  await updateMonitorStatus();
-});
-
-document.getElementById("monitor-test").addEventListener("click", async () => {
-  const res = await fetch("/monitor/test", { method: "POST" });
-  const d = await res.json();
-  showPopup(d.message, d.success ? "#17a2b8" : "#dc3545");
-});
-
-document.getElementById("monitor-fetch-chat-id").addEventListener("click", async () => {
-  const res = await fetch("/monitor/fetch_chat_id", { method: "POST" });
-  const d = await res.json();
-  if (d.success) {
-    showPopup(`Chat ID set: ${d.chat_id}`, "#28a745");
-  } else {
-    showPopup(d.message, "#dc3545");
-  }
-  await updateMonitorStatus();
-});
-
-document.getElementById("monitor-set-chat-id").addEventListener("click", async () => {
-  const val = document.getElementById("monitor-chat-id-input").value.trim();
-  if (!val) return;
-  const res = await fetch("/monitor/set_chat_id", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chat_id: parseInt(val) }),
-  });
-  const d = await res.json();
-  if (d.success) {
-    showPopup(`Chat ID set: ${d.chat_id}`, "#28a745");
-    document.getElementById("monitor-chat-id-input").value = "";
-  } else {
-    showPopup(d.message, "#dc3545");
-  }
-  await updateMonitorStatus();
-});
-
-// Fetch bot username for display
-(async () => {
-  const res = await fetch("/monitor/bot_info");
-  const d = await res.json();
-  if (d.success) {
-    document.getElementById("monitor-bot-name").textContent = `Bot: @${d.username}`;
-  }
-})();
-
-updateMonitorStatus();
-setInterval(updateMonitorStatus, 10000);
+// Monitor panel (Telegram alerts) removed 2026-07-18 with its UI strip.
 
 updateHVPlots();
 setInterval(updateHVPlots, 5000);  // update every 5s
@@ -1388,8 +1282,15 @@ async function updateSysStats() {
                     sysFormatBytes(disk.used) + '/' + sysFormatBytes(disk.total))
                 : sysMakeBar(label, 0, 'n/a');
         };
-        sysDiskRow('sys-ssd-row', 'SSD', d.ssd);
-        sysDiskRow('sys-hdd-row', 'HDD', d.hdd);
+        if (d.single_disk) {
+            // OS and data dir live on the same filesystem (banco: one NVMe) —
+            // one row instead of two identical SSD/HDD rows.
+            sysDiskRow('sys-ssd-row', 'Disk', d.ssd);
+            document.getElementById('sys-hdd-row').innerHTML = '';
+        } else {
+            sysDiskRow('sys-ssd-row', 'SSD', d.ssd);
+            sysDiskRow('sys-hdd-row', 'HDD', d.hdd);
+        }
     } catch (e) { /* silent */ }
 }
 

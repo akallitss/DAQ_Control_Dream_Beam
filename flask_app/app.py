@@ -655,6 +655,50 @@ def _run_has_hv_data(run_dir, hv_file="hv_monitor.csv"):
     return False
 
 
+def _load_hv_cfg(run_name):
+    """Run config dict for the HV panel. run_name is a json filename under
+    CONFIG_RUN_DIR, or 'auto': pick the config whose run_out_dir holds the most
+    recently modified hv_monitor.csv — i.e. follow whatever run (beam,
+    pedestals, ...) is currently writing HV data. None if nothing matches."""
+    if run_name and run_name != "auto":
+        config_path = os.path.join(CONFIG_RUN_DIR, run_name)
+        if not os.path.isfile(config_path):
+            return None
+        try:
+            with open(config_path) as f:
+                return json.load(f)
+        except Exception:
+            return None
+    best_cfg, best_mtime = None, -1.0
+    try:
+        json_names = [f for f in os.listdir(CONFIG_RUN_DIR) if f.endswith(".json")]
+    except OSError:
+        json_names = []
+    for name in json_names:
+        try:
+            with open(os.path.join(CONFIG_RUN_DIR, name)) as f:
+                cfg = json.load(f)
+        except Exception:
+            continue
+        run_dir = _hv_run_dir(cfg)
+        mtime = _newest_hv_mtime(run_dir)
+        if mtime > best_mtime:
+            best_cfg, best_mtime = cfg, mtime
+    return best_cfg
+
+
+def _newest_hv_mtime(run_dir, hv_file="hv_monitor.csv"):
+    """Most recent mtime of any subrun's HV monitor CSV under run_dir, or -1."""
+    newest = -1.0
+    if not run_dir or not os.path.isdir(run_dir):
+        return newest
+    for sub in os.listdir(run_dir):
+        csv_path = os.path.join(run_dir, sub, hv_file)
+        if os.path.isfile(csv_path):
+            newest = max(newest, os.path.getmtime(csv_path))
+    return newest
+
+
 def _hv_run_dir(cfg, hv_file="hv_monitor.csv"):
     """Run directory the HV plot should read: normally the config's run_out_dir, but
     when that run has no HV data yet (a run just started, or between runs while the
@@ -664,9 +708,18 @@ def _hv_run_dir(cfg, hv_file="hv_monitor.csv"):
     primary = cfg.get("run_out_dir")
     if _run_has_hv_data(primary, hv_file):
         return primary
+    # Fall back to sibling runs of the same kind first (e.g. other runs under
+    # pedestals/ for a pedestal config), then the beam runs dir — so a freshly
+    # regenerated config (whose own run dir doesn't exist yet) still shows the
+    # latest run that has HV data.
+    candidates = []
+    for coll_dir in ([os.path.dirname(primary.rstrip('/'))] if primary else []) + [RUN_DIR]:
+        try:
+            candidates.extend(os.path.join(coll_dir, d) for d in os.listdir(coll_dir))
+        except OSError:
+            continue
     try:
-        candidates = sorted((os.path.join(RUN_DIR, d) for d in os.listdir(RUN_DIR)),
-                            key=os.path.getmtime, reverse=True)
+        candidates = sorted(dict.fromkeys(candidates), key=os.path.getmtime, reverse=True)
     except OSError:
         candidates = []
     for d in candidates:
@@ -681,13 +734,10 @@ def get_subruns():
     if not run_name:
         return jsonify([])
 
-    config_path = os.path.join(CONFIG_RUN_DIR, run_name)
-    if not os.path.isfile(config_path):
-        return jsonify([])
-
     try:
-        with open(config_path) as f:
-            cfg = json.load(f)
+        cfg = _load_hv_cfg(run_name)
+        if cfg is None:
+            return jsonify([])
         run_dir = _hv_run_dir(cfg)
         if not run_dir:
             return jsonify([])
@@ -747,12 +797,9 @@ def hv_data():
         subrun_name = request.args.get("subrun")
         hv_file_name = request.args.get("hv_file", "hv_monitor.csv")
 
-        config_path = os.path.join(CONFIG_RUN_DIR, run_name)
-        if not os.path.isfile(config_path):
+        cfg = _load_hv_cfg(run_name)
+        if cfg is None:
             return jsonify([])
-
-        with open(config_path) as f:
-            cfg = json.load(f)
         # Resolve the same run dir as /get_subruns (with the previous-run fallback),
         # so the subrun the selector offers is found here too.
         output_dir = _hv_run_dir(cfg, hv_file_name)
@@ -989,6 +1036,12 @@ def system_stats():
 
         ssd = disk_stats('/')            # OS/system SSD
         hdd = disk_stats(BASE_DATA_DIR)  # data disk (from run_config_beam SITE)
+        # On banco the data dir lives on the OS NVMe — same filesystem. Flag it
+        # so the page shows a single "Disk" row instead of identical SSD/HDD.
+        try:
+            single_disk = os.stat('/').st_dev == os.stat(BASE_DATA_DIR).st_dev
+        except OSError:
+            single_disk = False
         return jsonify({
             "success": True,
             "cpu_cores": cpu_pcts,
@@ -996,6 +1049,7 @@ def system_stats():
             "swap":   {"total": swap.total, "used": swap.used, "percent": swap.percent},
             "ssd":    ssd,
             "hdd":    hdd,
+            "single_disk": single_disk,
             "load_avg": list(load),
         })
     except ImportError:

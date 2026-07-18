@@ -15,7 +15,9 @@ import logging
 import subprocess
 from subprocess import Popen, PIPE, STDOUT
 import pty
+import signal
 import termios
+import time
 from time import sleep
 from datetime import datetime
 import traceback
@@ -145,7 +147,21 @@ def main():
                         else:
                             print(f'Starting Dream DAQ with command: {run_command}')
                             prepare_terminal()
-                            ret = subprocess.call(run_command)
+                            process = subprocess.Popen(run_command)
+                            if (effective_info.get('do_pedestal_threshold_run')
+                                    and effective_info.get('do_data_run') is False):
+                                # Pure pedestal run: banco's RunCtrl falls to its
+                                # interactive '***' prompt after the PedThr phase
+                                # instead of exiting in batch mode — stop it once
+                                # the .prg outputs are complete (see watchdog).
+                                threading.Thread(
+                                    target=pedestal_run_watchdog,
+                                    args=(process, sub_run_dir,
+                                          effective_info.get('included_feus') or [],
+                                          effective_info.get('go_timeout', 300)),
+                                    daemon=True,
+                                ).start()
+                            ret = process.wait()
 
                         # while True:
                         #     output = process.stdout.readline()
@@ -420,6 +436,45 @@ def get_tmux_pane():
         return None
 
 
+def pedestal_run_watchdog(process, sub_run_dir, included_feus, go_timeout, poll_s=5):
+    """End RunCtrl once a pure pedestal run's outputs are complete.
+
+    On banco, RunCtrl (batch mode) runs the PedThr phase unattended but then
+    drops to its interactive '***' prompt instead of exiting when the remaining
+    phases (TrgThrRun/DataRun) are disabled, hanging the sub-run forever. The
+    run's only purpose is the per-FEU _ped.prg/_thr.prg outputs: once they all
+    exist, give RunCtrl a grace period to finish writing, then SIGINT it (its
+    cleanup trap restores the terminal). Falls back to stopping after
+    go_timeout even without outputs so a failed run cannot hang the DAQ.
+    """
+    feus = [int(f) for f in included_feus]
+    start = time.time()
+    while process.poll() is None:
+        try:
+            names = os.listdir(sub_run_dir)
+        except OSError:
+            names = []
+        done = feus and all(
+            any(n.endswith(f'_{feu:02d}_ped.prg') for n in names)
+            and any(n.endswith(f'_{feu:02d}_thr.prg') for n in names)
+            for feu in feus)
+        timed_out = time.time() - start > go_timeout
+        if done or timed_out:
+            sleep(10)  # grace: let RunCtrl finish writing fdf/aux files
+            if process.poll() is None:
+                if done:
+                    print('\nPedestal outputs complete for all FEUs — stopping RunCtrl.')
+                else:
+                    print(f'\nWARNING: pedestal run produced no complete outputs within '
+                          f'{go_timeout:.0f}s — stopping RunCtrl.')
+                process.send_signal(signal.SIGINT)
+                sleep(10)
+                if process.poll() is None:
+                    process.kill()
+            return
+        sleep(poll_s)
+
+
 def runctrl_batch_watchdog(process, go_timeout, tmux_pane):
     """Recover from a batch-mode failure where RunCtrl is stuck waiting for 'G'.
 
@@ -543,10 +598,41 @@ def make_config_from_template(run_dir, cfg_template_file_path, cfg_file_run_time
         updates["Sys Action DataRun"] = _to_bit(do_data_run)
     update_config_value(cfg_file_path, updates)
 
+    # A pure pedestal run (PedThrRun without DataRun) must not preload FEU
+    # pedestal/threshold memories: templates can reference old .prg outputs
+    # (e.g. banco's SelfTcm.cfg pointing at a past test's files) by relative
+    # paths that don't exist in the run directory, which aborts RunCtrl in
+    # FeuMemConfig before any data is taken.
+    if do_pedestal_threshold_run and do_data_run is False:
+        clear_feu_mem_file_refs(cfg_file_path)
+
     if included_feus is not None:
         set_active_feus(cfg_file_path, included_feus, feu_connectors=feu_connectors, trigger_feu=trigger_feu)
 
     return cfg_file_path
+
+
+def clear_feu_mem_file_refs(filepath, output_path=None):
+    """Set every active ``Feu <N|*> Feu_RunCtrl_PdFile/ZsFile`` line to ``None``
+    so RunCtrl does not try to load pedestal/threshold memories from files."""
+    output_path = output_path or filepath
+    pat = re.compile(r'^(\s*)(Feu\s+(?:\*|\d+)\s+Feu_RunCtrl_(?:Pd|Zs)File)\s+\S.*$')
+    cleared = 0
+    with open(filepath, 'r') as f:
+        lines = f.readlines()
+    new_lines = []
+    for line in lines:
+        raw = line.rstrip('\n')
+        m = pat.match(raw)
+        if m and not raw.lstrip().startswith('#') and not raw.split()[-1] == 'None':
+            new_lines.append(f'{m.group(1)}{m.group(2)}         None\n')
+            cleared += 1
+        else:
+            new_lines.append(line)
+    with open(output_path, 'w') as f:
+        f.writelines(new_lines)
+    if cleared:
+        print(f'Cleared {cleared} FEU Pd/Zs memory file reference(s) for fresh pedestal run')
 
 
 # Connectors in dream_feus are 1-based (1..8) and map to FEU Dream indices 0..7.
@@ -593,8 +679,24 @@ def set_active_feus(filepath, included_feus, feu_connectors=None, trigger_feu=No
     with open(filepath, 'r') as f:
         lines = f.readlines()
 
+    # Which FEUs already have an ACTIVE (uncommented) line per hardware kind
+    # (index into hw_pats: 0 = Feu_RunCtrl_Id, 1 = NetChan_Ip)? Templates like
+    # banco's SelfTcm.cfg carry some FEUs only as commented-out blocks — those
+    # must be uncommented to enable the FEU, while a FEU whose active line
+    # exists keeps it as the single source of truth (a commented spare
+    # duplicate must not be resurrected alongside it).
+    active_hw = [set(), set()]
+    for line in lines:
+        raw = line.rstrip('\n')
+        if raw.lstrip().startswith('#'):
+            continue
+        for kind, pat in enumerate(hw_pats):
+            if pat.match(raw):
+                active_hw[kind].add(int(pat.match(raw).group('num')))
+
     new_lines = []
     activated, deactivated = set(), set()
+    uncommented_hw = set()  # (kind, feu_num) already uncommented — only the first block
     for line in lines:
         raw = line.rstrip('\n')
 
@@ -621,11 +723,17 @@ def set_active_feus(filepath, included_feus, feu_connectors=None, trigger_feu=No
             indent, body = hm.group('indent'), hm.group('body')
             was_commented = raw.lstrip().startswith('#')
             if feu_num in included:
-                # Preserve the template's comment state for included FEUs. nTof templates may carry a
-                # second, commented-out alternate hardware block (spare FEU Ids/IPs); force-uncommenting
-                # would resurrect it and create a duplicate Feu_RunCtrl_Id/NetChan_Ip line. The template's
-                # already-active block stays the single source of truth for each FEU's Id/IP.
-                new_lines.append(line)
+                kind = hw_pats.index(pat)
+                if was_commented and feu_num not in active_hw[kind] and (kind, feu_num) not in uncommented_hw:
+                    # FEU exists only as a commented block (e.g. SelfTcm.cfg) —
+                    # uncomment its first Id/IP lines so RunCtrl can open it.
+                    new_lines.append(f'{indent}{body}\n')
+                    uncommented_hw.add((kind, feu_num))
+                else:
+                    # Active line (or a later spare duplicate): keep the template's
+                    # comment state so an active block stays the single source of
+                    # truth and spares are not resurrected alongside it.
+                    new_lines.append(line)
             else:
                 # Comment out hardware for FEUs not in this run (no-op if already commented).
                 new_lines.append(line if was_commented else f'{indent}#{body}\n')

@@ -9,6 +9,7 @@ Created as Cosmic_Bench_DAQ_Control/run_config_template.py
 """
 
 import copy
+import os
 from datetime import datetime
 
 from run_config_base import RunConfigBase
@@ -31,8 +32,9 @@ class Config(RunConfigBase):
         self.__dict__.update(copy.deepcopy(beam.__dict__))
 
         # --- Pedestal-specific overrides ---
+        # DAQ_RUN_NAME overrides the timestamped default (e.g. for named tests).
         date_time_str = datetime.now().strftime('%m-%d-%y_%H-%M-%S')
-        self.run_name = f'pedestals_{date_time_str}'
+        self.run_name = os.environ.get('DAQ_RUN_NAME') or f'pedestals_{date_time_str}'
         self.data_out_dir = f'{self.base_out_dir}pedestals/'
         self.run_out_dir = f'{self.data_out_dir}{self.run_name}/'
 

@@ -56,6 +56,11 @@ SITES = {
         # Built 2026-07-18 against ROOT 6.32.02 in ~/opt/root_v6.32.02 (binaries
         # carry an rpath to it — no thisroot.sh needed to run them).
         'reconstruction_build': '/local/home/banco/mm_dream_reconstruction/build/',
+        # Dream .cfg template maintained with the FEU software (source of truth
+        # for FEU Ids/IPs and TCM input numbering: input 3 = Id 101, 4 = 102,
+        # 5 = 103). set_feus_from_detectors activates/masks FEUs per run.
+        'dream_cfg_template': '/local/home/banco/Feu/Firmware/Implementation/'
+                              'Projects/Software/Linux/bin/EicP2Bt/SelfTcm.cfg',
     },
 }
 
@@ -119,9 +124,10 @@ class Config(RunConfigBase):
         self.dream_daq_info = {
             'ip': _SITE_CFG['daq_host'],
             'port': 1101,
-            # Cosmic bench P2 template (Sys DaqRun Trig Ext). TODO-SPS: copy to
-            # Sps_P2.cfg and adjust trigger/FEU hardware lines for the beam area.
-            'daq_config_template_path': f'{self.base_out_dir}dream_config/CosmicTb_P2.cfg',
+            # Site override (e.g. banco's SelfTcm.cfg) or the cosmic-bench P2
+            # template copied into the data tree.
+            'daq_config_template_path': _SITE_CFG.get(
+                'dream_cfg_template', f'{self.base_out_dir}dream_config/CosmicTb_P2.cfg'),
             # Directory where RunCtrl writes fdfs (fast local disk on the DAQ CPU).
             'run_directory': f'{self.base_out_dir}dream_run/{self.run_name}/',
             'data_out_dir': f'{self.run_out_dir}',
@@ -234,7 +240,8 @@ class Config(RunConfigBase):
 
         # Telescope cabling (2026-07-18): each detector has connectors 4-7 read
         # out, each connector on a bot/top Dream pair filling FEU connectors 1-8.
-        # P2_OUT -> FEU Id 103 (cfg Feu 6, 192.168.10.115)
+        # Cfg FEU numbers are TCM input ports (per SelfTcm.cfg):
+        # P2_OUT -> FEU Id 103 (cfg Feu 5, 192.168.10.115)
         # P2_MID -> FEU Id 102 (cfg Feu 4, 192.168.10.114)
         # dream_feu_orientation carried over from the cosmic-bench P2 setup;
         # TODO-SPS: verify orientations and survey coordinates on the telescope.
@@ -266,7 +273,7 @@ class Config(RunConfigBase):
                     'z': 0,  # deg  Rotation about z axis
                 },
                 'hv_channels': P2_HV['P2_OUT'],
-                'dream_feus': _telescope_dream_feus(6),
+                'dream_feus': _telescope_dream_feus(5),
                 'dream_feu_orientation': dict(_telescope_orientation),
             },
             {

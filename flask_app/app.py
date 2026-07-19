@@ -17,7 +17,7 @@ import select
 import threading
 import time
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 import pandas as pd
 from urllib.parse import quote
 from flask import Flask, render_template, jsonify, request, send_from_directory, abort
@@ -26,12 +26,15 @@ from flask_socketio import SocketIO, emit
 from daq_status import (get_dream_daq_status, get_hv_control_status,
                         get_daq_control_status, get_processor_watcher_status,
                         get_qa_watcher_status, get_backup_watcher_status,
-                        get_pedestal_watcher_status)
+                        get_pedestal_watcher_status, get_beam_watcher_status)
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # Add parent dir to path
 from run_config_beam import Config, BASE_DATA_DIR
 from get_run_events import get_total_events_for_run
 from monitor import DaqMonitor, fetch_chat_id, get_bot_username
+from beam_monitor.beam_intensity_controller import (BEAM_LOG_DIR, BEAM_STATE_PATH,
+                                                    NXCALS_PYTHON, BEAM_UNIT,
+                                                    PULSE_THRESHOLD_E10)
 
 # Repo root (parent of flask_app/) — no per-machine edit needed.
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -85,7 +88,7 @@ app = Flask(__name__)
 socketio = SocketIO(app)
 
 TMUX_SESSIONS = ["daq_control", "dream_daq", "hv_control", "processor_watcher", "qa_watcher", "backup_watcher",
-                 "pedestal_watcher"]
+                 "pedestal_watcher", "beam_watcher"]
 sessions = {}
 
 @app.route("/")
@@ -239,6 +242,8 @@ def status_all():
             info = get_backup_watcher_status()
         elif s == "pedestal_watcher":
             info = get_pedestal_watcher_status()
+        elif s == "beam_watcher":
+            info = get_beam_watcher_status()
         else:
             info = {"status": "READY", "color": "secondary", "fields": []}
 
@@ -506,6 +511,38 @@ def stop_backup():
     try:
         subprocess.run(["tmux", "kill-session", "-t", BACKUP_TMUX], capture_output=True)
         return jsonify({"success": True, "message": "Backup watcher stopped"})
+    except Exception as e:
+        return jsonify({"success": False, "message": str(e)}), 500
+
+
+@app.route("/start_beam_watcher", methods=["POST"])
+def start_beam_watcher():
+    """Start the SPS beam-intensity watcher (sole owner of the NXCALS/Spark session:
+    pulls the SPS intensity variable, logs it, and publishes beam on/off). Needs a
+    valid Kerberos ticket (kinit <user>@CERN.CH) and the NXCALS venv."""
+    try:
+        # NOT sys.executable: pytimber + PySpark live in their own venv, not flask's.
+        if not os.path.exists(NXCALS_PYTHON):
+            return jsonify({"success": False,
+                            "message": f"NXCALS venv missing: {NXCALS_PYTHON} "
+                                       f"(see beam_monitor/README.md)"}), 500
+        subprocess.run(["tmux", "kill-session", "-t", "beam_watcher"], capture_output=True)
+        subprocess.Popen([
+            "tmux", "new-session", "-d", "-s", "beam_watcher",
+            NXCALS_PYTHON, f"{BASE_DIR}/beam_watcher.py"
+        ])
+        return jsonify({"success": True,
+                        "message": "Beam watcher started (first NXCALS query takes ~1 min)"})
+    except Exception as e:
+        return jsonify({"success": False, "message": str(e)}), 500
+
+
+@app.route("/stop_beam_watcher", methods=["POST"])
+def stop_beam_watcher():
+    """Stop the beam watcher. Beam-intensity logging pauses until it restarts."""
+    try:
+        subprocess.run(["tmux", "kill-session", "-t", "beam_watcher"], capture_output=True)
+        return jsonify({"success": True, "message": "Beam watcher stopped"})
     except Exception as e:
         return jsonify({"success": False, "message": str(e)}), 500
 
@@ -1018,6 +1055,45 @@ def monitor_bot_info():
     return jsonify({"success": True, "username": username})
 
 
+# Network interfaces and physical disks to report I/O rates for. x17 hardcodes
+# these per-machine; here they are auto-detected so the same code runs on banco
+# and on the local dev/sim setup: every non-virtual NIC, plus the block devices
+# backing / and BASE_DATA_DIR (a single entry when they share a filesystem —
+# the banco single_disk case).
+def _detect_net_ifaces():
+    try:
+        import psutil
+        virtual = ("lo", "veth", "docker", "br-", "virbr", "tun", "tap", "vnet")
+        return sorted(n for n in psutil.net_io_counters(pernic=True)
+                      if not n.startswith(virtual))
+    except Exception:
+        return []
+
+
+def _block_dev_for_path(path):
+    """Base block device name (e.g. 'sda', 'nvme0n1') backing path, or None.
+    Resolves the st_dev major:minor through /sys/dev/block; a partition symlink
+    ends .../block/<disk>/<part>, a whole disk (or dm device) .../block/<dev>."""
+    try:
+        st = os.stat(path)
+        link = os.readlink(f"/sys/dev/block/{os.major(st.st_dev)}:{os.minor(st.st_dev)}")
+        parent = os.path.basename(os.path.dirname(link))
+        return parent if parent != "block" else os.path.basename(link)
+    except OSError:
+        return None
+
+
+_NET_IFACES = _detect_net_ifaces()
+_DISK_DEVS = {}
+for _key, _path in (("ssd", "/"), ("hdd", BASE_DATA_DIR)):
+    _dev = _block_dev_for_path(_path)
+    if _dev and _dev not in _DISK_DEVS.values():
+        _DISK_DEVS[_key] = _dev
+
+# Previous I/O counter sample, kept between /system_stats calls to derive rates.
+_io_prev = {"t": None, "net": None, "disk": None}
+
+
 @app.route("/system_stats")
 def system_stats():
     try:
@@ -1042,6 +1118,53 @@ def system_stats():
             single_disk = os.stat('/').st_dev == os.stat(BASE_DATA_DIR).st_dev
         except OSError:
             single_disk = False
+
+        # ---- I/O rates (bytes/sec) derived from the previous sample ----
+        now = time.monotonic()
+        net_ctr = psutil.net_io_counters(pernic=True)
+        # psutil can fail to parse /proc/diskstats lines on some kernel/psutil
+        # combinations (seen on banco with loop devices). Disk I/O rates then
+        # just read 0 — never fail the whole system_stats response over it.
+        try:
+            disk_ctr = psutil.disk_io_counters(perdisk=True)
+        except Exception:
+            disk_ctr = {}
+        prev = _io_prev
+        dt = (now - prev["t"]) if prev["t"] else None
+
+        def rate(cur, prev_val):
+            if dt and dt > 0 and prev_val is not None:
+                return max(0.0, (cur - prev_val) / dt)
+            return 0.0
+
+        net_rates = {}
+        for name in _NET_IFACES:
+            cur = net_ctr.get(name)
+            p = (prev["net"] or {}).get(name)
+            if cur:
+                net_rates[name] = {
+                    "rx": rate(cur.bytes_recv, p.bytes_recv if p else None),
+                    "tx": rate(cur.bytes_sent, p.bytes_sent if p else None),
+                }
+            else:
+                net_rates[name] = None
+
+        disk_rates = {}
+        for key, dev in _DISK_DEVS.items():
+            cur = disk_ctr.get(dev)
+            p = (prev["disk"] or {}).get(dev)
+            if cur:
+                disk_rates[key] = {
+                    "read":  rate(cur.read_bytes,  p.read_bytes if p else None),
+                    "write": rate(cur.write_bytes, p.write_bytes if p else None),
+                }
+            else:
+                disk_rates[key] = None
+
+        _io_prev["t"] = now
+        _io_prev["net"] = net_ctr
+        _io_prev["disk"] = disk_ctr
+
         return jsonify({
             "success": True,
             "cpu_cores": cpu_pcts,
@@ -1050,12 +1173,161 @@ def system_stats():
             "ssd":    ssd,
             "hdd":    hdd,
             "single_disk": single_disk,
+            "net":    net_rates,
+            "disk_io": disk_rates,
             "load_avg": list(load),
         })
     except ImportError:
         return jsonify({"success": False, "message": "psutil not installed"})
     except Exception as e:
         return jsonify({"success": False, "message": str(e)})
+
+
+# Logged system-stats CSVs (per-day) for /system_stats/history. x17 has a separate
+# system_stats_watcher (system_monitor/) writing here; this repo doesn't run one
+# yet, so until it exists the route just returns empty history and the Overview
+# plots fill in live. Kept in the same slow_control tree as the beam logs.
+SYSTEM_STATS_LOG_DIR = os.path.join(os.path.dirname(BEAM_LOG_DIR.rstrip('/')),
+                                    "system_stats")
+
+
+@app.route("/system_stats/history")
+def system_stats_history():
+    """Logged system-resource history from the per-day CSV(s) a system_stats_watcher
+    writes, so the Overview plots come up already populated instead of filling in live.
+    `minutes` trims to a recent window; the result is downsampled to keep the payload
+    light. Net/disk rates are summed across interfaces/devices to match the live plots."""
+    import glob
+    minutes = request.args.get("minutes", default=30.0, type=float)
+    max_points = request.args.get("max_points", default=600, type=int)
+    empty = {"success": True, "time": [], "cpu": [], "cpu_avg": [], "mem": [],
+             "swap": [], "net_rx": [], "net_tx": [], "disk_r": [], "disk_w": []}
+    try:
+        files = sorted(glob.glob(os.path.join(SYSTEM_STATS_LOG_DIR, "system_stats_*.csv")))
+        if not files:
+            return jsonify(empty)
+        # Read the last couple of day-files so a window spanning midnight still works.
+        df = pd.concat([pd.read_csv(f) for f in files[-2:]], ignore_index=True)
+        df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+        df = df.dropna(subset=["timestamp"])
+        if minutes and minutes > 0:
+            df = df[df["timestamp"] >= datetime.now() - timedelta(minutes=minutes)]
+        if df.empty:
+            return jsonify(empty)
+        # Downsample by striding so the trace stays light but keeps its shape.
+        if len(df) > max_points:
+            df = df.iloc[:: (len(df) // max_points) + 1]
+
+        def sum_pattern(pattern):
+            """Sum every column matching pattern into one series (interface/device
+            names are auto-detected here, so match by shape rather than by name)."""
+            s = None
+            for n in df.columns:
+                if re.fullmatch(pattern, n):
+                    col = pd.to_numeric(df[n], errors="coerce").fillna(0)
+                    s = col if s is None else s + col
+            return (s if s is not None else pd.Series(0.0, index=df.index)).tolist()
+
+        core_cols = sorted(
+            [c for c in df.columns if re.fullmatch(r"cpu\d+", c)],
+            key=lambda c: int(c[3:]))
+        return jsonify({
+            "success": True,
+            "time": df["timestamp"].dt.strftime("%Y-%m-%dT%H:%M:%S").tolist(),
+            "cpu": df[core_cols].round(1).values.tolist() if core_cols else [],
+            "cpu_avg": df["cpu_avg"].round(1).tolist() if "cpu_avg" in df else [],
+            "mem": df["mem_percent"].round(1).tolist() if "mem_percent" in df else [],
+            "swap": df["swap_percent"].round(1).tolist() if "swap_percent" in df else [],
+            "net_rx": sum_pattern(r"net_.+_rx_bps"),
+            "net_tx": sum_pattern(r"net_.+_tx_bps"),
+            "disk_r": sum_pattern(r"disk_.+_read_bps"),
+            "disk_w": sum_pattern(r"disk_.+_write_bps"),
+        })
+    except Exception as e:
+        return jsonify({"success": False, "message": str(e)}), 500
+
+
+# --- SPS beam intensity ---
+# The NXCALS session is owned by the separate beam_watcher process (see
+# beam_monitor/beam_intensity_controller.py). Flask only reads the watcher's
+# published state and CSV history. Intensity is in 1e10 protons per spill.
+
+def _beam_read_state():
+    """The beam watcher's latest published state, or a disconnected stub if it isn't
+    running yet / hasn't written the file."""
+    try:
+        with open(BEAM_STATE_PATH) as f:
+            return json.load(f)
+    except Exception:
+        return {"connected": False, "last_error": "beam watcher not running",
+                "unit": BEAM_UNIT, "beam_on": None}
+
+
+@app.route("/beam/status")
+def beam_status():
+    """Latest SPS beam-intensity summary published by the beam_watcher process."""
+    return jsonify(_beam_read_state())
+
+
+@app.route("/beam/history")
+def beam_history():
+    """Logged beam-spill history from the per-day CSV(s) for a plot. `hours` trims
+    the window, striding keeps the payload light."""
+    import glob
+    hours = request.args.get("hours", default=6.0, type=float)
+    max_points = request.args.get("max_points", default=1500, type=int)
+    try:
+        files = sorted(glob.glob(os.path.join(BEAM_LOG_DIR, "beam_intensity_*.csv")))
+        if not files:
+            return jsonify({"success": True, "time": [], "intensity": [], "unit": BEAM_UNIT})
+        df = pd.concat([pd.read_csv(f) for f in files[-2:]], ignore_index=True)
+        df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+        df = df.dropna(subset=["timestamp"])
+        # Early watcher versions could re-log the lookback window on restart:
+        # sort + dedup so old files still plot cleanly.
+        df = df.sort_values("timestamp").drop_duplicates(subset=["timestamp"])
+        avg_window_min = 10
+        # Compute the rolling series on the FULL loaded frame and trim to the
+        # display window afterwards: a trailing sum/mean can't see cycles before
+        # the left edge, so trimming first would undercount the first
+        # avg_window_min of the window.
+        #
+        # Two complementary measures, same window:
+        #  * avg — rolling mean of REAL spills only (empty cycles excluded). Beam
+        #    QUALITY: how hot each spill is when beam is on. Blind to duty cycle.
+        #  * delivery — rolling SUM over ALL cycles (empty ones included, so they
+        #    count as zero). Protons delivered in the trailing window; this DROPS
+        #    to zero during beam-off, so it reflects duty cycle, not just quality.
+        pulses = df[df["intensity_e10"] >= PULSE_THRESHOLD_E10]
+        avg = (pulses.set_index("timestamp")["intensity_e10"]
+               .rolling(f"{avg_window_min}min").mean().reset_index())
+        delivery = (df.set_index("timestamp")["intensity_e10"]
+                    .rolling(f"{avg_window_min}min").sum().reset_index())
+        if hours and hours > 0:
+            cutoff = datetime.now() - timedelta(hours=hours)
+            df = df[df["timestamp"] >= cutoff]
+            avg = avg[avg["timestamp"] >= cutoff]
+            delivery = delivery[delivery["timestamp"] >= cutoff]
+        if len(avg) > max_points:
+            avg = avg.iloc[:: (len(avg) // max_points) + 1]
+        if len(delivery) > max_points:
+            delivery = delivery.iloc[:: (len(delivery) // max_points) + 1]
+        if len(df) > max_points:
+            df = df.iloc[:: (len(df) // max_points) + 1]
+        return jsonify({
+            "success": True,
+            "time": df["timestamp"].dt.strftime("%Y-%m-%d %H:%M:%S").tolist(),
+            "intensity": df["intensity_e10"].round(3).tolist(),
+            "avg_time": avg["timestamp"].dt.strftime("%Y-%m-%d %H:%M:%S").tolist(),
+            "avg_intensity": avg["intensity_e10"].round(3).tolist(),
+            "avg_window_min": avg_window_min,
+            "delivery_time": delivery["timestamp"].dt.strftime("%Y-%m-%d %H:%M:%S").tolist(),
+            "delivery_intensity": delivery["intensity_e10"].round(1).tolist(),
+            "delivery_window_min": avg_window_min,
+            "unit": BEAM_UNIT,
+        })
+    except Exception as e:
+        return jsonify({"success": False, "message": str(e)}), 500
 
 
 def is_dream_daq_running():

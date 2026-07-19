@@ -8,8 +8,16 @@ Created as Cosmic_Bench_DAQ_Control/daq_status.py
 @author: Dylan Neff, Dylan
 """
 
+import os
+import json
 import subprocess
 import re
+from datetime import datetime
+
+# State file the beam_watcher publishes (must match beam_monitor/
+# beam_intensity_controller.py BEAM_STATE_PATH — both resolve config/ in the repo).
+_REPO_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+BEAM_STATE_FILE = os.path.join(_REPO_DIR, "config", "beam_state.json")
 
 
 """ Colors:
@@ -353,6 +361,40 @@ def get_pedestal_watcher_status():
     # Session alive but no recognized line in the capture window (e.g. a long
     # unprefixed analysis printout scrolled everything out) — not an error.
     return _st("RUNNING", "info")
+
+
+def get_beam_watcher_status():
+    """Compact card for the SPS beam-intensity watcher (the separate process that
+    owns the NXCALS/Spark session). Derived from tmux session existence + the state
+    file the watcher publishes (connection + freshness), rendered as a small
+    status-only card."""
+    def small(status, color):
+        return {"status": status, "color": color, "small": True, "fields": []}
+
+    # No tmux session -> the watcher isn't running (beam logging is down).
+    alive = subprocess.run(["tmux", "has-session", "-t", "beam_watcher"],
+                           capture_output=True).returncode == 0
+    if not alive:
+        return small("STOPPED", "secondary")
+
+    try:
+        with open(BEAM_STATE_FILE) as f:
+            st = json.load(f)
+    except Exception:
+        return small("Starting", "info")   # session up, no state published yet
+
+    if not st.get("connected"):
+        return small("No NXCALS", "warning")   # session up but queries failing
+
+    # NXCALS polls every ~30 s (plus ~1 min Spark restart after a blip), so the
+    # staleness cutoff is much looser than the hardware watchers'.
+    try:
+        age = (datetime.now() - datetime.fromisoformat(st["timestamp"])).total_seconds()
+    except Exception:
+        age = None
+    if age is not None and age > 180:
+        return small("Stale", "warning")
+    return small("Logging", "success")
 
 
 def get_decoder_status():

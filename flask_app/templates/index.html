@@ -21,6 +21,10 @@
               <div class="stat-label">Events this run</div>
               <div class="stat-value" id="events-display">0</div>
             </div>
+            <div class="stat">
+              <div class="stat-label">Beam</div>
+              <div class="stat-value" id="run-beam" style="font-size:1.1rem;">—</div>
+            </div>
           </div>
 
           <select id="run-select" class="form-select d-none" style="width:auto;"></select>
@@ -44,6 +48,7 @@
               <button id="qa-toggle" class="btn btn-info btn-sm">Start QA</button>
               <button id="pedestal-toggle" class="btn btn-info btn-sm">Start Pedestal QA</button>
               <button id="backup-toggle" class="btn btn-info btn-sm">Start Backup</button>
+              <button id="beam-watcher-toggle" class="btn btn-info btn-sm">Start Beam Watcher</button>
               <button id="rerun-qa" class="btn btn-outline-warning btn-sm ms-auto">Rerun QA</button>
             </div>
           </div>
@@ -59,12 +64,20 @@
           <span id="sys-load-avg" class="ms-auto"></span>
         </div>
         <div class="panel-body">
-          <div id="sys-cpu-grid"></div>
-          <div class="sys-rows">
-            <div id="sys-mem-row"></div>
-            <div id="sys-swp-row"></div>
-            <div id="sys-ssd-row"></div>
-            <div id="sys-hdd-row"></div>
+          <div class="sys-col-title">CPU &amp; Memory</div>
+          <div id="sys-cpumem-plot" class="sys-plot-tall"></div>
+          <div class="sys-io-row">
+            <div>
+              <div class="sys-col-title">Disk Space</div>
+              <div class="sys-rows sys-diskspace">
+                <div id="sys-ssd-row"></div>
+                <div id="sys-hdd-row"></div>
+              </div>
+            </div>
+            <div>
+              <div class="sys-col-title">Network &amp; Disk I/O</div>
+              <div id="sys-io-plot" class="sys-plot"></div>
+            </div>
           </div>
         </div>
       </div>
@@ -101,6 +114,17 @@
           <div id="hv-current-plot" style="width:100%;height:380px;"></div>
         </div>
       </div>
+    </div>
+  </div>
+
+  <!-- SPS beam summary (mirrors the Beam tab plot) -->
+  <div class="panel mt-3">
+    <div class="panel-header">
+      <span class="panel-title">SPS Beam Intensity</span>
+      <span class="panel-header-note">per-spill intensity, avg &amp; protons/min delivery — last 6 h from NXCALS/Timber</span>
+    </div>
+    <div class="panel-body">
+      <div id="beam-plot-overview" style="width:100%;height:300px;"></div>
     </div>
   </div>
 
@@ -167,6 +191,10 @@
         <select id="ped-run-select" class="form-select" style="width:auto;">
           <option value="">Loading...</option>
         </select>
+        <label for="ped-compare-select" class="form-label mb-0 ms-2">Compare to:</label>
+        <select id="ped-compare-select" class="form-select" style="width:auto;">
+          <option value="">None</option>
+        </select>
         <button id="ped-reload" class="btn btn-outline-info btn-sm">Reload</button>
         <a id="ped-pdf-link" class="btn btn-outline-light btn-sm d-none" target="_blank" href="#">PDF</a>
       </div>
@@ -197,6 +225,75 @@
   </div>
 
   <div id="ab-gallery" class="row g-3 mt-0"></div>
+</div>
+
+
+<!-- Beam Tab: live SPS beam intensity from NXCALS/Timber -->
+<div class="tab-pane fade" id="beam">
+  <div class="row g-3">
+    <!-- Current state -->
+    <div class="col-12 col-xl-4">
+      <div class="panel h-100">
+        <div class="panel-header">
+          <span class="panel-title">SPS Beam</span>
+          <span id="beam-conn" class="ms-auto panel-header-note">…</span>
+        </div>
+        <div class="panel-body">
+          <div class="run-stats mb-0">
+            <div class="stat">
+              <div class="stat-label">Beam status</div>
+              <div class="stat-value" id="beam-state-big" style="font-size:1.6rem;">—</div>
+            </div>
+            <div class="stat">
+              <div class="stat-label">Last spill</div>
+              <div class="stat-value" id="beam-last-pulse" style="font-size:1.1rem;">—</div>
+            </div>
+          </div>
+          <div class="run-stats mb-0 mt-2">
+            <div class="stat">
+              <div class="stat-label">Spills / 10 min</div>
+              <div class="stat-value" id="beam-pulses-10m" style="font-size:1.1rem;">—</div>
+            </div>
+            <div class="stat">
+              <div class="stat-label">Protons / 10 min</div>
+              <div class="stat-value" id="beam-protons-10m" style="font-size:1.1rem;">—</div>
+            </div>
+            <div class="stat">
+              <div class="stat-label">Avg spill</div>
+              <div class="stat-value" id="beam-avg-10m" style="font-size:1.1rem;">—</div>
+            </div>
+          </div>
+          <p class="text-muted small mb-0 mt-3">
+            <span class="font-monospace">SPS.BCTDC.51454:SFTPRO_INT</span> — protons
+            slow-extracted from the SPS towards the North Area (placeholder until the
+            assigned beam line's counters are confirmed), one point per SFTPRO cycle,
+            read from NXCALS (Timber) every 30&nbsp;s. Beam counts as OFF after
+            5&nbsp;min without a spill. Logged to
+            <span class="font-monospace" id="beam-csv-path">beam_monitor logs</span>.
+          </p>
+          <p class="text-muted small mb-0 mt-2">
+            <span id="beam-krb"></span>
+          </p>
+          <p class="text-muted small mb-0 mt-2">
+            <span id="beam-updated"></span>
+          </p>
+        </div>
+      </div>
+    </div>
+
+    <!-- Trend -->
+    <div class="col-12 col-xl-8">
+      <div class="panel h-100">
+        <div class="panel-header">
+          <span class="panel-title">Beam Intensity Trend</span>
+          <span class="panel-header-note">protons per spill — last 6 h from the log</span>
+        </div>
+        <div class="panel-body">
+          <div id="beam-plot" style="width:100%;height:380px;"></div>
+        </div>
+      </div>
+    </div>
+  </div>
 </div>
 
 
@@ -344,10 +441,14 @@ async function fetchHVData() {
     return data;
 }
 
-// One hue per detector (validated dark categorical palette, slots 1-4: blue/aqua/
-// yellow/green); within a detector the drift line is a lighter blend of the same hue
-// so identity = colour and electrode = shade.
-const HV_DET_COLOR = { A: "#3987e5", B: "#199e70", C: "#c98500", D: "#008300" };
+// One hue per detector (validated dark categorical palette); within a detector the
+// drift line is a lighter blend of the same hue so identity = colour and
+// electrode = shade. Trace names come from _hv_channel_labels: P2_OUT ->
+// OUT_Drift/OUT_Mesh, P2_MID -> MID_Drift/MID_Mesh, so the map is keyed on the
+// detector-name suffix (x17 keyed on A/B/C/D; those stay as fallbacks so older
+// cosmic-bench style configs still colour up). OUT = blue, MID = yellow.
+const HV_DET_COLOR = { OUT: "#3987e5", MID: "#c98500",
+                       A: "#3987e5", B: "#199e70", C: "#c98500", D: "#008300" };
 function _hvLighten(hex, amt) {
     const n = parseInt(hex.slice(1), 16);
     const r = (n >> 16) & 255, g = (n >> 8) & 255, b = n & 255;
@@ -926,6 +1027,9 @@ const WATCHER_TOGGLES = [
       start: "/start_ped_qa", stop: "/stop_ped_qa", confirm: "Stop the pedestal QA watcher?" },
     { name: "backup_watcher", btn: "backup-toggle", label: "Backup",
       start: "/start_backup", stop: "/stop_backup", confirm: "Stop the backup watcher?" },
+    { name: "beam_watcher", btn: "beam-watcher-toggle", label: "Beam Watcher",
+      start: "/start_beam_watcher", stop: "/stop_beam_watcher",
+      confirm: "Stop the beam watcher? (SPS intensity logging pauses)" },
 ];
 const watcherStopped = {};  // name -> bool, tracked from /status
 
@@ -959,6 +1063,7 @@ WATCHER_TOGGLES.forEach(cfg => {
 
 async function loadPedRuns() {
     const select = document.getElementById("ped-run-select");
+    const cmp    = document.getElementById("ped-compare-select");
     const res = await fetch("/list_ped_runs");
     const data = await res.json();
     if (!data.success) {
@@ -971,33 +1076,72 @@ async function loadPedRuns() {
     const current = Array.from(select.options).map(o => o.textContent);
     if (labels.length === current.length && labels.every((l, i) => l === current[i])) return;
 
-    const prev = select.value;   // read at rebuild time, after the await
+    const prev    = select.value;   // read at rebuild time, after the await
+    const prevCmp = cmp.value;
     select.innerHTML = "";
+    cmp.innerHTML = '<option value="">None</option>';
     data.runs.forEach(r => {
-        const opt = document.createElement("option");
-        opt.value = r.name;
-        opt.textContent = r.has_qa ? r.name : `${r.name}  (no QA yet)`;
-        select.appendChild(opt);
+        const label = r.has_qa ? r.name : `${r.name}  (no QA yet)`;
+        const o1 = document.createElement("option");
+        o1.value = r.name; o1.textContent = label; select.appendChild(o1);
+        const o2 = document.createElement("option");
+        o2.value = r.name; o2.textContent = label; cmp.appendChild(o2);
     });
     if (prev && data.runs.some(r => r.name === prev)) {
-        select.value = prev;           // keep user's selection on refresh
-    }                                  // else newest run (first option) is selected
+        select.value = prev;             // keep user's nominal selection on refresh
+    }                                    // else newest run (first option) is selected
+    if (prevCmp && data.runs.some(r => r.name === prevCmp)) {
+        cmp.value = prevCmp;             // keep the comparison selection
+    } else if (data.runs.length > 1) {
+        cmp.value = data.runs[1].name;   // default comparison = second-newest run
+    }
 }
 
 const PED_LEVEL_BADGE = { good: "success", warn: "warning", bad: "danger" };
+// Problem-DREAM badge colours (match the analysis plots: disconnected cable = red,
+// suspect cable = orange).
+const PED_DREAM_BG = { disconnected_cable: "bg-danger", suspect_cable: "bg-warning text-dark" };
 
-function renderPedSummary(s) {
+// A "(+x)"/"(-x)" delta vs the comparison run. More (dead/noisy/RMS) is worse → red;
+// fewer → green. cur/prev may be null (missing FEU / N/A value) → no delta shown.
+function pedDelta(cur, prev, dec) {
+    if (cur == null || prev == null) return "";
+    const d = cur - prev;
+    const eps = dec ? 0.05 : 0.5;
+    if (Math.abs(d) < eps) return ` <span class="text-muted small">(0)</span>`;
+    const cls  = d > 0 ? "text-danger" : "text-success";
+    const sign = d > 0 ? "+" : "";
+    return ` <span class="${cls} small">(${sign}${d.toFixed(dec)})</span>`;
+}
+
+function renderPedSummary(s, cmp) {
     const div = document.getElementById("ped-summary");
     if (!s) { div.innerHTML = ""; return; }
 
+    const cmpFeus = (cmp && cmp.feus) ? cmp.feus : null;
+
+    // Split the top-line bad count into dead/stuck vs noisy/floating strips.
+    let totDead = 0, totNoisy = 0, cDead = 0, cNoisy = 0;
+    Object.values(s.feus).forEach(f => { totDead += f.n_dead; totNoisy += f.n_noisy; });
+    if (cmpFeus) Object.values(cmpFeus).forEach(f => { cDead += f.n_dead; cNoisy += f.n_noisy; });
+
     const overall = PED_LEVEL_BADGE[s.overall] || "secondary";
+    const cmpNote = cmpFeus
+        ? `<span class="text-muted small">vs ${cmp.pedestal_ts || "comparison"}</span>` : "";
     let html = `
       <div class="d-flex flex-wrap align-items-center gap-3 mb-2">
         <span class="badge bg-${overall}" style="font-size:1em;">${s.overall.toUpperCase()}</span>
-        <span>${s.total_bad} bad / ${s.total_ch} channels</span>
+        <span><span class="text-danger">${totDead} dead/stuck</span>${cmpFeus ? pedDelta(totDead, cDead, 0) : ""}
+              · <span class="text-warning">${totNoisy} noisy</span>${cmpFeus ? pedDelta(totNoisy, cNoisy, 0) : ""}
+              / ${s.total_ch} channels</span>
         <span class="text-muted">Ref CNS RMS: ${s.ref_cns_rms} ADC</span>
         <span class="text-muted">Pedestals: ${s.pedestal_ts || "?"}</span>
+        ${cmpNote}
         <span class="text-muted small">analyzed ${s.generated}</span>
+      </div>
+      <div class="mb-2 small text-muted">
+        Problem DREAMs: <span class="badge bg-danger">D#</span> disconnected cable
+        <span class="badge bg-warning text-dark ms-1">D#</span> suspect cable
       </div>
       <div style="overflow-x:auto;">
       <table class="table table-dark table-sm table-bordered" style="width:auto;font-size:0.9em;">
@@ -1008,15 +1152,21 @@ function renderPedSummary(s) {
 
     Object.keys(s.feus).sort((a, b) => a - b).forEach(feu => {
         const f = s.feus[feu];
+        const c = cmpFeus ? cmpFeus[feu] : null;
         const lvl = PED_LEVEL_BADGE[f.level] || "secondary";
-        const badDreams = Object.entries(f.bad_dreams)
-            .map(([d, cls]) => `D${d} (${cls.replace("_cable", "")})`)
-            .join(", ") || "—";
+        const badDreams = Object.entries(f.bad_dreams).map(([d, cls]) => {
+            const bg = PED_DREAM_BG[cls] || "bg-secondary";
+            return `<span class="badge ${bg} me-1" title="${cls}">D${d}</span>`;
+        }).join("") || "—";
+        const dNois = c ? pedDelta(f.n_noisy, c.n_noisy, 0) : "";
+        const dDead = c ? pedDelta(f.n_dead, c.n_dead, 0) : "";
+        const dOth  = c ? pedDelta(f.n_other, c.n_other, 0) : "";
+        const dCns  = c ? pedDelta(f.med_cns_rms, c.med_cns_rms, 1) : "";
         html += `<tr>
           <td><span class="badge bg-${lvl}">FEU ${String(feu).padStart(2, "0")}</span></td>
-          <td>${f.n_events}</td><td>${f.n_ok}</td><td>${f.n_noisy}</td>
-          <td>${f.n_dead}</td><td>${f.n_other}</td>
-          <td>${f.med_cns_rms ?? "N/A"}</td><td>${badDreams}</td>
+          <td>${f.n_events}</td><td>${f.n_ok}</td>
+          <td>${f.n_noisy}${dNois}</td><td>${f.n_dead}${dDead}</td><td>${f.n_other}${dOth}</td>
+          <td>${f.med_cns_rms ?? "N/A"}${dCns}</td><td>${badDreams}</td>
         </tr>`;
     });
     div.innerHTML = html + "</tbody></table></div>";
@@ -1048,7 +1198,18 @@ async function loadPedQA(bustCache = false, data = null) {
     }
     noQa.classList.add("d-none");
     pedLastGenerated = data.summary.generated;
-    renderPedSummary(data.summary);
+
+    // Fetch the comparison run's summary (if one is selected) for the +/- deltas.
+    let cmpSummary = null;
+    const cmpRun = document.getElementById("ped-compare-select").value;
+    if (cmpRun && cmpRun !== run) {
+        try {
+            const r2 = await fetch(`/ped_qa_data?run=${encodeURIComponent(cmpRun)}`);
+            const d2 = await r2.json();
+            if (d2.success && d2.has_qa) cmpSummary = d2.summary;
+        } catch (e) { /* comparison is best-effort; ignore fetch errors */ }
+    }
+    renderPedSummary(data.summary, cmpSummary);
 
     if (data.pdf) {
         pdfLink.href = data.pdf;
@@ -1079,6 +1240,7 @@ document.querySelector('a[href="#ped-viewer"]').addEventListener("click", async 
     await loadPedQA();
 });
 document.getElementById("ped-run-select").addEventListener("change", () => loadPedQA());
+document.getElementById("ped-compare-select").addEventListener("change", () => loadPedQA());
 document.getElementById("ped-reload").addEventListener("click", async () => {
     await loadPedRuns();
     await loadPedQA(true);
@@ -1240,6 +1402,130 @@ function sysFormatBytes(b) {
     return (b / 1e3).toFixed(0) + 'K';
 }
 
+// ---- Rolling history for the line plots ----------------------------------
+// /system_stats returns instantaneous samples, so we keep a client-side buffer
+// and rebuild the traces each poll. The window is time-based (last SYS_WINDOW_MS)
+// so the seeded CSV history + live samples share one rolling view.
+const SYS_WINDOW_MS = 10 * 60 * 1000;   // 10 min
+const sysSamples = [];   // [{t: Date, cpu: [..], cpuAvg, mem, swap, netRx, netTx, diskR, diskW}]
+
+// Drop samples older than the window (called after every push / seed).
+function sysTrim() {
+    const cutoff = Date.now() - SYS_WINDOW_MS;
+    while (sysSamples.length && sysSamples[0].t.getTime() < cutoff) sysSamples.shift();
+}
+
+// Prefill the buffer from logged CSVs (if a system_stats_watcher is running) so the
+// plots come up populated instead of filling in live. Runs once at load, before live
+// polling starts; harmless no-op when there is no logged history yet.
+async function sysSeedHistory() {
+    try {
+        const res = await fetch('/system_stats/history?minutes=' + (SYS_WINDOW_MS / 60000));
+        const d = await res.json();
+        if (!d.success || !d.time || !d.time.length) return;
+        const seeded = d.time.map((ts, i) => ({
+            t: new Date(ts),            // ISO local (no tz) -> parsed as local, matches live
+            cpu: d.cpu[i] || [],
+            cpuAvg: d.cpu_avg[i],
+            mem: d.mem[i], swap: d.swap[i],
+            netRx: d.net_rx[i], netTx: d.net_tx[i],
+            diskR: d.disk_r[i], diskW: d.disk_w[i],
+        }));
+        // Prepend logged history ahead of anything already collected live this session.
+        sysSamples.unshift(...seeded);
+        sysTrim();
+        sysDrawPlots();
+    } catch (e) { /* silent */ }
+}
+
+// Blue→red spread across the CPU cores so individual core lines stay distinct.
+function sysCoreColor(i, n) {
+    const h = 210 - (i / Math.max(1, n - 1)) * 210;
+    return `hsl(${h}, 55%, 60%)`;
+}
+
+// Shared dark plot styling (mirrors the HV plots on this page).
+const SYS_PLOT_CFG = { responsive: true, displaylogo: false, displayModeBar: false };
+const SYS_AXIS = { gridcolor: '#242e39', zerolinecolor: '#38434f', linecolor: '#38434f' };
+function sysBaseLayout() {
+    return {
+        showlegend: true,
+        legend: { orientation: 'h', font: { size: 10 }, x: 0, y: 1.22, yanchor: 'bottom' },
+        hovermode: 'x unified',
+        uirevision: 'sys',
+        paper_bgcolor: 'rgba(0,0,0,0)',
+        plot_bgcolor: 'rgba(0,0,0,0)',
+        font: { color: '#8b96a5', size: 10 },
+        hoverlabel: { bgcolor: '#1b222b', bordercolor: '#38434f' },
+        margin: { t: 18, r: 12, b: 20, l: 42 },
+    };
+}
+
+// Redraw the two line plots from the history buffer. Plotly can't size a plot
+// in a hidden tab (0 width), so skip drawing unless the Overview tab is visible.
+function sysDrawPlots() {
+    if (typeof Plotly === 'undefined') return;
+    const ov = document.getElementById('overview');
+    if (!ov || !ov.classList.contains('active')) return;
+    if (!sysSamples.length) return;
+
+    const t = sysSamples.map(s => s.t);
+    const nCores = sysSamples[sysSamples.length - 1].cpu.length;
+    const sysYTitle = { size: 11, color: '#cbd5e1' };
+
+    // CPU + Memory: two vertically-stacked subplots that SHARE the x-axis. CPU on top
+    // (y2), Memory below (y); the single x-axis (ticks at the bottom) is common to both.
+    const cpuTraces = [];
+    for (let i = 0; i < nCores; i++) {
+        cpuTraces.push({
+            x: t, y: sysSamples.map(s => s.cpu[i] ?? null),
+            mode: 'lines', name: 'core ' + (i + 1),
+            line: { color: sysCoreColor(i, nCores), width: 1 },
+            opacity: 0.5, showlegend: false, xaxis: 'x', yaxis: 'y2',
+        });
+    }
+    cpuTraces.push({
+        x: t, y: sysSamples.map(s => s.cpuAvg),
+        mode: 'lines', name: 'CPU avg', line: { color: '#3ddc84', width: 2.5 },
+        xaxis: 'x', yaxis: 'y2',
+    });
+    const memTraces = [
+        { x: t, y: sysSamples.map(s => s.mem), mode: 'lines', name: 'RAM',
+          line: { color: '#6ab0f3', width: 2 }, xaxis: 'x', yaxis: 'y' },
+        { x: t, y: sysSamples.map(s => s.swap), mode: 'lines', name: 'Swap',
+          line: { color: '#f0a050', width: 2 }, xaxis: 'x', yaxis: 'y' },
+    ];
+    Plotly.react('sys-cpumem-plot', [...cpuTraces, ...memTraces], {
+        ...sysBaseLayout(),
+        legend: { orientation: 'h', font: { size: 10 }, x: 0, y: 1.0, yanchor: 'bottom' },
+        margin: { t: 20, r: 12, b: 34, l: 48 },
+        xaxis:  { ...SYS_AXIS, anchor: 'y', domain: [0, 1] },
+        yaxis:  { ...SYS_AXIS, domain: [0, 0.46], range: [0, 100], ticksuffix: '%',
+                  title: { text: 'Mem', font: sysYTitle } },
+        yaxis2: { ...SYS_AXIS, domain: [0.54, 1], range: [0, 100], ticksuffix: '%',
+                  anchor: 'x', title: { text: 'CPU', font: sysYTitle } },
+    }, SYS_PLOT_CFG);
+
+    // Network + disk throughput, MB/s (rates summed across interfaces / devices).
+    // Wider left margin so the "MB/s" y tick labels aren't clipped in the narrow column.
+    const MB = 1e6;
+    Plotly.react('sys-io-plot', [
+        { x: t, y: sysSamples.map(s => s.netRx / MB), mode: 'lines', name: 'net ↓',
+          line: { color: '#6ab0f3', width: 2 } },
+        { x: t, y: sysSamples.map(s => s.netTx / MB), mode: 'lines', name: 'net ↑',
+          line: { color: '#b57edc', width: 2 } },
+        { x: t, y: sysSamples.map(s => s.diskR / MB), mode: 'lines', name: 'disk R',
+          line: { color: '#3ddc84', width: 2 } },
+        { x: t, y: sysSamples.map(s => s.diskW / MB), mode: 'lines', name: 'disk W',
+          line: { color: '#e0806a', width: 2 } },
+    ], {
+        ...sysBaseLayout(),
+        margin: { t: 18, r: 12, b: 20, l: 60 },
+        xaxis: { ...SYS_AXIS },
+        yaxis: { ...SYS_AXIS, rangemode: 'tozero', ticksuffix: ' MB/s' },
+    }, SYS_PLOT_CFG);
+}
+
 function sysMakeBar(label, pct, rightLabel) {
     const color = sysBarColor(pct);
     const w = Math.max(0, Math.min(100, pct));
@@ -1263,19 +1549,7 @@ async function updateSysStats() {
         const loadEl = document.getElementById('sys-load-avg');
         loadEl.textContent = 'load avg: ' + d.load_avg.map(x => x.toFixed(2)).join('  ');
 
-        const grid = document.getElementById('sys-cpu-grid');
-        grid.innerHTML = d.cpu_cores.map((pct, i) =>
-            sysMakeBar('CPU' + (i + 1), pct, null)
-        ).join('');
-
-        const m = d.memory, s = d.swap;
-        document.getElementById('sys-mem-row').innerHTML = sysMakeBar(
-            'Mem', m.percent,
-            sysFormatBytes(m.used) + '/' + sysFormatBytes(m.total));
-        document.getElementById('sys-swp-row').innerHTML = sysMakeBar(
-            'Swp', s.percent,
-            sysFormatBytes(s.used) + '/' + sysFormatBytes(s.total));
-
+        // Disk-space usage stays as bars.
         const sysDiskRow = (elId, label, disk) => {
             document.getElementById(elId).innerHTML = disk
                 ? sysMakeBar(label, disk.percent,
@@ -1291,10 +1565,173 @@ async function updateSysStats() {
             sysDiskRow('sys-ssd-row', 'SSD', d.ssd);
             sysDiskRow('sys-hdd-row', 'HDD', d.hdd);
         }
+
+        // Accumulate a sample for the line plots. Net/disk rates are summed across
+        // interfaces / physical devices into single throughput series.
+        const cores = d.cpu_cores || [];
+        const cpuAvg = cores.length ? cores.reduce((a, b) => a + b, 0) / cores.length : 0;
+        const sumIO = (obj, ...keys) => Object.values(obj || {}).reduce((acc, v) =>
+            v ? keys.reduce((a, k) => a + (v[k] || 0), acc) : acc, 0);
+        sysSamples.push({
+            t: new Date(),
+            cpu: cores,
+            cpuAvg,
+            mem: d.memory ? d.memory.percent : 0,
+            swap: d.swap ? d.swap.percent : 0,
+            netRx: sumIO(d.net, 'rx'),
+            netTx: sumIO(d.net, 'tx'),
+            diskR: sumIO(d.disk_io, 'read'),
+            diskW: sumIO(d.disk_io, 'write'),
+        });
+        sysTrim();
+
+        sysDrawPlots();
     } catch (e) { /* silent */ }
 }
 
-updateSysStats();
-setInterval(updateSysStats, 2000);
+// Seed from the logged CSVs first (plots come up populated), then start live polling.
+sysSeedHistory().finally(() => {
+    updateSysStats();
+    setInterval(updateSysStats, 2000);
+});
+// Overview may start hidden; redraw on show so the plots size correctly once the
+// container has real dimensions.
+document.querySelector('a[href="#overview"]')
+    .addEventListener('shown.bs.tab', sysDrawPlots);
+
+
+// ---------------------------------------------------------------------------
+// SPS beam intensity (Beam tab + Overview mirror). The NXCALS session is owned
+// by the beam_watcher process; the GUI reads /beam/status (state file) and
+// /beam/history (per-day CSV). New data lands every ~30 s, so polling is relaxed.
+// ---------------------------------------------------------------------------
+
+// intensity in 1e10 protons -> "6.8e12 p"
+function beamFmtP(e10) {
+  return e10 == null ? "—" : (e10 * 1e10).toExponential(1).replace("+", "") + " p";
+}
+
+function beamFmtAge(s) {
+  if (s == null) return "";
+  return s < 120 ? `${Math.round(s)} s ago` : `${Math.round(s / 60)} min ago`;
+}
+
+async function beamUpdateStatus() {
+  let d;
+  try { d = await (await fetch("/beam/status")).json(); } catch (e) { return; }
+
+  const conn = document.getElementById("beam-conn");
+  const big = document.getElementById("beam-state-big");
+  const runStat = document.getElementById("run-beam");
+
+  if (!d.connected) {
+    conn.textContent = "disconnected" + (d.last_error ? ` — ${String(d.last_error).split("\n")[0]}` : "");
+    conn.style.color = "var(--bad)";
+    big.textContent = "NO DATA";
+    big.style.color = "var(--muted)";
+    ["beam-last-pulse", "beam-pulses-10m", "beam-protons-10m", "beam-avg-10m"]
+      .forEach(id => document.getElementById(id).textContent = "—");
+    document.getElementById("beam-updated").textContent = "";
+    runStat.textContent = "—";
+    return;
+  }
+  conn.textContent = "connected";
+  conn.style.color = "var(--ok)";
+
+  big.textContent = d.beam_on ? "BEAM ON" : "BEAM OFF";
+  big.style.color = d.beam_on ? "var(--ok)" : "var(--bad)";
+
+  document.getElementById("beam-last-pulse").textContent =
+    d.last_pulse_e10 != null ? `${beamFmtP(d.last_pulse_e10)} · ${beamFmtAge(d.seconds_since_pulse)}` : "—";
+  document.getElementById("beam-pulses-10m").textContent = d.pulses_10min ?? "—";
+  document.getElementById("beam-protons-10m").textContent = beamFmtP(d.protons_10min_e10);
+  document.getElementById("beam-avg-10m").textContent = beamFmtP(d.avg_pulse_e10);
+  if (d.csv_path) document.getElementById("beam-csv-path").textContent = d.csv_path;
+  document.getElementById("beam-updated").textContent =
+    d.timestamp ? `updated ${d.timestamp.split("T")[1] || ""} · query ${d.query_s ?? "?"} s` : "";
+
+  // Kerberos expiry is the one silent failure mode — show it, red when < 12 h left.
+  const krb = document.getElementById("beam-krb");
+  if (d.krb_valid_until) {
+    const hoursLeft = (new Date(d.krb_valid_until) - Date.now()) / 3.6e6;
+    krb.textContent = `Kerberos ticket valid until ${d.krb_valid_until.replace("T", " ")} `
+                    + `(${hoursLeft.toFixed(0)} h) — reseed with kinit on the DAQ PC.`;
+    krb.style.color = hoursLeft < 12 ? "var(--bad)" : "";
+  } else {
+    krb.textContent = "";
+  }
+
+  // Mirror into the Run Control header (Overview tab): show the duty-cycle-aware
+  // delivery RATE (protons in the last 10 min / 10) rather than a single spill.
+  const pPerMin = d.protons_10min_e10 != null
+    ? beamFmtP(d.protons_10min_e10 / 10) + "/min" : "—";
+  runStat.innerHTML = d.beam_on
+    ? `<span style="color:var(--ok);">ON</span> · ${pPerMin}`
+    : `<span style="color:var(--bad);">OFF</span> · ${beamFmtAge(d.seconds_since_pulse)}`;
+}
+
+async function beamRenderPlot() {
+  if (typeof Plotly === "undefined") return;
+  let h;
+  try { h = await (await fetch("/beam/history?hours=6&max_points=3000")).json(); } catch (e) { return; }
+  if (!h || !h.success) return;
+  const axis = { gridcolor: '#242e39', zerolinecolor: '#38434f', linecolor: '#38434f' };
+  const win = h.delivery_window_min || 10;
+  const layout = {
+    hovermode: "closest",
+    paper_bgcolor: "rgba(0,0,0,0)", plot_bgcolor: "rgba(0,0,0,0)",
+    font: { color: "#8b96a5" }, hoverlabel: { bgcolor: "#1b222b", bordercolor: "#38434f" },
+    legend: { orientation: "h", y: -0.22, yanchor: "top" },
+    margin: { t: 20, r: 64, b: 48, l: 60 }, xaxis: { ...axis },
+    yaxis: { title: { text: "Intensity (10¹⁰ p / spill)", font: { size: 14, color: "#4dabe8" } },
+             ...axis, rangemode: "tozero" },
+    // Right axis: proton delivery RATE (trailing-window sum / window), a different
+    // quantity from per-spill intensity, so it gets its own scale.
+    yaxis2: { title: { text: "Protons / min (10¹⁰)", font: { size: 14, color: "#5cc98a" } },
+              ...axis, overlaying: "y", side: "right", rangemode: "tozero", showgrid: false },
+  };
+  // One marker per SFTPRO cycle (zeros included, so beam-off gaps are visible) —
+  // markers, not lines: spills are discrete and a line just draws noise.
+  // Plain SVG scatter (not scattergl): ~3000 points is light, and it keeps the
+  // plot working on machines/browsers without WebGL.
+  const markers = { x: h.time, y: h.intensity, name: "Spill intensity",
+                    type: "scatter", mode: "markers", marker: { color: "#4dabe8", size: 4 } };
+  // Per-spill rolling mean — beam QUALITY (blind to duty cycle).
+  const avgLine = (h.avg_time && h.avg_time.length)
+    ? { x: h.avg_time, y: h.avg_intensity, name: `${h.avg_window_min || 10}-min avg spill`,
+        mode: "lines", line: { color: "#c98500", width: 2 } }
+    : null;
+  // Duty-cycle-aware delivery as a per-minute rate: the trailing-window proton
+  // sum divided by the window. Falls to zero during beam-off, unlike avg spill.
+  const rateLine = (h.delivery_time && h.delivery_time.length)
+    ? { x: h.delivery_time, y: h.delivery_intensity.map(v => v / win),
+        name: "Protons / min", mode: "lines", yaxis: "y2",
+        line: { color: "#5cc98a", width: 2 } }
+    : null;
+  // Beam tab and Overview mirror show the same three: per-spill markers, the
+  // per-spill average (quality), and the protons/min delivery rate (right axis).
+  const traces = [markers, avgLine, rateLine].filter(Boolean);
+  ["beam-plot", "beam-plot-overview"].forEach(id => {
+    if (document.getElementById(id)) {
+      Plotly.react(id, traces, { ...layout, uirevision: id }, { responsive: true, displaylogo: false });
+    }
+  });
+}
+
+// Plotly can't size a plot while its tab is hidden (display:none -> 0 width), so
+// (re)render when a tab showing a beam plot is shown.
+["#beam", "#overview"].forEach(sel =>
+  document.querySelector(`a[href="${sel}"]`).addEventListener("shown.bs.tab", beamRenderPlot));
+
+// Refresh the history plot on a timer, but only while a tab that shows it is visible.
+setInterval(() => {
+  const vis = document.getElementById("overview").classList.contains("active") ||
+              document.getElementById("beam").classList.contains("active");
+  if (vis) beamRenderPlot();
+}, 15000);
+
+beamUpdateStatus();
+setInterval(beamUpdateStatus, 5000);
+beamRenderPlot();   // initial draw (Overview is the default-active tab at load)
 </script>
 {% endblock %}

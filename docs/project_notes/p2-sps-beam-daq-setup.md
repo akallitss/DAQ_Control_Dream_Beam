@@ -5,7 +5,7 @@ metadata:
   node_type: memory
   type: project
   originSessionId: 7c0af0b2-c6b0-4673-b9d0-8efb706c624c
-  modified: 2026-07-19T15:55:10.861Z
+  modified: 2026-07-19T21:22:35.337Z
 ---
 
 DAQ_Control_Dream_Beam (fork of Dylan Neff's nTof x17 DAQ) was transitioned on
@@ -106,6 +106,17 @@ external scintillator trigger via TCM; beam 150/80 GeV mu/pi.
   P2SelfTrigger.cfg, self_trigger=True, Trg roles) via env DAQ_TRIGGER=self.
   Template auto-resolved from <base>/dream_config/. Verified both modes on
   banco. So Fe55 self-trigger is still one env var away.
+- GUI RUN BUILDER (commit 9669cb0): Flask "Run Setup" tab configures runs
+  without editing Python — run name, gas, operator/notes, trigger mode,
+  detectors (position + HV channels + full FEU/connector wiring, add/remove),
+  run type (mesh_scan/drift_scan/long_run/pedestals with per-type
+  durations+voltages), live preview + HV-limit validation. Form writes
+  config/gui_run_config.json (GITIGNORED, per-machine); gui_run_config.py =
+  schema/build/validate/preview/defaults_from_code; run_config_beam.py
+  applies it ONLY when the file exists AND enabled=true (operator flips the
+  "Enabled" toggle + Save), else code defaults BYTE-IDENTICAL (verified).
+  Routes /run_builder/{config,options,preview,save}. Deployed+verified banco.
+  Gotcha: when enabled, GUI run_name wins over iterate_run_num auto-increment.
 - BEAM_TODO.md (repo root, commit) = beam-time finalization checklist. Key
   open items: scintillator trigger into TCM + test Sys Trg Mult (2/4 inherited
   from rays cosmic — may need wide-open for external); LATENCY scan test run

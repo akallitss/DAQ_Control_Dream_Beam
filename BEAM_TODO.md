@@ -19,7 +19,7 @@ below is DAQ-side unless noted. Current state: paths on `TB_July2026_H4`,
 - [ ] Confirm `Sys DaqRun Trig Ext` + `Tg_Src_ExtSyn` behave as expected with
       the real trigger (both already set in P2TB.cfg).
 
-## 2. Latency — the test run you flagged
+## 2. Latency, samples & DAQ throughput — the test runs you flagged
 - [ ] **Find the correct latency for our signals**: the sample window offset
       (`Feu * Dream * 12` register / the config `latency` field) depends on the
       trigger-to-signal timing at the beam. Take a **latency-scan test run**
@@ -28,8 +28,21 @@ below is DAQ-side unless noted. Current state: paths on `TB_July2026_H4`,
       `13_timing_waveforms` + the online detector_qa plots). Then set it as the
       run-config latency (the code writes `Feu * Dream * 12` per run, so it's a
       config value, not a template edit).
-- [ ] Decide `n_samples_per_waveform` / `sample_period` for beam (template has
-      32 samples @ 60 ns; both are set per-run by the config).
+- [ ] **Rate / data-integrity test run — `Feu_InterPacket_Delay` +
+      `n_samples`**: the sustainable trigger rate without corrupted/dropped
+      data depends on the per-event payload (number of samples) and the FEU
+      packet pacing (`Feu * Feu_InterPacket_Delay`, currently 100 in P2TB.cfg
+      from the rays config) vs the network/DAQ throughput. Take a test run at
+      the expected beam rate and:
+        - scan `Feu_InterPacket_Delay` (and `UdpChan_MultiPackThr`, now 4888)
+          and `n_samples_per_waveform` (template 32),
+        - watch for corruption / dropped events (RunCtrl errors,
+          FeuDataFileReader `sample_cnt != nb_of_samples`, decode failures,
+          gaps in event IDs — cf. `24_event_sync_qa`),
+        - pick the largest samples + smallest delay that runs clean at rate.
+      InterPacket_Delay + UdpChan_MultiPackThr are **template** settings
+      (P2TB.cfg); n_samples is a per-run config value.
+- [ ] Fix `sample_period` for beam (template 60 ns; per-run config value).
 
 ## 3. Detectors & HV
 - [ ] **Third station P2_IN**: add it to `run_config_beam.py` detectors with

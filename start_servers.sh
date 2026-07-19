@@ -17,3 +17,6 @@ bash_scripts/start_tmux.sh dream_daq "$ENVCLEAN python dream_daq_control.py" 200
 bash_scripts/start_tmux.sh processor_watcher "$ENVCLEAN python processor_watcher.py config/processor_config.json" 20000
 bash_scripts/start_tmux.sh daq_control "echo 'Daq control session started'" 20000
 bash_scripts/start_tmux.sh flask_server "$ENVCLEAN flask_app/start_flask.sh" 5000
+# Memory guardian: kills a runaway compute job (reconstruction / QA) before the
+# machine runs out of memory and thrashes — never touches the live DAQ.
+bash_scripts/start_tmux.sh mem_guardian "$ENVCLEAN python mem_guardian.py" 2000

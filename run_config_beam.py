@@ -29,6 +29,23 @@ from run_config_base import RunConfigBase
 # ---------------------------------------------------------------------------
 SITE = os.environ.get('DAQ_SITE', 'local')  # 'local' or 'sps'; export DAQ_SITE=sps on banco
 
+# ---------------------------------------------------------------------------
+# Trigger mode — switches the whole trigger configuration coherently. Flip it
+# here (or per-run with the DAQ_TRIGGER env var) to move between the SPS beam
+# and the Fe55 bench without editing anything else.
+#   'external' : SPS beam. External scintillator trigger via the TCM. Uses the
+#                P2TB.cfg dream template (Sys DaqRun Trig Ext) and Dat FEU roles.
+#   'self'     : Fe55 bench. Self-trigger via TCM multiplicity. Uses the
+#                P2SelfTrigger.cfg template (Sys DaqRun Trig Slf) and Trg roles.
+# The template file is picked up from <base_data_dir>/dream_config/ (both live
+# there), so no per-site path edits are needed to switch.
+# ---------------------------------------------------------------------------
+TRIGGER_MODE = os.environ.get('DAQ_TRIGGER', 'external')  # 'external' (beam) or 'self' (Fe55)
+assert TRIGGER_MODE in ('external', 'self'), \
+    f"DAQ_TRIGGER must be 'external' or 'self', got {TRIGGER_MODE!r}"
+_SELF_TRIGGER = (TRIGGER_MODE == 'self')
+_DREAM_TEMPLATE_FILE = {'self': 'P2SelfTrigger.cfg', 'external': 'P2TB.cfg'}[TRIGGER_MODE]
+
 SITES = {
     'local': {
         # All data under a local test tree (runs/, pedestals/, dream_config/, ...)
@@ -63,7 +80,8 @@ SITES = {
         # numbering: input 3 = Id 101, 4 = 102, 5 = 103) with Sys Name = P2Fe55
         # and the stale per-FEU PdFile/ZsFile refs cleared (each run's own
         # PedThr phase programs fresh pedestals/thresholds instead).
-        'dream_cfg_template': '/local/home/banco/P2_data/TB_July2026_H4/dream_config/P2SelfTrigger.cfg',
+        # dream_cfg_template is derived from TRIGGER_MODE below (P2TB.cfg for
+        # beam, P2SelfTrigger.cfg for Fe55) — both live in dream_config/.
     },
 }
 
@@ -71,6 +89,10 @@ _SITE_CFG = SITES[SITE]
 BASE_DATA_DIR = _SITE_CFG['base_data_dir']
 RECONSTRUCTION_BUILD = _SITE_CFG['reconstruction_build']
 SIMULATE = _SITE_CFG['simulate']
+# Dream .cfg template for the current trigger mode (see TRIGGER_MODE above). An
+# explicit SITES['<site>']['dream_cfg_template'] still wins if one is set.
+DREAM_CFG_TEMPLATE = _SITE_CFG.get(
+    'dream_cfg_template', f'{BASE_DATA_DIR}dream_config/{_DREAM_TEMPLATE_FILE}')
 
 # ---------------------------------------------------------------------------
 # Run schedule
@@ -136,19 +158,20 @@ class Config(RunConfigBase):
         self.beam_type = 'sps_beam'
         # self.beam_type = 'cosmics'
         self.target_type = 'none'
-        # Fe55 bench runs: self-trigger through the TCM — each FEU's 'Trg'
-        # Dreams send hit primitives, the TCM forms the trigger from its
-        # multiplicity window and distributes it on the sync line.
-        # TODO-SPS: switch back to the external beam trigger at the beam area.
-        self.trigger = 'Fe55 self trigger via TCM multiplicity'
+        # Trigger description follows TRIGGER_MODE.
+        #   self:     Fe55 bench — each FEU's 'Trg' Dreams send hit primitives,
+        #             the TCM forms the trigger from its multiplicity window.
+        #   external: SPS beam — external scintillator coincidence into the TCM,
+        #             distributed on the sync line; FEUs are pure 'Dat'.
+        self.trigger = ('Fe55 self trigger via TCM multiplicity' if _SELF_TRIGGER
+                        else 'SPS external scintillator coincidence via TCM')
 
         self.dream_daq_info = {
             'ip': _SITE_CFG['daq_host'],
             'port': 1101,
             # Site override (e.g. banco's SelfTcm.cfg) or the cosmic-bench P2
             # template copied into the data tree.
-            'daq_config_template_path': _SITE_CFG.get(
-                'dream_cfg_template', f'{self.base_out_dir}dream_config/CosmicTb_P2.cfg'),
+            'daq_config_template_path': DREAM_CFG_TEMPLATE,
             # Directory where RunCtrl writes fdfs (fast local disk on the DAQ CPU).
             'run_directory': f'{self.base_out_dir}dream_run/{self.run_name}/',
             'data_out_dir': f'{self.run_out_dir}',
@@ -169,9 +192,10 @@ class Config(RunConfigBase):
             'do_pedestal_threshold_run': True,   # Sys Action PedThrRun
             'do_trigger_threshold_run': False,   # Sys Action TrgThrRun
             'do_data_run': True,                 # Sys Action DataRun
-            # Self-trigger mode: used connectors get the 'Trg' Dream role
-            # (trigger-contributing AND read out) instead of 'Dat'.
-            'self_trigger': True,
+            # Trigger mode (from TRIGGER_MODE): self-trigger gives used
+            # connectors the 'Trg' Dream role (trigger-contributing AND read
+            # out); external trigger gives them 'Dat'.
+            'self_trigger': _SELF_TRIGGER,
             # Auto-select the active FEUs in the .cfg from the included detectors'
             # dream_feus maps (only P2 FEUs stay active; M3/trigger FEU lines are
             # commented out — the SPS trigger comes in externally on the TCM).
@@ -395,6 +419,8 @@ if __name__ == '__main__':
     total_h = run_min / 60
     print(f'Site: {SITE}  (simulate={SIMULATE})')
     print(f'Base data dir: {BASE_DATA_DIR}')
+    print(f'Trigger mode: {TRIGGER_MODE}  (self_trigger={_SELF_TRIGGER})')
+    print(f'Dream template: {DREAM_CFG_TEMPLATE}')
     print(f'Gas: {config.gas}')
     print(f'Trigger: {config.trigger}')
     if HV_SCAN:

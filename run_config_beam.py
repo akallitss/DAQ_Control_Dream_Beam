@@ -151,6 +151,10 @@ class Config(RunConfigBase):
         super().__init__(config_path)
 
     def _set_defaults(self, config_path=None):
+        # Declared global up front (Python requires this before the names are
+        # read) so the GUI override at the end of this method can retarget the
+        # trigger mode. Untouched unless a GUI config is loaded there.
+        global TRIGGER_MODE, _SELF_TRIGGER, _DREAM_TEMPLATE_FILE, DREAM_CFG_TEMPLATE
         self.run_name = 'run_1'
         self.base_out_dir = BASE_DATA_DIR
         self.data_out_dir = f'{self.base_out_dir}runs/'
@@ -415,6 +419,58 @@ class Config(RunConfigBase):
             else:
                 print('set_feus_from_detectors is on but no included detector has dream_feus; '
                       'leaving the template FEU selection unchanged.')
+
+        # --- GUI override (config/gui_run_config.json) ---
+        # Pure additive override: when the GUI file is absent / disabled /
+        # unparseable, gui_run_config.load() returns None and NOTHING below runs,
+        # so this config is byte-identical to the code defaults. Imported lazily
+        # to avoid an import cycle (gui_run_config imports this module).
+        try:
+            import gui_run_config as _gui_mod
+            _gui = _gui_mod.load()
+        except Exception as _gui_err:
+            _gui, _gui_mod = None, None
+            print(f'GUI run config load failed, using code defaults: {_gui_err}')
+        if _gui:
+            self.run_name = _gui.get('run_name', self.run_name)
+            self.gas = _gui.get('gas', self.gas)
+            self.operator = _gui.get('operator', '')
+            self.notes = _gui.get('notes', '')
+            self.detectors, self.included_detectors = _gui_mod.build_detectors(_gui)
+            self.sub_runs = _gui_mod.build_sub_runs(_gui)
+
+            # Trigger mode: follow the GUI so the dream template + self_trigger
+            # role selection track it (external -> P2TB.cfg / Dat, self ->
+            # P2SelfTrigger.cfg / Trg).
+            _tm = _gui.get('trigger_mode', TRIGGER_MODE)
+            if _tm in ('external', 'self'):
+                TRIGGER_MODE = _tm
+                _SELF_TRIGGER = (_tm == 'self')
+                _DREAM_TEMPLATE_FILE = {'self': 'P2SelfTrigger.cfg',
+                                        'external': 'P2TB.cfg'}[_tm]
+                DREAM_CFG_TEMPLATE = _SITE_CFG.get(
+                    'dream_cfg_template',
+                    f'{BASE_DATA_DIR}dream_config/{_DREAM_TEMPLATE_FILE}')
+                self.dream_daq_info['self_trigger'] = _SELF_TRIGGER
+                self.dream_daq_info['daq_config_template_path'] = DREAM_CFG_TEMPLATE
+                self.trigger = ('Fe55 self trigger via TCM multiplicity' if _SELF_TRIGGER
+                                else 'SPS external scintillator coincidence via TCM')
+
+            # Re-derive the run-name-dependent paths so data lands in the GUI's
+            # run directory (run_name was set from 'run_1' earlier).
+            self.run_out_dir = f'{self.data_out_dir}{self.run_name}/'
+            self.dream_daq_info['run_directory'] = f'{self.base_out_dir}dream_run/{self.run_name}/'
+            self.dream_daq_info['data_out_dir'] = f'{self.run_out_dir}'
+            self.processor_info['run_dir'] = f'{self.run_out_dir}'
+            self.hv_info['run_out_dir'] = self.run_out_dir
+
+            # Recompute the active FEUs from the GUI detectors (same logic as above).
+            if self.dream_daq_info.get('set_feus_from_detectors', False):
+                feu_connectors = self.get_active_feu_connectors()
+                if feu_connectors:
+                    self.dream_daq_info['included_feus'] = sorted(feu_connectors)
+                    self.dream_daq_info['feu_connectors'] = feu_connectors
+                    self.dream_daq_info['trigger_feu'] = None
 
     def get_active_feu_connectors(self):
         """Map each FEU used by the included detectors to the sorted list of its used connectors.

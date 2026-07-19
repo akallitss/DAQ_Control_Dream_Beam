@@ -132,6 +132,103 @@
 </div>
 
 
+<!-- Run Setup Tab: build a run config (detectors + HV schedule + trigger) that
+     run_config_beam.py picks up from config/gui_run_config.json. -->
+<div class="tab-pane fade" id="run-setup">
+  <div class="row g-3">
+    <!-- Left column: the builder form -->
+    <div class="col-12 col-xl-7">
+      <div class="panel">
+        <div class="panel-header">
+          <span class="panel-title">Run Setup</span>
+          <span class="panel-header-note">Writes config/gui_run_config.json — an additive override on run_config_beam.py.</span>
+          <div class="form-check form-switch ms-auto mb-0">
+            <input class="form-check-input" type="checkbox" id="rb-enabled">
+            <label class="form-check-label" for="rb-enabled" style="font-size:0.8rem;">Enabled</label>
+          </div>
+        </div>
+        <div class="panel-body">
+          <div id="rb-disabled-note" class="text-muted mb-2" style="font-size:0.8rem; display:none;">
+            Override is <b>disabled</b> — the DAQ uses the code defaults in run_config_beam.py.
+            Turn on “Enabled” and Save to activate this configuration.
+          </div>
+
+          <div class="row g-2">
+            <div class="col-sm-6">
+              <label class="form-label" for="rb-run-name">Run name</label>
+              <input type="text" class="form-control form-control-sm" id="rb-run-name" placeholder="run_1">
+            </div>
+            <div class="col-sm-6">
+              <label class="form-label" for="rb-operator">Operator</label>
+              <input type="text" class="form-control form-control-sm" id="rb-operator" placeholder="(optional)">
+            </div>
+            <div class="col-sm-6">
+              <label class="form-label" for="rb-gas">Gas</label>
+              <input type="text" class="form-control form-control-sm" id="rb-gas" list="rb-gas-presets" placeholder="Ar/Iso 95/5">
+              <datalist id="rb-gas-presets"></datalist>
+            </div>
+            <div class="col-sm-6">
+              <label class="form-label d-block">Trigger mode</label>
+              <div class="btn-group" role="group">
+                <input type="radio" class="btn-check" name="rb-trigger" id="rb-trig-external" value="external" autocomplete="off">
+                <label class="btn btn-outline-info btn-sm" for="rb-trig-external">External (beam)</label>
+                <input type="radio" class="btn-check" name="rb-trigger" id="rb-trig-self" value="self" autocomplete="off">
+                <label class="btn btn-outline-info btn-sm" for="rb-trig-self">Self (Fe55)</label>
+              </div>
+            </div>
+            <div class="col-12">
+              <label class="form-label" for="rb-notes">Notes</label>
+              <textarea class="form-control form-control-sm" id="rb-notes" rows="1" placeholder="(optional)"></textarea>
+            </div>
+          </div>
+
+          <hr>
+          <div class="d-flex align-items-center mb-2">
+            <span class="group-label mb-0">Detectors</span>
+            <button id="rb-add-det" class="btn btn-outline-light btn-sm ms-auto">+ Add detector</button>
+          </div>
+          <div id="rb-detectors"></div>
+
+          <hr>
+          <div class="row g-2 align-items-end">
+            <div class="col-sm-6">
+              <label class="form-label" for="rb-run-type">Run type</label>
+              <select id="rb-run-type" class="form-select form-select-sm"></select>
+            </div>
+          </div>
+          <div id="rb-params" class="mt-2"></div>
+
+          <hr>
+          <div class="d-flex gap-2">
+            <button id="rb-save" class="btn btn-success btn-sm">Save &amp; regenerate</button>
+            <button id="rb-reset" class="btn btn-outline-secondary btn-sm">Reset to code defaults</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Right column: live preview -->
+    <div class="col-12 col-xl-5">
+      <div class="panel" style="position:sticky; top:64px;">
+        <div class="panel-header">
+          <span class="panel-title">Live Preview</span>
+          <span id="rb-preview-totals" class="panel-header-note ms-auto"></span>
+        </div>
+        <div class="panel-body">
+          <div id="rb-errors" style="color:var(--bad); font-size:0.82rem; margin-bottom:0.5rem;"></div>
+          <div style="max-height:60vh; overflow:auto;">
+            <table class="table table-sm table-dark mb-0" style="font-size:0.8rem;">
+              <thead><tr><th>#</th><th>Sub-run</th><th>Setpoints (mesh/drift)</th><th>min</th></tr></thead>
+              <tbody id="rb-preview-body"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+
 <!-- Online QA Viewer Tab -->
 <div class="tab-pane fade" id="png-viewer">
   <div class="panel">
@@ -2225,6 +2322,233 @@ beamRenderPlot();   // initial draw (Overview is the default-active tab at load)
   const dsTab = document.querySelector('a[href="#disk-space"]');
   if (dsTab) dsTab.addEventListener("shown.bs.tab", loadUsage);
   setMode("free");
+})();
+</script>
+
+<!-- ============================ Run Setup builder ============================ -->
+<script>
+(function(){
+  let rbGui = null;         // working config object (single source of truth)
+  let rbOptions = null;
+  let rbLoaded = false;
+  let rbPreviewTimer = null;
+
+  const $ = id => document.getElementById(id);
+  function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g,
+    c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+  function num(v){ return v===''||v==null ? null : Number(v); }
+
+  async function rbInit(){
+    if (rbLoaded) return;
+    rbLoaded = true;
+    try {
+      const [cfgR, optR] = await Promise.all([
+        fetch('/run_builder/config').then(r=>r.json()),
+        fetch('/run_builder/options').then(r=>r.json())
+      ]);
+      if (!cfgR.success) throw cfgR.message || 'config load failed';
+      rbGui = cfgR.config;
+      rbOptions = optR.success ? optR : {run_types:['mesh_scan','drift_scan','long_run','pedestals'],
+                                         trigger_modes:['external','self'], gas_presets:[]};
+      wireStaticInputs();
+      renderAll();
+    } catch(e){
+      rbLoaded = false;
+      showPopup('Run Setup load failed: '+e, '#dc3545');
+    }
+  }
+
+  function wireStaticInputs(){
+    $('rb-enabled').addEventListener('change', e=>{ rbGui.enabled=e.target.checked; updateDisabledNote(); });
+    $('rb-run-name').addEventListener('input', e=>{ rbGui.run_name=e.target.value; schedulePreview(); });
+    $('rb-operator').addEventListener('input', e=>{ rbGui.operator=e.target.value; });
+    $('rb-gas').addEventListener('input', e=>{ rbGui.gas=e.target.value; });
+    $('rb-notes').addEventListener('input', e=>{ rbGui.notes=e.target.value; });
+    $('rb-trig-external').addEventListener('change', ()=>{ rbGui.trigger_mode='external'; });
+    $('rb-trig-self').addEventListener('change', ()=>{ rbGui.trigger_mode='self'; });
+    $('rb-run-type').addEventListener('change', e=>{ rbGui.run_type=e.target.value; renderParams(); schedulePreview(); });
+    $('rb-add-det').addEventListener('click', ()=>rbApp.addDet());
+    $('rb-save').addEventListener('click', save);
+    $('rb-reset').addEventListener('click', reset);
+  }
+
+  function renderAll(){
+    $('rb-gas-presets').innerHTML = (rbOptions.gas_presets||[]).map(g=>'<option value="'+esc(g)+'">').join('');
+    $('rb-run-type').innerHTML = (rbOptions.run_types||[]).map(rt=>'<option value="'+rt+'">'+rt.replace('_',' ')+'</option>').join('');
+    $('rb-enabled').checked = !!rbGui.enabled;
+    $('rb-run-name').value = rbGui.run_name||'';
+    $('rb-operator').value = rbGui.operator||'';
+    $('rb-gas').value = rbGui.gas||'';
+    $('rb-notes').value = rbGui.notes||'';
+    const tm = rbGui.trigger_mode||'external';
+    $('rb-trig-external').checked = (tm==='external');
+    $('rb-trig-self').checked = (tm==='self');
+    $('rb-run-type').value = rbGui.run_type||'mesh_scan';
+    updateDisabledNote();
+    renderDetectors();
+    renderParams();
+    schedulePreview();
+  }
+
+  function updateDisabledNote(){ $('rb-disabled-note').style.display = rbGui.enabled ? 'none' : 'block'; }
+
+  // ---------- Detectors ----------
+  function renderDetectors(){
+    const c = $('rb-detectors'); c.innerHTML='';
+    (rbGui.detectors||[]).forEach((det,i)=>{
+      const card = document.createElement('div');
+      card.style.cssText='border:1px solid var(--border);border-radius:8px;padding:0.6rem;margin-bottom:0.6rem;background:var(--panel-2);';
+      card.innerHTML = detCardHTML(det,i);
+      c.appendChild(card);
+    });
+  }
+
+  function detCardHTML(d,i){
+    const hc=d.hv_channels||{}, mesh=hc.mesh||[], drift=hc.drift||[], max=d.hv_max||{}, feus=d.dream_feus||{};
+    const feuRows = Object.entries(feus).map(([conn,pair])=>
+      '<div class="row g-1 align-items-center mb-1">'+
+      '<div class="col-auto"><input class="form-control form-control-sm" style="width:7rem" value="'+esc(conn)+'" onchange="rbApp.renameFeu('+i+',\''+esc(conn)+'\',this.value)"></div>'+
+      '<div class="col-auto"><input type="number" class="form-control form-control-sm" style="width:5rem" placeholder="feu" value="'+(pair&&pair[0]!=null?pair[0]:'')+'" oninput="rbApp.setFeuVal('+i+',\''+esc(conn)+'\',0,this.value)"></div>'+
+      '<div class="col-auto"><input type="number" class="form-control form-control-sm" style="width:6.5rem" placeholder="dreamconn" value="'+(pair&&pair[1]!=null?pair[1]:'')+'" oninput="rbApp.setFeuVal('+i+',\''+esc(conn)+'\',1,this.value)"></div>'+
+      '<div class="col-auto"><button class="btn btn-outline-danger btn-sm" onclick="rbApp.removeFeu('+i+',\''+esc(conn)+'\')">&times;</button></div>'+
+      '</div>').join('');
+    return ''+
+      '<div class="d-flex align-items-center gap-2 mb-2">'+
+        '<input class="form-control form-control-sm" style="max-width:9rem" placeholder="name" value="'+esc(d.name||'')+'" onchange="rbApp.setDet('+i+',\'name\',this.value)">'+
+        '<div class="form-check mb-0"><input class="form-check-input" type="checkbox" id="rb-inc-'+i+'" '+(d.included?'checked':'')+' onchange="rbApp.setDet('+i+',\'included\',this.checked)"><label class="form-check-label" for="rb-inc-'+i+'" style="font-size:0.8rem">included</label></div>'+
+        '<button class="btn btn-outline-danger btn-sm ms-auto" onclick="rbApp.removeDet('+i+')">Remove</button>'+
+      '</div>'+
+      '<div class="row g-2 mb-1">'+
+        '<div class="col-auto"><label class="form-label">z (mm)</label><input type="number" step="any" class="form-control form-control-sm" style="width:6rem" value="'+(d.z_mm!=null?d.z_mm:'')+'" oninput="rbApp.setDet('+i+',\'z_mm\',this.value)"></div>'+
+        '<div class="col-auto"><label class="form-label">mesh card/ch</label><div class="d-flex gap-1"><input type="number" class="form-control form-control-sm" style="width:4.5rem" value="'+(mesh[0]!=null?mesh[0]:'')+'" oninput="rbApp.setChan('+i+',\'mesh\',0,this.value)"><input type="number" class="form-control form-control-sm" style="width:4.5rem" value="'+(mesh[1]!=null?mesh[1]:'')+'" oninput="rbApp.setChan('+i+',\'mesh\',1,this.value)"></div></div>'+
+        '<div class="col-auto"><label class="form-label">drift card/ch</label><div class="d-flex gap-1"><input type="number" class="form-control form-control-sm" style="width:4.5rem" value="'+(drift[0]!=null?drift[0]:'')+'" oninput="rbApp.setChan('+i+',\'drift\',0,this.value)"><input type="number" class="form-control form-control-sm" style="width:4.5rem" value="'+(drift[1]!=null?drift[1]:'')+'" oninput="rbApp.setChan('+i+',\'drift\',1,this.value)"></div></div>'+
+        '<div class="col-auto"><label class="form-label">mesh max</label><input type="number" class="form-control form-control-sm" style="width:6rem" value="'+(max.mesh!=null?max.mesh:'')+'" oninput="rbApp.setMax('+i+',\'mesh\',this.value)"></div>'+
+        '<div class="col-auto"><label class="form-label">drift max</label><input type="number" class="form-control form-control-sm" style="width:6rem" value="'+(max.drift!=null?max.drift:'')+'" oninput="rbApp.setMax('+i+',\'drift\',this.value)"></div>'+
+        '<div class="col-auto"><label class="form-label">orientation</label><input class="form-control form-control-sm" style="width:11rem" value="'+esc(d.orientation||'')+'" oninput="rbApp.setDet('+i+',\'orientation\',this.value)"></div>'+
+      '</div>'+
+      '<details><summary style="cursor:pointer;font-size:0.8rem;color:var(--muted)">dream_feus wiring ('+Object.keys(feus).length+' connectors)</summary>'+
+      '<div class="mt-2">'+feuRows+'<button class="btn btn-outline-light btn-sm mt-1" onclick="rbApp.addFeu('+i+')">+ connector</button></div></details>';
+  }
+
+  // ---------- Run-type parameters ----------
+  function rtVal(rt,k){ const o=(rbGui.run_types||{})[rt]||{}; return o[k]!=null?o[k]:''; }
+
+  function scalarInputs(rt,keys){
+    return '<div class="row g-2">'+keys.map(k=>
+      '<div class="col-auto"><label class="form-label">'+k+'</label>'+
+      '<input type="number" step="any" class="form-control form-control-sm" style="width:8rem" value="'+rtVal(rt,k)+'" oninput="rbApp.setParam(\''+rt+'\',[\''+k+'\'],this.value)"></div>').join('')+'</div>';
+  }
+
+  function detSetpointRow(rt,sub,name,electrodes){
+    const s=(((rbGui.run_types[rt]||{})[sub])||{})[name]||{};
+    return '<div class="row g-2 align-items-end mb-1"><div class="col-auto" style="min-width:5.5rem"><span class="text-muted">'+esc(name)+'</span></div>'+
+      electrodes.map(e=>'<div class="col-auto"><label class="form-label">'+e+'</label><input type="number" step="any" class="form-control form-control-sm" style="width:7rem" value="'+(s[e]!=null?s[e]:'')+'" oninput="rbApp.setDetParam(\''+rt+'\',\''+sub+'\',\''+esc(name)+'\',\''+e+'\',this.value)"></div>').join('')+'</div>';
+  }
+
+  function driftRow(rt,name){
+    const mf=((rbGui.run_types[rt].mesh_fixed||{})[name]);
+    const ds=((rbGui.run_types[rt].drift_start||{})[name]);
+    return '<div class="row g-2 align-items-end mb-1"><div class="col-auto" style="min-width:5.5rem"><span class="text-muted">'+esc(name)+'</span></div>'+
+      '<div class="col-auto"><label class="form-label">mesh fixed</label><input type="number" step="any" class="form-control form-control-sm" style="width:7rem" value="'+(mf!=null?mf:'')+'" oninput="rbApp.setDetScalar(\''+rt+'\',\'mesh_fixed\',\''+esc(name)+'\',this.value)"></div>'+
+      '<div class="col-auto"><label class="form-label">drift start</label><input type="number" step="any" class="form-control form-control-sm" style="width:7rem" value="'+(ds!=null?ds:'')+'" oninput="rbApp.setDetScalar(\''+rt+'\',\'drift_start\',\''+esc(name)+'\',this.value)"></div></div>';
+  }
+
+  function renderParams(){
+    const rt = rbGui.run_type||'mesh_scan';
+    rbGui.run_types = rbGui.run_types || {};
+    rbGui.run_types[rt] = rbGui.run_types[rt] || {};
+    const dets = (rbGui.detectors||[]).filter(d=>d.included && d.name);
+    let html='';
+    if(rt==='mesh_scan'){
+      html+=scalarInputs(rt,['subrun_min','step_v','points']);
+      html+='<div class="group-label mt-2">Start setpoints — mesh &amp; drift step DOWN together (constant gap)</div>';
+      html+=dets.map(d=>detSetpointRow(rt,'start',d.name,['mesh','drift'])).join('');
+    } else if(rt==='drift_scan'){
+      html+=scalarInputs(rt,['subrun_min','step_v','points']);
+      html+='<div class="group-label mt-2">Mesh fixed, drift steps DOWN (varies drift gap)</div>';
+      html+=dets.map(d=>driftRow(rt,d.name)).join('');
+    } else if(rt==='long_run'){
+      html+=scalarInputs(rt,['subrun_min','n_subruns']);
+      html+='<div class="group-label mt-2">Fixed HV per detector</div>';
+      html+=dets.map(d=>detSetpointRow(rt,'hv',d.name,['mesh','drift'])).join('');
+    } else if(rt==='pedestals'){
+      html+=scalarInputs(rt,['voltage','subrun_min']);
+      html+='<div class="text-muted mt-2" style="font-size:0.8rem">All included detectors\' mesh+drift channels ramp to the voltage above; single sub-run.</div>';
+    }
+    $('rb-params').innerHTML = html;
+  }
+
+  // ---------- Preview ----------
+  function schedulePreview(){ clearTimeout(rbPreviewTimer); rbPreviewTimer=setTimeout(runPreview,300); }
+  async function runPreview(){
+    if(!rbGui) return;
+    try{
+      const r=await fetch('/run_builder/preview',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(rbGui)});
+      const d=await r.json();
+      if(!d.success){ $('rb-errors').textContent=d.message||'preview error'; return; }
+      renderPreview(d);
+    }catch(e){ $('rb-errors').textContent='preview failed: '+e; }
+  }
+  function renderPreview(d){
+    const errs=d.errors||[];
+    $('rb-errors').innerHTML = errs.length ? errs.map(e=>'&#9888; '+esc(e)).join('<br>') : '';
+    const pv=d.preview||{sub_runs:[]};
+    $('rb-preview-totals').textContent = (pv.n_subruns||0)+' sub-runs · '+(pv.total_min||0)+' min';
+    $('rb-preview-body').innerHTML = (pv.sub_runs||[]).map((s,i)=>{
+      const sp=Object.entries(s.detectors||{}).map(([n,v])=>esc(n.split('_').pop())+': '+(v.mesh==null?'–':v.mesh)+'/'+(v.drift==null?'–':v.drift)).join('<br>');
+      return '<tr><td>'+i+'</td><td style="font-family:var(--mono)">'+esc(s.name)+'</td><td style="font-family:var(--mono);font-size:0.72rem">'+sp+'</td><td>'+s.run_time+'</td></tr>';
+    }).join('');
+  }
+
+  // ---------- Save / reset ----------
+  async function save(){
+    try{
+      const r=await fetch('/run_builder/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(rbGui)});
+      const d=await r.json();
+      showPopup(d.message||(d.success?'Saved':'Error'), d.success?'#28a745':'#dc3545');
+      runPreview();
+    }catch(e){ showPopup('Save failed: '+e,'#dc3545'); }
+  }
+  async function reset(){
+    if(!confirm('Reset the form to the code defaults from run_config_beam.py? Unsaved changes are lost.')) return;
+    try{
+      const r=await fetch('/run_builder/config?defaults=1').then(x=>x.json());
+      if(!r.success) throw r.message;
+      rbGui=r.config; renderAll();
+      showPopup('Reset to code defaults (not yet saved).', '#17a2b8');
+    }catch(e){ showPopup('Reset failed: '+e,'#dc3545'); }
+  }
+
+  // ---------- Handlers exposed to inline markup ----------
+  window.rbApp = {
+    setDet(i,f,v){
+      const d=rbGui.detectors[i];
+      if(f==='included'){ d.included=!!v; renderParams(); }
+      else if(f==='z_mm'){ d.z_mm=num(v); }
+      else if(f==='name'){ d.name=v; renderParams(); }
+      else { d[f]=v; }
+      schedulePreview();
+    },
+    setChan(i,e,idx,v){
+      const d=rbGui.detectors[i]; d.hv_channels=d.hv_channels||{};
+      let arr=d.hv_channels[e]; if(!Array.isArray(arr)) arr=[null,null];
+      arr[idx]=num(v); d.hv_channels[e]=arr; schedulePreview();
+    },
+    setMax(i,e,v){ const d=rbGui.detectors[i]; d.hv_max=d.hv_max||{}; d.hv_max[e]=num(v); schedulePreview(); },
+    addDet(){ (rbGui.detectors=rbGui.detectors||[]).push({name:'',included:true,z_mm:0,description:'',hv_channels:{mesh:[null,null],drift:[null,null]},hv_max:{mesh:700,drift:700},dream_feus:{},orientation:'rotated_inverted'}); renderDetectors(); renderParams(); schedulePreview(); },
+    removeDet(i){ rbGui.detectors.splice(i,1); renderDetectors(); renderParams(); schedulePreview(); },
+    renameFeu(i,oldC,newC){ if(!newC||newC===oldC) return; const fe=rbGui.detectors[i].dream_feus; const out={}; for(const k in fe){ out[k===oldC?newC:k]=fe[k]; } rbGui.detectors[i].dream_feus=out; renderDetectors(); schedulePreview(); },
+    setFeuVal(i,conn,idx,v){ const fe=rbGui.detectors[i].dream_feus; let arr=fe[conn]; if(!Array.isArray(arr)) arr=[null,null]; arr[idx]=num(v); fe[conn]=arr; schedulePreview(); },
+    addFeu(i){ const fe=rbGui.detectors[i].dream_feus; let n=1; while(fe['c_'+n]!==undefined) n++; fe['c_'+n]=[null,null]; renderDetectors(); schedulePreview(); },
+    removeFeu(i,conn){ delete rbGui.detectors[i].dream_feus[conn]; renderDetectors(); schedulePreview(); },
+    setParam(rt,keys,v){ let o=rbGui.run_types[rt]; for(let k=0;k<keys.length-1;k++){ o[keys[k]]=o[keys[k]]||{}; o=o[keys[k]]; } o[keys[keys.length-1]]=num(v); schedulePreview(); },
+    setDetParam(rt,sub,name,e,v){ const o=rbGui.run_types[rt]; o[sub]=o[sub]||{}; o[sub][name]=o[sub][name]||{}; o[sub][name][e]=num(v); schedulePreview(); },
+    setDetScalar(rt,sub,name,v){ const o=rbGui.run_types[rt]; o[sub]=o[sub]||{}; o[sub][name]=num(v); schedulePreview(); }
+  };
+
+  // Lazy init when the tab is first shown.
+  const tabLink = document.querySelector('a[href="#run-setup"]');
+  if (tabLink) tabLink.addEventListener('shown.bs.tab', rbInit);
 })();
 </script>
 {% endblock %}

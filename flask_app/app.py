@@ -405,6 +405,97 @@ def run_config_py():
         return jsonify({"success": False, "message": str(e)}), 500
 
 
+# ---------------------------------------------------------------------------
+# Run Setup builder — operators configure a run (detectors, HV schedule, trigger)
+# from the GUI, written to config/gui_run_config.json which run_config_beam.py
+# picks up as an additive override. No effect until saved with "enabled": true.
+# ---------------------------------------------------------------------------
+@app.route("/run_builder/config", methods=["GET"])
+def run_builder_config():
+    try:
+        import gui_run_config as grc
+        if request.args.get("defaults"):
+            gui = grc.defaults_from_code()
+            gui["_from_defaults"] = True
+            return jsonify({"success": True, "config": gui})
+        gui = grc.load()
+        if gui is None:
+            # No enabled file yet: hand the UI a seed built from the code defaults
+            # (in-memory; the file is only created when the operator saves).
+            gui = grc.defaults_from_code()
+            gui["_from_defaults"] = True
+        return jsonify({"success": True, "config": gui})
+    except Exception as e:
+        return jsonify({"success": False, "message": str(e)}), 500
+
+
+@app.route("/run_builder/options", methods=["GET"])
+def run_builder_options():
+    try:
+        import gui_run_config as grc
+        from run_config_beam import P2_HV
+        hv_cards = sorted({card for det in P2_HV.values()
+                           for (card, _chan) in det.values()})
+        return jsonify({
+            "success": True,
+            "run_types": grc.RUN_TYPES,
+            "trigger_modes": grc.TRIGGER_MODES,
+            "gas_presets": grc.GAS_PRESETS,
+            "hv_cards": hv_cards,
+            "n_channels_per_card": 12,
+            "detector_templates": list(P2_HV.keys()),
+        })
+    except Exception as e:
+        return jsonify({"success": False, "message": str(e)}), 500
+
+
+@app.route("/run_builder/preview", methods=["POST"])
+def run_builder_preview():
+    try:
+        import gui_run_config as grc
+        gui = request.get_json(force=True) or {}
+        ok, errors = grc.validate(gui)
+        preview = grc.preview(gui)
+        return jsonify({"success": True, "valid": ok, "errors": errors, "preview": preview})
+    except Exception as e:
+        return jsonify({"success": False, "message": str(e)}), 500
+
+
+@app.route("/run_builder/save", methods=["POST"])
+def run_builder_save():
+    try:
+        import gui_run_config as grc
+        gui = request.get_json(force=True) or {}
+        gui.pop("_from_defaults", None)
+        ok, errors = grc.validate(gui)
+        if not ok:
+            return jsonify({"success": False, "valid": False, "errors": errors,
+                            "message": "Validation failed — not saved."}), 400
+
+        os.makedirs(os.path.dirname(grc.GUI_CONFIG_PATH), exist_ok=True)
+        with open(grc.GUI_CONFIG_PATH, "w") as f:
+            json.dump(gui, f, indent=4)
+
+        # Regenerate config/json_run_configs/run_config_beam.json so Start Run
+        # picks up the new schedule (same as /run_config_py does before starting).
+        result = subprocess.run(
+            ["python", f"{BASE_DIR}/run_config_beam.py"],
+            cwd=BASE_DIR, capture_output=True, text=True
+        )
+        if result.returncode != 0:
+            return jsonify({"success": False, "valid": True, "errors": [],
+                            "message": f"Saved, but config generation failed: {result.stderr}"}), 500
+
+        log_event("run_setup", "gui", run_name=gui.get("run_name", "?"),
+                  run_type=gui.get("run_type", "?"),
+                  enabled=gui.get("enabled", False))
+        return jsonify({"success": True, "valid": True, "errors": [],
+                        "message": f"Saved run setup for {gui.get('run_name', '?')} "
+                                   f"and regenerated run_config_beam.json."})
+    except Exception as e:
+        return jsonify({"success": False, "message": str(e)}), 500
+
+
 @app.route("/take_pedestals", methods=["POST"])
 def take_pedestals():
     try:

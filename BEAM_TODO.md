@@ -45,10 +45,11 @@ below is DAQ-side unless noted. Current state: paths on `TB_July2026_H4`,
 - [ ] Fix `sample_period` for beam (template 60 ns; per-run config value).
 
 ## 3. Detectors & HV
-- [ ] **Third station P2_IN**: add it to `run_config_beam.py` detectors with
-      its real `dream_feus` wiring (FEU/connectors) and `hv_channels`, plus
-      survey `det_center_coords` z for all three planes (needed for
-      telescope alignment / tag-probe).
+- [ ] **Third station P2_IN**: geometry is in (z=0 upstream; P2_MID 300,
+      P2_OUT 600 mm via `TELESCOPE_SPACING_MM`/`TELESCOPE_ORDER`). Still needed:
+      its real `dream_feus` wiring (FEU/connectors) + `hv_channels`, then add
+      'P2_IN' to `included_detectors` and `P2_HV`. Confirm the beam order
+      (is P2_IN really upstream?) and survey the real x/y offsets on site.
 - [ ] Confirm P2_OUT/P2_MID/P2_IN FEU + HV cabling at the beam matches the
       config (FEU Ids 101/102/103 @ .113/.114/.115 assumed from the bench).
 - [ ] HV operating points per detector for beam (drift-gap convention:

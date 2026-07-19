@@ -127,12 +127,11 @@ DRIFT_V = 600   # V, P2 drift (drift gap = drift - mesh = 160 V)
 # Stations are TELESCOPE_SPACING_MM apart, the first one (beam order) at z = 0.
 # The per-detector z below is derived from TELESCOPE_ORDER, so change spacing or
 # order here and every detector's det_center_coords follows.
-# TODO-SPS: confirm the beam order (is P2_IN really upstream?) and survey the
-# real x/y offsets + exact z at the beam line.
+# TODO-SPS: survey the real x/y offsets + exact z at the beam line.
 # ---------------------------------------------------------------------------
 TELESCOPE_SPACING_MM = 300.0                        # 30 cm between adjacent stations
-TELESCOPE_ORDER = ['P2_IN', 'P2_MID', 'P2_OUT']     # beam order upstream -> downstream
-DET_Z_MM = {name: i * TELESCOPE_SPACING_MM          # -> P2_IN 0, P2_MID 300, P2_OUT 600
+TELESCOPE_ORDER = ['P2_OUT', 'P2_MID', 'P2_IN']     # beam order: P2_OUT first (upstream)
+DET_Z_MM = {name: i * TELESCOPE_SPACING_MM          # -> P2_OUT 0, P2_MID 300, P2_IN 600
             for i, name in enumerate(TELESCOPE_ORDER)}
 
 # Telescope HV channels: (card, channel) on the SPS crate (192.168.10.199).
@@ -372,13 +371,14 @@ class Config(RunConfigBase):
                 'dream_feu_orientation': dict(_telescope_orientation),
             },
             {
-                # Third telescope station. TODO-SPS: fill in the real FEU/connector
-                # wiring (dream_feus), the HV card/channels, and add 'P2_IN' to
+                # Third telescope station, LAST one the beam sees (z = 600 mm,
+                # downstream). TODO-SPS: fill in the real FEU/connector wiring
+                # (dream_feus), the HV card/channels, and add 'P2_IN' to
                 # included_detectors + P2_HV once it is cabled. Only its geometry
-                # (z = 0, the upstream station) is set so far.
+                # is set so far.
                 'name': 'P2_IN',
-                'description': 'P2 telescope inner/upstream detector, SPS 2026. '
-                               'TODO-SPS: wiring + HV not yet assigned.',
+                'description': 'P2 telescope inner/downstream detector (last the '
+                               'beam sees), SPS 2026. TODO-SPS: wiring + HV not yet assigned.',
                 'det_type': 'P2',
                 'resist_type': 'none',
                 'bulked_from': 'Alex+Enzo',

@@ -23,6 +23,7 @@ from urllib.parse import quote
 from flask import Flask, render_template, jsonify, request, send_from_directory, abort
 from flask_socketio import SocketIO, emit
 
+import space_manager
 from daq_status import (get_dream_daq_status, get_hv_control_status,
                         get_daq_control_status, get_processor_watcher_status,
                         get_qa_watcher_status, get_backup_watcher_status,
@@ -1328,6 +1329,80 @@ def beam_history():
         })
     except Exception as e:
         return jsonify({"success": False, "message": str(e)}), 500
+
+
+# ===========================================================================
+# Disk Space tab — free space by clearing DREAM runs that are provably backed up
+# ---------------------------------------------------------------------------
+# All the safety logic lives in flask_app/space_manager.py: a run is "safe to
+# delete" only when every file of its tree is verified on EOS (native xrdfs,
+# relpath + size). /space/scan is read-only; /space/delete re-verifies every
+# run server-side before removing it (never trusts the client) and requires
+# the typed "DELETE" confirmation.
+# ===========================================================================
+
+@app.route("/space/usage")
+def space_usage():
+    return jsonify(space_manager.disk_usage())
+
+
+@app.route("/space/scan")
+def space_scan():
+    disk = request.args.get("disk", "data")
+    if disk not in space_manager.DISKS:
+        return jsonify({"success": False, "message": f"unknown disk {disk}"}), 400
+    try:
+        return jsonify(space_manager.scan(disk))
+    except Exception as e:
+        return jsonify({"success": False, "message": str(e)}), 500
+
+
+@app.route("/space/delete", methods=["POST"])
+def space_delete():
+    data = request.get_json(silent=True) or {}
+    disk = data.get("disk")
+    runs = data.get("runs") or []
+    confirm = data.get("confirm")
+    if disk not in space_manager.DISKS:
+        return jsonify({"success": False, "message": f"unknown disk {disk}"}), 400
+    if not isinstance(runs, list) or not runs:
+        return jsonify({"success": False, "message": "no runs selected"}), 400
+    # Typed confirmation must match exactly, so a stray click can't delete.
+    if confirm != "DELETE":
+        return jsonify({"success": False, "message": "confirmation text did not match"}), 400
+    out = space_manager.delete_runs(disk, runs)
+    log_event("SPACE_DELETE", "disk_space", disk=disk,
+              runs=",".join(runs), freed=out["freed_h"],
+              ok=out["n_deleted"], failed=out["n_failed"])
+    out["success"] = out["n_failed"] == 0
+    out["usage"] = space_manager.disk_usage().get(disk, {})
+    return jsonify(out)
+
+
+@app.route("/space/restore_scan")
+def space_restore_scan():
+    """List runs on EOS and how each compares to the local disk (read-only)."""
+    try:
+        return jsonify(space_manager.scan_restore())
+    except Exception as e:
+        return jsonify({"success": False, "message": str(e)}), 500
+
+
+@app.route("/space/restore", methods=["POST"])
+def space_restore():
+    """Pull runs back from EOS onto the local data disk. Non-destructive: only
+    files missing or size-mismatched locally are fetched. Sent one run per
+    request by the UI so it can show per-run progress."""
+    data = request.get_json(silent=True) or {}
+    runs = data.get("runs") or []
+    if not isinstance(runs, list) or not runs:
+        return jsonify({"success": False, "message": "no runs selected"}), 400
+    out = space_manager.restore_runs(runs)
+    log_event("SPACE_RESTORE", "disk_space", runs=",".join(runs),
+              fetched=out["fetched_h"], ok=out["n_restored"], failed=out["n_failed"])
+    out["success"] = out["n_failed"] == 0
+    out["usage"] = space_manager.disk_usage().get("data", {})
+    return jsonify(out)
 
 
 def is_dream_daq_running():

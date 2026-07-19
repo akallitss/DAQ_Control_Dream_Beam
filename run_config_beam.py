@@ -122,6 +122,19 @@ POST_SUBRUN_PAUSE_MIN = 0   # optional pause AFTER each sub-run (minutes); 0 = n
 MESH_V = 440    # V, P2 mesh
 DRIFT_V = 600   # V, P2 drift (drift gap = drift - mesh = 160 V)
 
+# ---------------------------------------------------------------------------
+# Telescope geometry — the three P2 stations' positions along the beam (z, mm).
+# Stations are TELESCOPE_SPACING_MM apart, the first one (beam order) at z = 0.
+# The per-detector z below is derived from TELESCOPE_ORDER, so change spacing or
+# order here and every detector's det_center_coords follows.
+# TODO-SPS: confirm the beam order (is P2_IN really upstream?) and survey the
+# real x/y offsets + exact z at the beam line.
+# ---------------------------------------------------------------------------
+TELESCOPE_SPACING_MM = 300.0                        # 30 cm between adjacent stations
+TELESCOPE_ORDER = ['P2_IN', 'P2_MID', 'P2_OUT']     # beam order upstream -> downstream
+DET_Z_MM = {name: i * TELESCOPE_SPACING_MM          # -> P2_IN 0, P2_MID 300, P2_OUT 600
+            for i, name in enumerate(TELESCOPE_ORDER)}
+
 # Telescope HV channels: (card, channel) on the SPS crate (192.168.10.199).
 # Cabling confirmed 2026-07-18 (matches the live bias readings that day:
 # ch0 700 V / ch1 450 V on P2_OUT, ch2/ch3 parked at 300 V on P2_MID).
@@ -322,10 +335,10 @@ class Config(RunConfigBase):
                 'det_type': 'P2',
                 'resist_type': 'none',
                 'bulked_from': 'Alex+Enzo',
-                'det_center_coords': {  # Center of detector. TODO-SPS: beam-line survey coordinates
+                'det_center_coords': {  # z along the beam from DET_Z_MM. TODO-SPS: survey x/y.
                     'x': 0,  # mm
                     'y': 0,  # mm
-                    'z': 0,  # mm
+                    'z': DET_Z_MM['P2_OUT'],  # mm
                 },
                 'det_orientation': {
                     'x': 0,  # deg  Rotation about x axis
@@ -344,10 +357,10 @@ class Config(RunConfigBase):
                 'det_type': 'P2',
                 'resist_type': 'none',
                 'bulked_from': 'Alex+Enzo',
-                'det_center_coords': {  # Center of detector. TODO-SPS: beam-line survey coordinates
+                'det_center_coords': {  # z along the beam from DET_Z_MM. TODO-SPS: survey x/y.
                     'x': 0,  # mm
                     'y': 0,  # mm
-                    'z': 0,  # mm
+                    'z': DET_Z_MM['P2_MID'],  # mm
                 },
                 'det_orientation': {
                     'x': 0,  # deg  Rotation about x axis
@@ -357,6 +370,31 @@ class Config(RunConfigBase):
                 'hv_channels': P2_HV['P2_MID'],
                 'dream_feus': _telescope_dream_feus(4),
                 'dream_feu_orientation': dict(_telescope_orientation),
+            },
+            {
+                # Third telescope station. TODO-SPS: fill in the real FEU/connector
+                # wiring (dream_feus), the HV card/channels, and add 'P2_IN' to
+                # included_detectors + P2_HV once it is cabled. Only its geometry
+                # (z = 0, the upstream station) is set so far.
+                'name': 'P2_IN',
+                'description': 'P2 telescope inner/upstream detector, SPS 2026. '
+                               'TODO-SPS: wiring + HV not yet assigned.',
+                'det_type': 'P2',
+                'resist_type': 'none',
+                'bulked_from': 'Alex+Enzo',
+                'det_center_coords': {  # z along the beam from DET_Z_MM. TODO-SPS: survey x/y.
+                    'x': 0,  # mm
+                    'y': 0,  # mm
+                    'z': DET_Z_MM['P2_IN'],  # mm
+                },
+                'det_orientation': {
+                    'x': 0,  # deg  Rotation about x axis
+                    'y': 0,  # deg  Rotation about y axis
+                    'z': 0,  # deg  Rotation about z axis
+                },
+                'hv_channels': {},        # TODO-SPS: mesh/drift (card, channel)
+                'dream_feus': {},         # TODO-SPS: connectors -> (feu, dream_conn)
+                'dream_feu_orientation': {},
             },
         ]
 

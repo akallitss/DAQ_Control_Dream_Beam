@@ -45,7 +45,9 @@ SITES = {
         # Active runs write to the NVMe system disk (measured 1.4 GB/s direct
         # writes, >10x the 1 GbE FEU link) — back up to the Intenso USB drive
         # between runs, never record onto it directly (FAT32, ~106 MB/s, SMR).
-        'base_data_dir': '/local/home/banco/P2_data/Fe55/',
+        # SPS July-2026 beam test in the H4 line — separate campaign dir from
+        # the Fe55 bench data (already backed up under P2_data/Fe55/).
+        'base_data_dir': '/local/home/banco/P2_data/TB_July2026_H4/',
         'daq_host': '192.168.10.8',                  # banco's IP on its DAQ LAN (enp2s0)
         'hv_ip': '192.168.10.199',                   # CAEN mainframe on banco's DAQ LAN (web login on :80)
         # Crate probed 2026-07-18: 16-slot mainframe, 12-ch cards in slots 8 and
@@ -61,7 +63,7 @@ SITES = {
         # numbering: input 3 = Id 101, 4 = 102, 5 = 103) with Sys Name = P2Fe55
         # and the stale per-FEU PdFile/ZsFile refs cleared (each run's own
         # PedThr phase programs fresh pedestals/thresholds instead).
-        'dream_cfg_template': '/local/home/banco/P2_data/Fe55/dream_config/P2SelfTrigger.cfg',
+        'dream_cfg_template': '/local/home/banco/P2_data/TB_July2026_H4/dream_config/P2SelfTrigger.cfg',
     },
 }
 

@@ -50,10 +50,16 @@ from datetime import datetime, timedelta
 # session; Flask only reads BEAM_STATE_PATH and the CSVs.
 _MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
 _REPO_DIR = os.path.dirname(_MODULE_DIR)
-# Per-day intensity CSVs live with the other slow-control logs (gas, 3He pressure)
-# under ~/beam_july/slow_control/ on the data disk, not in the repo.
-BEAM_LOG_DIR = os.path.expanduser("~/beam_july/slow_control/beam_intensity")
-BEAM_STATE_PATH = os.path.join(_REPO_DIR, "config", "beam_state.json")
+# Paths are env-overridable so the SAME module works on both ends of the
+# lxplus->EOS->banco bridge (NXCALS only runs on the CERN network):
+#   * lxplus watcher: set SPS_BEAM_STATE / SPS_BEAM_LOG_DIR to the EOS mount
+#     (/eos/project/.../beam_monitor/) so it publishes there directly (FUSE).
+#   * banco Flask + bridge: use the repo-local defaults below; beam_bridge.py
+#     xrdcp's the EOS files into these so the GUI reads a fresh state.
+BEAM_LOG_DIR = os.environ.get(
+    "SPS_BEAM_LOG_DIR", os.path.join(_REPO_DIR, "beam_monitor", "logs"))
+BEAM_STATE_PATH = os.environ.get(
+    "SPS_BEAM_STATE", os.path.join(_REPO_DIR, "config", "beam_state.json"))
 
 # Interpreter the watcher must run under (Flask's venv does not have pytimber).
 NXCALS_PYTHON = os.path.expanduser("~/venvs/nxcals/bin/python")

@@ -609,22 +609,29 @@ def stop_backup():
 
 @app.route("/start_beam_watcher", methods=["POST"])
 def start_beam_watcher():
-    """Start the SPS beam-intensity watcher (sole owner of the NXCALS/Spark session:
-    pulls the SPS intensity variable, logs it, and publishes beam on/off). Needs a
-    valid Kerberos ticket (kinit <user>@CERN.CH) and the NXCALS venv."""
+    """Start the beam-intensity feed in the 'beam_watcher' tmux session.
+
+    Two modes (SPS_BEAM_MODE env, default 'bridge'):
+      * bridge — the DAQ machine (banco) is off the CERN network and cannot reach
+        NXCALS, so it pulls the beam_state.json/CSVs the lxplus watcher publishes
+        to EOS (beam_bridge.py, runs under the Flask venv + xrdcp + Kerberos).
+      * direct — a CERN-network DAQ machine queries NXCALS itself
+        (beam_watcher.py under the NXCALS venv)."""
     try:
-        # NOT sys.executable: pytimber + PySpark live in their own venv, not flask's.
-        if not os.path.exists(NXCALS_PYTHON):
-            return jsonify({"success": False,
-                            "message": f"NXCALS venv missing: {NXCALS_PYTHON} "
-                                       f"(see beam_monitor/README.md)"}), 500
+        mode = os.environ.get("SPS_BEAM_MODE", "bridge")
         subprocess.run(["tmux", "kill-session", "-t", "beam_watcher"], capture_output=True)
-        subprocess.Popen([
-            "tmux", "new-session", "-d", "-s", "beam_watcher",
-            NXCALS_PYTHON, f"{BASE_DIR}/beam_watcher.py"
-        ])
-        return jsonify({"success": True,
-                        "message": "Beam watcher started (first NXCALS query takes ~1 min)"})
+        if mode == "direct":
+            if not os.path.exists(NXCALS_PYTHON):
+                return jsonify({"success": False,
+                                "message": f"NXCALS venv missing: {NXCALS_PYTHON} "
+                                           f"(see beam_monitor/README.md)"}), 500
+            cmd = [NXCALS_PYTHON, f"{BASE_DIR}/beam_watcher.py"]
+            msg = "Beam watcher started (direct NXCALS; first query ~1 min)"
+        else:
+            cmd = [sys.executable, f"{BASE_DIR}/beam_bridge.py"]
+            msg = "Beam bridge started (pulling beam state from EOS)"
+        subprocess.Popen(["tmux", "new-session", "-d", "-s", "beam_watcher", *cmd])
+        return jsonify({"success": True, "message": msg})
     except Exception as e:
         return jsonify({"success": False, "message": str(e)}), 500
 

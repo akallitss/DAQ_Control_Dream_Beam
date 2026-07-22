@@ -123,26 +123,29 @@ MESH_V = 440    # V, P2 mesh
 DRIFT_V = 600   # V, P2 drift (drift gap = drift - mesh = 160 V)
 
 # ---------------------------------------------------------------------------
-# Telescope geometry — the three P2 stations' positions along the beam (z, mm).
-# Stations are TELESCOPE_SPACING_MM apart, the first one (beam order) at z = 0.
-# The per-detector z below is derived from TELESCOPE_ORDER, so change spacing or
-# order here and every detector's det_center_coords follows.
-# TODO-SPS: survey the real x/y offsets + exact z at the beam line.
+# Telescope geometry — position along the beam (z, mm), confirmed at the beam
+# 2026-07-22 (Alexandra). Beam order upstream -> downstream: uRWELL front
+# reference, the three P2 stations, then uRWELL back reference. Gaps 32/31/31/43
+# cm. TODO-SPS: survey the transverse x/y offsets.
 # ---------------------------------------------------------------------------
-TELESCOPE_SPACING_MM = 300.0                        # 30 cm between adjacent stations
-TELESCOPE_ORDER = ['P2_OUT', 'P2_MID', 'P2_IN']     # beam order: P2_OUT first (upstream)
-DET_Z_MM = {name: i * TELESCOPE_SPACING_MM          # -> P2_OUT 0, P2_MID 300, P2_IN 600
-            for i, name in enumerate(TELESCOPE_ORDER)}
+DET_Z_MM = {
+    'EIC_uRWELL_front':    0.0,   # front reference
+    'P2_IN':             320.0,   # 32 cm
+    'P2_MID':            630.0,   # +31 cm
+    'P2_OUT':            940.0,   # +31 cm
+    'EIC_uRWELL_back':  1370.0,   # +43 cm  back reference
+}
 
-# Telescope HV channels: (card, channel) on the SPS crate (192.168.10.199).
-# Cabling confirmed 2026-07-18 (matches the live bias readings that day:
-# ch0 700 V / ch1 450 V on P2_OUT, ch2/ch3 parked at 300 V on P2_MID).
-P2_HV = {
+# HV channels (card, channel) on the SPS CAEN crate (192.168.10.199), confirmed
+# at the beam 2026-07-22. P2 detectors: mesh + drift on card 8. uRWELL
+# references: drift on card 8 + a resistive layer on card 12 (the crate's second
+# populated slot).
+DET_HV = {
     'P2_OUT': {'drift': (8, 0), 'mesh': (8, 1)},
     'P2_MID': {'drift': (8, 2), 'mesh': (8, 3)},
-    # P2_IN: next channels on card 8 following the OUT(0/1)/MID(2/3) pattern.
-    # TODO-SPS: CONFIRM P2_IN's real mesh/drift channels at the beam.
     'P2_IN':  {'drift': (8, 4), 'mesh': (8, 5)},
+    'EIC_uRWELL_front': {'drift': (8, 6), 'resist': (12, 0)},
+    'EIC_uRWELL_back':  {'drift': (8, 7), 'resist': (12, 1)},
 }
 
 
@@ -270,10 +273,15 @@ class Config(RunConfigBase):
                 print(f'WARNING: {creds_path} not found — using default admin/admin HV credentials.')
 
         # ----- Run schedule (built from module constants above) -----
+        # NB: the Fe55 code schedule below only ramps the P2 detectors' mesh+drift
+        # (SCAN_START). Beam runs (3 P2 + 2 uRWELL) are configured from the GUI
+        # run builder, which sets every included detector's channels.
         def _both_det_hvs(mesh_v, drift_v):
-            """{card: {channel: V}} setting every included detector's mesh/drift."""
+            """{card: {channel: V}} setting every P2 detector's mesh + drift."""
             hvs = {}
-            for det_hv in P2_HV.values():
+            for det_hv in DET_HV.values():
+                if 'mesh' not in det_hv:   # uRWELLs (drift+resist) — skip in Fe55 helper
+                    continue
                 hvs.setdefault(str(det_hv['mesh'][0]), {})[str(det_hv['mesh'][1])] = mesh_v
                 hvs.setdefault(str(det_hv['drift'][0]), {})[str(det_hv['drift'][1])] = drift_v
             return hvs
@@ -287,7 +295,7 @@ class Config(RunConfigBase):
                 off = i * SCAN_STEP_V
                 hvs, name_bits = {}, []
                 for det_name, start in SCAN_START.items():
-                    det_hv = P2_HV[det_name]
+                    det_hv = DET_HV[det_name]
                     mesh_v, drift_v = start['mesh'] - off, start['drift'] - off
                     assert mesh_v <= start['mesh'] and drift_v <= start['drift'], \
                         f'{det_name} scan point above its maximum'
@@ -313,98 +321,102 @@ class Config(RunConfigBase):
             'board_thickness': 5,  # mm  Thickness of PCB for test boards  Guess!
         }
 
-        self.included_detectors = ['P2_OUT', 'P2_MID', 'P2_IN']
+        self.included_detectors = ['EIC_uRWELL_front', 'P2_IN', 'P2_MID',
+                                   'P2_OUT', 'EIC_uRWELL_back']
 
-        # Telescope cabling (2026-07-18, FEU assignment fixed later that day):
-        # each detector has connectors 4-7 read out, each connector on a
-        # bot/top Dream pair filling FEU connectors 1-8.
-        # Cfg FEU numbers are TCM input ports (per SelfTcm.cfg):
-        # P2_OUT -> FEU Id 101 (cfg Feu 3, 192.168.10.113)
-        # P2_MID -> FEU Id 102 (cfg Feu 4, 192.168.10.114)
-        # FEU Id 103 (cfg Feu 5, .115) is currently detector-less.
-        # dream_feu_orientation carried over from the cosmic-bench P2 setup;
-        # TODO-SPS: verify orientations and survey coordinates on the telescope.
-        _telescope_dream_feus = lambda feu: {
+        # Cabling confirmed at the beam 2026-07-22 (Alexandra). Cfg FEU numbers
+        # are TCM input ports; Id/IP from RackTcm.cfg:
+        #   cfg Feu 1 = Id 68  (.80)  -> both EIC uRWELL references
+        #   cfg Feu 3 = Id 101 (.113) -> P2_IN
+        #   cfg Feu 4 = Id 102 (.114) -> P2_MID
+        #   cfg Feu 5 = Id 103 (.115) -> P2_OUT
+        # P2: connectors 4-7, each a bot/top Dream pair filling FEU Dream conn
+        # 1-8; all rotated_inverted.
+        _p2_dream_feus = lambda feu: {
             f'c_{conn}_{pos}': (feu, 2 * (conn - 4) + (1 if pos == 'bot' else 2))
             for conn in (4, 5, 6, 7) for pos in ('bot', 'top')
         }
-        _telescope_orientation = {
+        _p2_orientation = {
             f'c_{conn}_{pos}': 'rotated_inverted'
             for conn in (4, 5, 6, 7) for pos in ('bot', 'top')
         }
+        # uRWELL x/y strips on cfg Feu 1 (Id 68): front on Dream conn 1-4, back
+        # on 5-8. Orientation: x normal; y inverted (front) / rotated (back).
+        def _urwell(feu, base, y_orient):
+            feus = {'x1': (feu, base), 'x2': (feu, base + 1),
+                    'y1': (feu, base + 2), 'y2': (feu, base + 3)}
+            orient = {'x1': 'normal', 'x2': 'normal', 'y1': y_orient, 'y2': y_orient}
+            return feus, orient
+        _urwell_front_feus, _urwell_front_orient = _urwell(1, 1, 'inverted')
+        _urwell_back_feus,  _urwell_back_orient  = _urwell(1, 5, 'rotated')
 
         self.detectors = [
             {
-                'name': 'P2_OUT',
-                'description': 'P2 telescope outer detector (det2), SPS 2026. '
-                               'Bulked 25-6-26; has the misaligned wall.',
+                'name': 'EIC_uRWELL_front',
+                'description': 'EIC uRWELL front reference (z=0, first the beam '
+                               'sees). FEU Id 68 (cfg Feu 1), Dream conn 1-4: '
+                               'x1/x2=ch1/2, y1/y2=ch3/4.',
+                'det_type': 'uRWELL',
+                'resist_type': 'resistive',
+                'bulked_from': '',
+                'det_center_coords': {'x': 0, 'y': 0, 'z': DET_Z_MM['EIC_uRWELL_front']},
+                'det_orientation': {'x': 0, 'y': 0, 'z': 0},
+                'hv_channels': DET_HV['EIC_uRWELL_front'],
+                'dream_feus': _urwell_front_feus,
+                'dream_feu_orientation': _urwell_front_orient,
+            },
+            {
+                'name': 'P2_IN',
+                'description': 'P2 telescope IN, upstream P2 (z=320 mm). '
+                               'det2 in bulking order. FEU Id 101 (cfg Feu 3).',
                 'det_type': 'P2',
                 'resist_type': 'none',
                 'bulked_from': 'Alex+Enzo',
-                'det_center_coords': {  # z along the beam from DET_Z_MM. TODO-SPS: survey x/y.
-                    'x': 0,  # mm
-                    'y': 0,  # mm
-                    'z': DET_Z_MM['P2_OUT'],  # mm
-                },
-                'det_orientation': {
-                    'x': 0,  # deg  Rotation about x axis
-                    'y': 0,  # deg  Rotation about y axis
-                    'z': 0,  # deg  Rotation about z axis
-                },
-                'hv_channels': P2_HV['P2_OUT'],
-                'dream_feus': _telescope_dream_feus(3),
-                'dream_feu_orientation': dict(_telescope_orientation),
+                'det_center_coords': {'x': 0, 'y': 0, 'z': DET_Z_MM['P2_IN']},
+                'det_orientation': {'x': 0, 'y': 0, 'z': 0},
+                'hv_channels': DET_HV['P2_IN'],
+                'dream_feus': _p2_dream_feus(3),
+                'dream_feu_orientation': dict(_p2_orientation),
             },
             {
                 'name': 'P2_MID',
-                'description': 'P2 telescope middle detector (det3), SPS 2026. '
-                               'Bulked 2-7-26; 2 insulations on the wall (half '
-                               'of the UV lamp lights were working at a time).',
+                'description': 'P2 telescope MID (z=630 mm). det1 in bulking '
+                               'order. FEU Id 102 (cfg Feu 4).',
                 'det_type': 'P2',
                 'resist_type': 'none',
                 'bulked_from': 'Alex+Enzo',
-                'det_center_coords': {  # z along the beam from DET_Z_MM. TODO-SPS: survey x/y.
-                    'x': 0,  # mm
-                    'y': 0,  # mm
-                    'z': DET_Z_MM['P2_MID'],  # mm
-                },
-                'det_orientation': {
-                    'x': 0,  # deg  Rotation about x axis
-                    'y': 0,  # deg  Rotation about y axis
-                    'z': 0,  # deg  Rotation about z axis
-                },
-                'hv_channels': P2_HV['P2_MID'],
-                'dream_feus': _telescope_dream_feus(4),
-                'dream_feu_orientation': dict(_telescope_orientation),
+                'det_center_coords': {'x': 0, 'y': 0, 'z': DET_Z_MM['P2_MID']},
+                'det_orientation': {'x': 0, 'y': 0, 'z': 0},
+                'hv_channels': DET_HV['P2_MID'],
+                'dream_feus': _p2_dream_feus(4),
+                'dream_feu_orientation': dict(_p2_orientation),
             },
             {
-                # Third telescope station, LAST one the beam sees (z = 600 mm,
-                # downstream). TODO-SPS: fill in the real FEU/connector wiring
-                # third telescope station, on FEU 5 (Id 103) — active in the
-                # expert RackTcm.cfg (2026-07-22). Connectors 4-7 assumed to
-                # mirror P2_OUT/P2_MID (fully activates FEU 5's 8 Dreams either
-                # way; only the analysis pad-labelling depends on the exact
-                # connectors). TODO-SPS: CONFIRM P2_IN connectors + HV channels.
-                'name': 'P2_IN',
-                'description': 'P2 telescope inner/downstream detector (last the '
-                               'beam sees), SPS 2026. FEU 5 (Id 103). '
-                               'TODO-SPS: confirm connectors + HV.',
+                'name': 'P2_OUT',
+                'description': 'P2 telescope OUT, downstream P2 (z=940 mm). '
+                               'det3 in bulking order. FEU Id 103 (cfg Feu 5).',
                 'det_type': 'P2',
                 'resist_type': 'none',
                 'bulked_from': 'Alex+Enzo',
-                'det_center_coords': {  # z along the beam from DET_Z_MM. TODO-SPS: survey x/y.
-                    'x': 0,  # mm
-                    'y': 0,  # mm
-                    'z': DET_Z_MM['P2_IN'],  # mm
-                },
-                'det_orientation': {
-                    'x': 0,  # deg  Rotation about x axis
-                    'y': 0,  # deg  Rotation about y axis
-                    'z': 0,  # deg  Rotation about z axis
-                },
-                'hv_channels': P2_HV['P2_IN'],
-                'dream_feus': _telescope_dream_feus(5),
-                'dream_feu_orientation': dict(_telescope_orientation),
+                'det_center_coords': {'x': 0, 'y': 0, 'z': DET_Z_MM['P2_OUT']},
+                'det_orientation': {'x': 0, 'y': 0, 'z': 0},
+                'hv_channels': DET_HV['P2_OUT'],
+                'dream_feus': _p2_dream_feus(5),
+                'dream_feu_orientation': dict(_p2_orientation),
+            },
+            {
+                'name': 'EIC_uRWELL_back',
+                'description': 'EIC uRWELL back reference (z=1370 mm, last the '
+                               'beam sees). FEU Id 68 (cfg Feu 1), Dream conn 5-8: '
+                               'x1/x2=ch5/6, y1/y2=ch7/8.',
+                'det_type': 'uRWELL',
+                'resist_type': 'resistive',
+                'bulked_from': '',
+                'det_center_coords': {'x': 0, 'y': 0, 'z': DET_Z_MM['EIC_uRWELL_back']},
+                'det_orientation': {'x': 0, 'y': 0, 'z': 0},
+                'hv_channels': DET_HV['EIC_uRWELL_back'],
+                'dream_feus': _urwell_back_feus,
+                'dream_feu_orientation': _urwell_back_orient,
             },
         ]
 

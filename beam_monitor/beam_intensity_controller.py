@@ -64,15 +64,20 @@ BEAM_STATE_PATH = os.environ.get(
 # Interpreter the watcher must run under (Flask's venv does not have pytimber).
 NXCALS_PYTHON = os.path.expanduser("~/venvs/nxcals/bin/python")
 
-# NXCALS variable — the H4 experiment-zone (HNA348) beam counter, confirmed
-# logged live 2026-07-22 (XBH4.EXPT.HNA348.002-008:COUNTS, ~14 s cadence).
-# Which of the .002-.008 counters is the primary beam/trigger counter is set
-# via SPS_BEAM_VARIABLE (no code change to swap). Value is per-cycle COUNTS.
-BEAM_VARIABLE = os.environ.get("SPS_BEAM_VARIABLE", "XBH4.EXPT.HNA348.002:COUNTS")
-BEAM_UNIT = os.environ.get("SPS_BEAM_UNIT", "counts")
-# Cycles with counts at/above this are "beam on". Counts (not 1e10 protons);
-# low threshold since any real beam gives many counts. Override SPS_BEAM_THRESHOLD.
-PULSE_THRESHOLD_E10 = float(os.environ.get("SPS_BEAM_THRESHOLD", "1"))
+# NXCALS variable — the SPS slow-extraction SPILL intensity to the North Area,
+# which reproduces the beam structure shown on the SPS1 Vistar (op-webtools).
+# Confirmed live 2026-07-23: SPSQC:MEAN_SPILL_INTENSITY ~1240 per spill (one
+# point per SFTPRO spill). This is the SPS-level beam (present whenever the SPS
+# spills), independent of whether beam is steered all the way to our zone — the
+# local H4 counters (XBH4.EXPT.HNA348.*:COUNTS) read 0 until beam reaches us.
+# Alternatives via SPS_BEAM_VARIABLE (env, no code change):
+#   * SPS.BCTDC.51456:SBF_INTENSITY  — raw per-cycle BCT (~1366 during a spill,
+#     ~0.4 between) if you want the on/off supercycle structure;
+#   * XBH4.EXPT.HNA348.00N:COUNTS    — our zone counter once beam is through.
+BEAM_VARIABLE = os.environ.get("SPS_BEAM_VARIABLE", "SPSQC:MEAN_SPILL_INTENSITY")
+BEAM_UNIT = os.environ.get("SPS_BEAM_UNIT", "1e10 p / spill")
+# Spills at/above this count as "beam on"; real spills are ~1240, empty ~0.
+PULSE_THRESHOLD_E10 = float(os.environ.get("SPS_BEAM_THRESHOLD", "50"))
 
 POLL_S = 30.0            # NXCALS query cadence
 LOOKBACK_S = 600.0       # stats window (spills / protons in the last 10 min)

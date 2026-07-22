@@ -64,20 +64,15 @@ BEAM_STATE_PATH = os.environ.get(
 # Interpreter the watcher must run under (Flask's venv does not have pytimber).
 NXCALS_PYTHON = os.path.expanduser("~/venvs/nxcals/bin/python")
 
-# NXCALS variable + interpretation — SPS North Area (P2 SPS beam test).
-# TODO-SPS: confirm the exact variable in Timber once the beam line (H2/H4/...)
-# is assigned. Candidates, most- to least-specific for our detector:
-#   * the XBPF/scintillator counters of the assigned beam line (best: particles
-#     actually through our zone),
-#   * the T2/T4/T6 target BSI intensity for our target (e.g. T2 for H2/H4),
-#   * SPS.BCTDC.51454:SFTPRO_INT — protons slow-extracted from the SPS towards
-#     the North Area (upstream of target sharing; good beam on/off signal,
-#     wrong for absolute normalisation). Used as the placeholder default.
-BEAM_VARIABLE = "SPS.BCTDC.51454:SFTPRO_INT"
-BEAM_UNIT = "1e10 protons"
-# Points below this are empty cycles, not real spills. TODO-SPS: retune against
-# real spill values of the chosen variable.
-PULSE_THRESHOLD_E10 = 50.0
+# NXCALS variable — the H4 experiment-zone (HNA348) beam counter, confirmed
+# logged live 2026-07-22 (XBH4.EXPT.HNA348.002-008:COUNTS, ~14 s cadence).
+# Which of the .002-.008 counters is the primary beam/trigger counter is set
+# via SPS_BEAM_VARIABLE (no code change to swap). Value is per-cycle COUNTS.
+BEAM_VARIABLE = os.environ.get("SPS_BEAM_VARIABLE", "XBH4.EXPT.HNA348.002:COUNTS")
+BEAM_UNIT = os.environ.get("SPS_BEAM_UNIT", "counts")
+# Cycles with counts at/above this are "beam on". Counts (not 1e10 protons);
+# low threshold since any real beam gives many counts. Override SPS_BEAM_THRESHOLD.
+PULSE_THRESHOLD_E10 = float(os.environ.get("SPS_BEAM_THRESHOLD", "1"))
 
 POLL_S = 30.0            # NXCALS query cadence
 LOOKBACK_S = 600.0       # stats window (spills / protons in the last 10 min)

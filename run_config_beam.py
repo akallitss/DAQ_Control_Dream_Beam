@@ -44,7 +44,7 @@ TRIGGER_MODE = os.environ.get('DAQ_TRIGGER', 'external')  # 'external' (beam) or
 assert TRIGGER_MODE in ('external', 'self'), \
     f"DAQ_TRIGGER must be 'external' or 'self', got {TRIGGER_MODE!r}"
 _SELF_TRIGGER = (TRIGGER_MODE == 'self')
-_DREAM_TEMPLATE_FILE = {'self': 'P2SelfTrigger.cfg', 'external': 'P2TB.cfg'}[TRIGGER_MODE]
+_DREAM_TEMPLATE_FILE = {'self': 'P2SelfTrigger.cfg', 'external': 'RackTcm.cfg'}[TRIGGER_MODE]
 
 SITES = {
     'local': {
@@ -140,6 +140,9 @@ DET_Z_MM = {name: i * TELESCOPE_SPACING_MM          # -> P2_OUT 0, P2_MID 300, P
 P2_HV = {
     'P2_OUT': {'drift': (8, 0), 'mesh': (8, 1)},
     'P2_MID': {'drift': (8, 2), 'mesh': (8, 3)},
+    # P2_IN: next channels on card 8 following the OUT(0/1)/MID(2/3) pattern.
+    # TODO-SPS: CONFIRM P2_IN's real mesh/drift channels at the beam.
+    'P2_IN':  {'drift': (8, 4), 'mesh': (8, 5)},
 }
 
 
@@ -192,13 +195,13 @@ class Config(RunConfigBase):
             'run_directory': f'{self.base_out_dir}dream_run/{self.run_name}/',
             'data_out_dir': f'{self.run_out_dir}',
             'raw_daq_inner_dir': self.raw_daq_inner_dir,
-            'n_samples_per_waveform': 32,  # Same as cosmic bench P2
+            'n_samples_per_waveform': 16,  # RackTcm.cfg (expert beam config)
             'sample_period': 60,  # ns, sampling period (same as cosmic bench)
             'go_timeout': 5 * 60,  # Seconds to wait for 'Go' response from RunCtrl before assuming failure
             'max_run_time_addition': 60 * 5,  # Seconds to add to requested run time before killing run
             'copy_on_fly': True,  # True to copy raw data to out dir during run, False to copy after run
             'batch_mode': True,  # Run Dream RunCtrl in batch mode.
-            'zero_suppress': False,  # True to run in zero suppression mode, False for full readout
+            'zero_suppress': True,   # ZS mode, matching RackTcm.cfg (beam)
             'pedestals_dir': f'{self.base_out_dir}pedestals/',  # None to ignore, else top directory for pedestal runs
             'pedestals': 'latest',  # 'latest' for most recent, otherwise specify directory name
             'zs_check_sample': 1,  # Number of samples to read out beyond threshold crossing
@@ -310,7 +313,7 @@ class Config(RunConfigBase):
             'board_thickness': 5,  # mm  Thickness of PCB for test boards  Guess!
         }
 
-        self.included_detectors = ['P2_OUT', 'P2_MID']
+        self.included_detectors = ['P2_OUT', 'P2_MID', 'P2_IN']
 
         # Telescope cabling (2026-07-18, FEU assignment fixed later that day):
         # each detector has connectors 4-7 read out, each connector on a
@@ -377,12 +380,15 @@ class Config(RunConfigBase):
             {
                 # Third telescope station, LAST one the beam sees (z = 600 mm,
                 # downstream). TODO-SPS: fill in the real FEU/connector wiring
-                # (dream_feus), the HV card/channels, and add 'P2_IN' to
-                # included_detectors + P2_HV once it is cabled. Only its geometry
-                # is set so far.
+                # third telescope station, on FEU 5 (Id 103) — active in the
+                # expert RackTcm.cfg (2026-07-22). Connectors 4-7 assumed to
+                # mirror P2_OUT/P2_MID (fully activates FEU 5's 8 Dreams either
+                # way; only the analysis pad-labelling depends on the exact
+                # connectors). TODO-SPS: CONFIRM P2_IN connectors + HV channels.
                 'name': 'P2_IN',
                 'description': 'P2 telescope inner/downstream detector (last the '
-                               'beam sees), SPS 2026. TODO-SPS: wiring + HV not yet assigned.',
+                               'beam sees), SPS 2026. FEU 5 (Id 103). '
+                               'TODO-SPS: confirm connectors + HV.',
                 'det_type': 'P2',
                 'resist_type': 'none',
                 'bulked_from': 'Alex+Enzo',
@@ -396,9 +402,9 @@ class Config(RunConfigBase):
                     'y': 0,  # deg  Rotation about y axis
                     'z': 0,  # deg  Rotation about z axis
                 },
-                'hv_channels': {},        # TODO-SPS: mesh/drift (card, channel)
-                'dream_feus': {},         # TODO-SPS: connectors -> (feu, dream_conn)
-                'dream_feu_orientation': {},
+                'hv_channels': P2_HV['P2_IN'],
+                'dream_feus': _telescope_dream_feus(5),
+                'dream_feu_orientation': dict(_telescope_orientation),
             },
         ]
 
@@ -447,7 +453,7 @@ class Config(RunConfigBase):
                 TRIGGER_MODE = _tm
                 _SELF_TRIGGER = (_tm == 'self')
                 _DREAM_TEMPLATE_FILE = {'self': 'P2SelfTrigger.cfg',
-                                        'external': 'P2TB.cfg'}[_tm]
+                                        'external': 'RackTcm.cfg'}[_tm]
                 DREAM_CFG_TEMPLATE = _SITE_CFG.get(
                     'dream_cfg_template',
                     f'{BASE_DATA_DIR}dream_config/{_DREAM_TEMPLATE_FILE}')

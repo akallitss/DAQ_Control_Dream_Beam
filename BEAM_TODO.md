@@ -176,7 +176,49 @@ to Fe55. Last reviewed 2026-07-23.
       (`N_SUBRUNS` / `SUBRUN_MIN`) using the **measured** event size and trigger
       rate from it — see the disk budget below.
 
-## 4b. Disk budget
+## 4a. FIRST BEAM RUN — DONE (2026-07-23, `beam_commissioning_1`)
+
+Pedestals `pedestals_07-23-26_17-00-32` (200 V all electrodes) then two 2-min
+external-trigger sub-runs. **Everything on the commissioning checklist passed.**
+
+| check | result |
+|---|---|
+| Trigger rate | **1595 / 1603 Hz** (sub-run 00 / 01) — beam present |
+| Events | 191 458 and 192 385 per FEU, 2 min each |
+| All 4 FEUs read out | yes — totals divide exactly by 4, perfect event sync |
+| Bad events / errors | **0** (no `sample_cnt` mismatch, no corruption) |
+| Pedestal reuse | worked — `TakePedThr=Off`, thresholds preloaded from the .prg |
+| Decoding | 4 ROOT files/sub-run, **191 458 entries each**, exactly matching RunCtrl |
+| HV | all 10 channels held setpoint, **zero trips** |
+| EOS | pedestals + run synced |
+
+**Measured event size** (replaces the estimate below): 282.6 MB per 2-min
+sub-run over 4 FEUs / 191 458 events = **1.51 kB/event** (387 B/FEU/event),
+i.e. ~2 % occupancy against the 79 kB raw-equivalent — the optimistic end of
+the estimate. At 1600 Hz that is **2.35 MB/s = 8.5 GB/h raw, ~21 GB/h on disk**
+(measured 421 MB per sub-run in `runs/` + the `dream_run/` copy). With 473 GB
+free that is roughly a day of continuous beam.
+Decoded ROOT is only **0.14x** the raw volume here (40 MB per sub-run), far
+below the 0.5x seen on the raw-mode Fe55 run — as expected with ZS on.
+
+**P2_OUT at the raised 450 V mesh drew 0.61-0.84 uA**, in line with P2_IN
+(0.72-0.95) and P2_MID (0.46). No trips, no excursion — the 450 V point looks
+healthy, though it remains above the previously documented 420 V maximum.
+
+Still to do on the next beam run:
+- [ ] The latency scan (`DAQ_LATENCY_SCAN=1`) — confirm 32 centres the pulse.
+- [ ] Look at the decoded data: occupancy per plane, pulse position in the
+      16-sample window, and that all five detectors show hits (this run
+      confirmed data flow and integrity, not yet detector response).
+- [ ] `power_off_hv_at_end` is True, so each run re-ramps from 0. Consider
+      setting it False for a back-to-back series.
+
+Minor, cosmetic: processor_watcher prints `Decoder finished, events: 0` even
+when the decode is fine (verified 191 458 entries in every ROOT file). The
+count it parses is not the real one — worth fixing so a genuine zero-event
+decode is not masked.
+
+## 4b. Disk budget (pre-run estimate — see measured values above)
 Calibrated from the Fe55 run of 2026-07-18 (RunCtrl log: 29 305 events/FEU in
 300 s = 97.7 Hz; 39.6 kB/event/FEU at 32 samples, raw mode, 2 FEUs). That gives
 a framing overhead of **1.21x** over the bare sample payload.

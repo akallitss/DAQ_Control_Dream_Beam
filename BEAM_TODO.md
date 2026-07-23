@@ -28,9 +28,22 @@ to Fe55. Last reviewed 2026-07-23.
       optimized beam reference `EicP2Bt/P2B_TstBeam.cfg` (2026-07-23 15:46).
       History: 45 (0x002D) in RackTcm.cfg, 40 (0x0028) in the self-trigger
       P2B_SelfTcm.cfg.
-- [ ] **Verify 32 on real beam signals**: worth a short latency scan
-      (e.g. 28/32/36) on the first beam — pick the value that centres the pulse
-      in the sample window (`13_timing_waveforms` + online detector_qa).
+- [ ] **Verify 32 on real beam signals** — scan is wired up and ready:
+      ```
+      DAQ_SITE=sps DAQ_TRIGGER=external DAQ_LATENCY_SCAN=1 python daq_control.py
+      ```
+      5 sub-runs `latency_024/028/032/036/040`, 2 min each (~10 min + overhead),
+      all at the beam operating point. Needs no extra DAQ plumbing: each
+      sub-run dict carries its own `latency`, and dream_daq_control merges
+      `{**dream_daq_info, **sub_run}` per sub-run (hv_control reads only `hvs`
+      and `sub_run_name` and ignores the rest). Verified end to end — the five
+      generated cfgs come out with `Feu * Dream * 12` =
+      0x0018/0x001C/0x0020/0x0024/0x0028 and `Sys DaqRun Trig Ext`.
+      Pick the value that centres the pulse in the 16-sample window
+      (`13_timing_waveforms` + online detector_qa), put it in
+      `dream_daq_info['latency']`, then set `LATENCY_SCAN` back to False.
+      If none of the five centres it, widen the step before narrowing it;
+      once bracketed, rescan at step 2.
 - [x] **Beam template = the expert's optimized beam config** (2026-07-23):
       `dream_config/P2B_Beam.cfg` is synced from `EicP2Bt/P2B_TstBeam.cfg`
       (an external-trigger config: `Trig Ext`, all-Dat topology, Mult 2/4) with
@@ -97,9 +110,14 @@ to Fe55. Last reviewed 2026-07-23.
       (`det_center_coords` x/y are all 0 at the moment).
 - [x] **HV operating points set per detector** (2026-07-23, `OPERATING_HV`):
       P2_IN 700 drift / 490 mesh (gap 210), P2_MID 700/510 (gap 190),
-      P2_OUT 700/420 (gap 280), uRWELL front (uRWELL-inter) and back
-      (uRWELL-strip) both 600 drift / 420 resistive. Asserted at import against
-      `MAX_HV` so a typo fails before it reaches the crate.
+      P2_OUT 700/450 (gap 250), uRWELL front (uRWELL-inter) and back
+      (uRWELL-strip) both 600 drift / 420 resistive. MID and OUT deliberately
+      share the same 250 V drift gap. Asserted at import against `MAX_HV` so a
+      typo fails before it reaches the crate.
+      **Watch P2_OUT on the first ramp**: its mesh setpoint was raised
+      420 -> 450 V on 2026-07-23, which is above the maximum documented for it
+      up to that point (the Fe55 `SCAN_START` still starts from 420). Back off
+      if it draws current or trips.
       This replaced the old common P2 point (mesh 440 / drift 600) inherited
       from the cosmic bench, which was **unsafe on P2_OUT** — 440 V mesh is
       above its 420 V maximum.
@@ -115,8 +133,10 @@ to Fe55. Last reviewed 2026-07-23.
 - [x] `HV_SCAN` set to **False** for the first beam run (2026-07-23):
       2 x 2 min commissioning sub-runs (`beam_commissioning_00/01`) at the
       operating point, to confirm trigger rate / event flow / clean decoding
-      before committing beam time. The Fe55 scan branch is untouched and still
-      applies for `DAQ_TRIGGER=self`.
+      before committing beam time.
+      Note `HV_SCAN` is **global, not per trigger mode**: the Fe55 scan code is
+      intact but will not run while the flag is False, so going back to the
+      Fe55 bench means setting `HV_SCAN=True` as well as `DAQ_TRIGGER=self`.
 - [ ] After the commissioning run passes, pick the physics schedule
       (`N_SUBRUNS` / `SUBRUN_MIN`) using the **measured** event size and trigger
       rate from it — see the disk budget below.
@@ -149,8 +169,22 @@ up. If the rate or occupancy comes in much higher, drop `save_fdfs` or clear
 - [ ] Intra-spill profile: `MEAN_SPILL_INTENSITY` is one scalar per spill. For
       the Vistar-style spill shape an array variable (NA-SPILL profile) still
       needs to be identified and added.
-- [ ] EOS backup: live (banco → `/eos/project/s/salsachip/…`). Confirm a first
-      real beam run reaches EOS.
+- [x] **EOS backup confirmed live end-to-end** (2026-07-23). Verified on banco:
+      `backup_watcher.py config/backup_config.json` running (PID 108222),
+      source `TB_July2026_H4/`, dest
+      `root://eosproject.cern.ch//eos/project/s/salsachip/Data/T2_tests/P2_SPS_Dream_Data/`.
+      Kerberos `akallits@CERN.CH` valid to 07/24 16:59, renewable to 07/28, with
+      an `xrootd/eosproject-i01.cern.ch` service ticket already issued.
+      Proof of live sync: the `P2B_Beam.cfg` we deployed today is on EOS at
+      8263 B — byte-identical to the local file — timestamped ~4 min after the
+      local write (EOS lists UTC, banco is CEST; matches the 300 s
+      `extra_sync_interval` for non-`runs` subdirs).
+      Note `xrdcp`/`xrdfs` live in `~/bin` and are NOT on a non-interactive
+      ssh PATH — prepend `PATH=$HOME/bin:$PATH` when checking by hand.
+- [ ] Confirm the **first real beam run** appears under EOS `runs/<run>/` with
+      all four FEUs' fdfs (config/dream_config/pedestals already mirror fine).
+      `dream_run/` is in `exclude_dirs`, so EOS carries ~1.5x the raw volume
+      (raw + decoded), not the ~2.5x that sits on the local disk.
 - [ ] Confirm the GUI Analysis tab + Disk Space tab show the beam runs.
 
 ## 6. Analysis (ready — flip on when real beam data arrives)

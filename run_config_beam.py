@@ -109,19 +109,45 @@ DREAM_CFG_TEMPLATE = _SITE_CFG.get(
     'dream_cfg_template', f'{BASE_DATA_DIR}dream_config/{_DREAM_TEMPLATE_FILE}')
 
 # ---------------------------------------------------------------------------
-# Run schedule
-#   HV_SCAN False: N_SUBRUNS identical sub-runs of SUBRUN_MIN minutes at the
-#                  nominal operating point (MESH_V/DRIFT_V).
-#   HV_SCAN True:  Fe55 self-trigger mesh HV scan. Per detector, start AT the
-#                  operating (max) point and step mesh AND drift down together
-#                  by SCAN_STEP_V per point — the potential across the drift
-#                  gap (= drift − mesh) stays constant: 280 V for P2_OUT,
-#                  190 V for P2_MID.
+# Run schedule — the three modes are checked in this order:
+#
+#   LATENCY_SCAN True : beam latency scan. One sub-run per value in
+#                       LATENCY_SCAN_VALUES, all at the beam operating point,
+#                       to find the latency that centres the pulse in the
+#                       sample window. Takes precedence over HV_SCAN.
+#   HV_SCAN True      : Fe55 self-trigger mesh HV scan. Per detector, start AT
+#                       the operating (max) point and step mesh AND drift down
+#                       together by SCAN_STEP_V per point — the potential across
+#                       the drift gap (= drift − mesh) stays constant.
+#   both False        : N_SUBRUNS identical sub-runs of SUBRUN_MIN minutes at
+#                       the beam operating point (OPERATING_HV). This is the
+#                       commissioning / physics case.
 # ---------------------------------------------------------------------------
+# Latency scan: confirm that the expert's 32 (0x0020) really centres the pulse
+# on REAL beam signals. 'latency' is written as 'Feu * Dream * 12', the
+# sample-window offset; too small and the pulse sits at the start of the 16
+# samples (rise clipped), too large and it runs off the end.
+#
+# This works with no extra DAQ plumbing: dream_daq_control builds each sub-run's
+# parameters as {**dream_daq_info, **sub_run}, so a 'latency' key in a sub-run
+# dict overrides the run-level value for that sub-run only. hv_control reads
+# only 'hvs' and 'sub_run_name' from the same dict and ignores the rest.
+#
+# Set LATENCY_SCAN=True (or DAQ_LATENCY_SCAN=1) for the scan, then put the
+# winning value in dream_daq_info['latency'] and set it back to False.
+LATENCY_SCAN = os.environ.get('DAQ_LATENCY_SCAN', '0') == '1'
+# Centred on the reference's 32, +/- 8 in steps of 4. Widen the step first if
+# none of these centres the pulse; narrow it to 2 once the region is bracketed.
+LATENCY_SCAN_VALUES = [24, 28, 32, 36, 40]
+LATENCY_SUBRUN_MIN = 2   # minutes per latency point — enough for a timing plot
+
 # False for the first external-trigger beam run: a short commissioning pass at
 # the nominal point (2 x 2 min) to confirm a non-zero trigger rate, that events
 # actually land in the FDFs, and that decoding is clean — before committing beam
-# time. The Fe55 scan below is kept for DAQ_TRIGGER=self.
+# time.
+# NB: this flag is global, NOT per trigger mode. The Fe55 scan code below is
+# intact but will not run while this is False — set it back to True (together
+# with DAQ_TRIGGER=self) to get the Fe55 mesh scan.
 HV_SCAN = False
 # Operating (= maximum safe) voltages per detector — scan starts here, goes DOWN.
 SCAN_START = {
@@ -148,18 +174,25 @@ POST_SUBRUN_PAUSE_MIN = 0   # optional pause AFTER each sub-run (minutes); 0 = n
 # ---------------------------------------------------------------------------
 OPERATING_HV = {
     'P2_IN':  {'drift': 700, 'mesh': 490},   # gap = 210 V
-    'P2_MID': {'drift': 700, 'mesh': 510},   # gap = 190 V — documented maximum
-    'P2_OUT': {'drift': 700, 'mesh': 420},   # gap = 280 V — documented maximum
+    'P2_MID': {'drift': 700, 'mesh': 450},   # gap = 250 V
+    'P2_OUT': {'drift': 700, 'mesh': 450},   # gap = 250 V  (see MAX_HV note)
     'EIC_uRWELL_front': {'drift': 600, 'resist': 420},   # uRWELL-inter
     'EIC_uRWELL_back':  {'drift': 600, 'resist': 420},   # uRWELL-strip
 }
 
 # Maximum safe voltage per detector/role. Asserted against OPERATING_HV at
 # import so a typo in a setpoint fails here rather than on the real crate.
+#
+# P2_OUT mesh was raised 420 -> 450 V on 2026-07-23 on Alexandra's instruction,
+# to run MID and OUT at the same 250 V drift gap. This SUPERSEDES the earlier
+# 420 V figure (which came from the Fe55 bench SCAN_START and is still what the
+# Fe55 scan below starts from). Flagged because it is the one setpoint here that
+# exceeds a previously documented maximum — watch P2_OUT's current draw on the
+# first ramp and back off if it draws or trips.
 MAX_HV = {
     'P2_IN':  {'drift': 700, 'mesh': 490},
     'P2_MID': {'drift': 700, 'mesh': 510},
-    'P2_OUT': {'drift': 700, 'mesh': 420},
+    'P2_OUT': {'drift': 700, 'mesh': 450},
     'EIC_uRWELL_front': {'drift': 600, 'resist': 420},
     'EIC_uRWELL_back':  {'drift': 600, 'resist': 420},
 }
@@ -370,7 +403,19 @@ class Config(RunConfigBase):
             return hvs
 
         self.sub_runs = []
-        if HV_SCAN:
+        if LATENCY_SCAN:
+            # One sub-run per latency point, all at the beam operating point.
+            # The per-sub-run 'latency' key overrides dream_daq_info['latency']
+            # in dream_daq_control's {**dream_daq_info, **sub_run} merge.
+            for lat in LATENCY_SCAN_VALUES:
+                self.sub_runs.append({
+                    'sub_run_name': f'latency_{lat:03d}',
+                    'run_time': LATENCY_SUBRUN_MIN,  # Minutes
+                    'post_pause_s': int(round(POST_SUBRUN_PAUSE_MIN * 60)),
+                    'hvs': _operating_hvs(),
+                    'latency': lat,
+                })
+        elif HV_SCAN:
             # Fe55 mesh HV scan: per-detector setpoints, starting at the
             # operating point and stepping mesh+drift down together so the
             # drift-gap potential (drift − mesh) stays constant.
@@ -621,7 +666,11 @@ if __name__ == '__main__':
     print(f'Dream template: {DREAM_CFG_TEMPLATE}')
     print(f'Gas: {config.gas}')
     print(f'Trigger: {config.trigger}')
-    if HV_SCAN:
+    if LATENCY_SCAN:
+        print(f'LATENCY SCAN: {LATENCY_SCAN_VALUES} '
+              f'(run-config default {config.dream_daq_info["latency"]}), '
+              f'{LATENCY_SUBRUN_MIN} min each')
+    elif HV_SCAN:
         last = (SCAN_POINTS - 1) * SCAN_STEP_V
         for det, start in SCAN_START.items():
             print(f'HV SCAN {det}: mesh {start["mesh"]}->{start["mesh"] - last} V, '

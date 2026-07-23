@@ -255,7 +255,12 @@ class Config(RunConfigBase):
         self.save_fdfs = True  # True to save FDF files, False to delete after decoding
         self.start_time = None
         self.process_on_fly = False  # False: processor_watcher handles processing independently
-        self.power_off_hv_at_end = True  # Power off all CAEN HV at the end of the run.
+        # False for a back-to-back beam series: powering off costs a full
+        # ~2-3 min re-ramp from 0 V at the start of the next run, and with
+        # spills every ~57 s that is real beam time. NB this leaves the
+        # detectors biased when the series ends — power off by hand (or flip
+        # this back to True for the last run of the day).
+        self.power_off_hv_at_end = False  # Power off all CAEN HV at the end of the run.
         self.resume = False  # True to resume an existing run: skip sub-runs already marked .subrun_complete.
         self.write_all_detectors_to_json = True  # Only when making run config json template. Maybe do always?
         self.gas = 'Ar/Iso 95/5'  # Gas type for run

@@ -34,7 +34,7 @@ SITE = os.environ.get('DAQ_SITE', 'local')  # 'local' or 'sps'; export DAQ_SITE=
 # here (or per-run with the DAQ_TRIGGER env var) to move between the SPS beam
 # and the Fe55 bench without editing anything else.
 #   'external' : SPS beam. External scintillator trigger via the TCM. Uses the
-#                P2TB.cfg dream template (Sys DaqRun Trig Ext) and Dat FEU roles.
+#                P2B_Beam.cfg dream template (Sys DaqRun Trig Ext) and Dat FEU roles.
 #   'self'     : Fe55 bench. Self-trigger via TCM multiplicity. Uses the
 #                P2SelfTrigger.cfg template (Sys DaqRun Trig Slf) and Trg roles.
 # The template file is picked up from <base_data_dir>/dream_config/ (both live
@@ -44,7 +44,21 @@ TRIGGER_MODE = os.environ.get('DAQ_TRIGGER', 'external')  # 'external' (beam) or
 assert TRIGGER_MODE in ('external', 'self'), \
     f"DAQ_TRIGGER must be 'external' or 'self', got {TRIGGER_MODE!r}"
 _SELF_TRIGGER = (TRIGGER_MODE == 'self')
-_DREAM_TEMPLATE_FILE = {'self': 'P2SelfTrigger.cfg', 'external': 'RackTcm.cfg'}[TRIGGER_MODE]
+# P2B_Beam.cfg is a copy of the expert's optimized beam reference config
+# EicP2Bt/P2B_TstBeam.cfg (2026-07-23 15:46) with the stale per-FEU PdFile/ZsFile
+# references cleared — each run programs fresh pedestals/thresholds. Unlike the
+# earlier self-trigger reference (P2B_SelfTcm.cfg), this one is itself an
+# external-trigger config: Sys DaqRun Trig Ext, an all-'Dat' Topo, Mult 2/4.
+# The beam-specific values it carries, which the run-config script never writes
+# and so would otherwise silently drift: latency 32 (Feu * Dream * 12 0x0020),
+# Feu_RunCtrl_RdDel 1, Feu_InterPacket_Delay 1, UdpChan_MultiPackThr 4888,
+# DrmClk Rd/WrClk_Div 6.0, Main_Trig_Ovr* watermarks 36/40/48, the Dream
+# channel-mask registers 8/9 = 0xffff, and no per-FEU Dream register-1
+# overrides (all FEUs take the wildcard 0x081f/0xd023).
+# Every trigger-mode field (Sys DaqRun Trig, the multiplicity window, the Topo
+# Dream roles) is still written per run from TRIGGER_MODE, so it serves both modes.
+# Cross-check any template change with scripts/check_cfg_vs_reference.py.
+_DREAM_TEMPLATE_FILE = {'self': 'P2SelfTrigger.cfg', 'external': 'P2B_Beam.cfg'}[TRIGGER_MODE]
 
 SITES = {
     'local': {
@@ -80,8 +94,8 @@ SITES = {
         # numbering: input 3 = Id 101, 4 = 102, 5 = 103) with Sys Name = P2Fe55
         # and the stale per-FEU PdFile/ZsFile refs cleared (each run's own
         # PedThr phase programs fresh pedestals/thresholds instead).
-        # dream_cfg_template is derived from TRIGGER_MODE below (P2TB.cfg for
-        # beam, P2SelfTrigger.cfg for Fe55) — both live in dream_config/.
+        # dream_cfg_template is derived from TRIGGER_MODE below (P2B_Beam.cfg
+        # for beam, P2SelfTrigger.cfg for Fe55) — both live in dream_config/.
     },
 }
 
@@ -104,7 +118,11 @@ DREAM_CFG_TEMPLATE = _SITE_CFG.get(
 #                  gap (= drift − mesh) stays constant: 280 V for P2_OUT,
 #                  190 V for P2_MID.
 # ---------------------------------------------------------------------------
-HV_SCAN = True
+# False for the first external-trigger beam run: a short commissioning pass at
+# the nominal point (2 x 2 min) to confirm a non-zero trigger rate, that events
+# actually land in the FDFs, and that decoding is clean — before committing beam
+# time. The Fe55 scan below is kept for DAQ_TRIGGER=self.
+HV_SCAN = False
 # Operating (= maximum safe) voltages per detector — scan starts here, goes DOWN.
 SCAN_START = {
     'P2_OUT': {'mesh': 420, 'drift': 700},   # max: 420 mesh / 700 drift
@@ -114,13 +132,42 @@ SCAN_STEP_V = 5         # V — mesh and drift both step down by this per point
 SCAN_POINTS = 12        # 12 points x 5 min = 1 h of data
 SCAN_SUBRUN_MIN = 5     # minutes per scan point
 
-N_SUBRUNS = 2       # number of identical sub-runs (HV_SCAN False)
-SUBRUN_MIN = 2      # run time per sub-run (minutes)
+N_SUBRUNS = 2       # number of identical sub-runs (HV_SCAN False) — commissioning
+SUBRUN_MIN = 2      # run time per sub-run (minutes) — short, this is a check run
 POST_SUBRUN_PAUSE_MIN = 0   # optional pause AFTER each sub-run (minutes); 0 = no pause
 
-# Nominal P2 operating point (cosmic bench long-run values, Ar/Iso 95/5):
-MESH_V = 440    # V, P2 mesh
-DRIFT_V = 600   # V, P2 drift (drift gap = drift - mesh = 160 V)
+# ---------------------------------------------------------------------------
+# Beam operating points, per detector (2026-07-23, Alexandra). Roles match the
+# DET_HV channel map below:
+#   P2 stations  -> 'drift' + 'mesh'
+#   uRWELL refs  -> 'drift' + 'resist'  (front = uRWELL-inter, back = uRWELL-strip)
+#
+# This replaces the old common P2 point (mesh 440 / drift 600, inherited from
+# the cosmic bench). That point was not just non-optimal for the beam, it was
+# unsafe on P2_OUT: 440 V mesh exceeds its 420 V maximum.
+# ---------------------------------------------------------------------------
+OPERATING_HV = {
+    'P2_IN':  {'drift': 700, 'mesh': 490},   # gap = 210 V
+    'P2_MID': {'drift': 700, 'mesh': 510},   # gap = 190 V — documented maximum
+    'P2_OUT': {'drift': 700, 'mesh': 420},   # gap = 280 V — documented maximum
+    'EIC_uRWELL_front': {'drift': 600, 'resist': 420},   # uRWELL-inter
+    'EIC_uRWELL_back':  {'drift': 600, 'resist': 420},   # uRWELL-strip
+}
+
+# Maximum safe voltage per detector/role. Asserted against OPERATING_HV at
+# import so a typo in a setpoint fails here rather than on the real crate.
+MAX_HV = {
+    'P2_IN':  {'drift': 700, 'mesh': 490},
+    'P2_MID': {'drift': 700, 'mesh': 510},
+    'P2_OUT': {'drift': 700, 'mesh': 420},
+    'EIC_uRWELL_front': {'drift': 600, 'resist': 420},
+    'EIC_uRWELL_back':  {'drift': 600, 'resist': 420},
+}
+for _det, _roles in OPERATING_HV.items():
+    for _role, _v in _roles.items():
+        assert _v <= MAX_HV[_det][_role], (
+            f'{_det} {_role} setpoint {_v} V exceeds its maximum '
+            f'{MAX_HV[_det][_role]} V')
 
 # ---------------------------------------------------------------------------
 # Telescope geometry — position along the beam (z, mm), confirmed at the beam
@@ -141,9 +188,9 @@ DET_Z_MM = {
 # references: drift on card 8 + a resistive layer on card 12 (the crate's second
 # populated slot).
 DET_HV = {
-    'P2_OUT': {'drift': (8, 0), 'mesh': (8, 1)},
+    'P2_IN':  {'drift': (8, 0), 'mesh': (8, 1)},
     'P2_MID': {'drift': (8, 2), 'mesh': (8, 3)},
-    'P2_IN':  {'drift': (8, 4), 'mesh': (8, 5)},
+    'P2_OUT': {'drift': (8, 4), 'mesh': (8, 5)},
     'EIC_uRWELL_front': {'drift': (8, 6), 'resist': (12, 0)},
     'EIC_uRWELL_back':  {'drift': (8, 7), 'resist': (12, 1)},
 }
@@ -200,6 +247,17 @@ class Config(RunConfigBase):
             'raw_daq_inner_dir': self.raw_daq_inner_dir,
             'n_samples_per_waveform': 16,  # RackTcm.cfg (expert beam config)
             'sample_period': 60,  # ns, sampling period (same as cosmic bench)
+            # Sample-window offset, written as 'Feu * Dream * 12'. 32 (0x0020)
+            # is the expert value in the optimized beam reference
+            # EicP2Bt/P2B_TstBeam.cfg (2026-07-23 15:46). Earlier values: 45
+            # (0x002D) in RackTcm.cfg, 40 (0x0028) in the self-trigger
+            # P2B_SelfTcm.cfg. Setting it here overrides the template.
+            'latency': 32,
+            # Event-count limit ('Sys DaqRun Events'). The reference caps runs at
+            # 500 events; our sub-runs are bounded by time ('Sys DaqRun Time',
+            # written per run), so leave the count unlimited or every sub-run
+            # stops after 500 events regardless of the requested duration.
+            'daq_run_events': 0,   # 0 = infinite
             'go_timeout': 5 * 60,  # Seconds to wait for 'Go' response from RunCtrl before assuming failure
             'max_run_time_addition': 60 * 5,  # Seconds to add to requested run time before killing run
             'copy_on_fly': True,  # True to copy raw data to out dir during run, False to copy after run
@@ -208,8 +266,20 @@ class Config(RunConfigBase):
             'pedestals_dir': f'{self.base_out_dir}pedestals/',  # None to ignore, else top directory for pedestal runs
             'pedestals': 'latest',  # 'latest' for most recent, otherwise specify directory name
             'zs_check_sample': 1,  # Number of samples to read out beyond threshold crossing
-            'pedestal_subtraction': False,
-            'common_noise_subtraction': False,
+            # On-FEU pedestal and common-mode subtraction ('Feu * Feu_RunCtrl_Pd'
+            # / '_CM'). Both 1 in the expert's optimized beam reference
+            # P2B_TstBeam.cfg, which runs them together with ZS: the FEU
+            # subtracts the pedestal and the per-Dream common mode before
+            # comparing against the ZS threshold, so zero suppression cuts on
+            # real signal rather than on the pedestal level. Fed by the
+            # PedThrRun phase at the start of each run.
+            # NB: these are the ONLINE (FEU) flags. The offline decoder's own
+            # common-noise subtraction is processor_config.py
+            # 'common_noise_subtraction', which stays False — the data written
+            # to disk is already subtracted, and subtracting twice would eat
+            # signal.
+            'pedestal_subtraction': True,
+            'common_noise_subtraction': True,
             'zs_type': 'tpc',
             'do_pedestal_threshold_run': True,   # Sys Action PedThrRun
             'do_trigger_threshold_run': False,   # Sys Action TrgThrRun
@@ -218,6 +288,15 @@ class Config(RunConfigBase):
             # connectors the 'Trg' Dream role (trigger-contributing AND read
             # out); external trigger gives them 'Dat'.
             'self_trigger': _SELF_TRIGGER,
+            # TCM trigger-multiplicity window ('Sys Trg MultMoreThan/LessThan').
+            # None = keep the template's values. The optimized beam reference
+            # (P2B_TstBeam.cfg) is itself an external-trigger config and sets
+            # 2/4, so we follow the expert rather than overriding. These knobs
+            # stay here because the window is the first suspect if the first
+            # beam run shows a trigger rate but no recorded events — setting
+            # them to 0/8 opens it wide for a test.
+            'trg_mult_more_than': None,
+            'trg_mult_less_than': None,
             # Auto-select the active FEUs in the .cfg from the included detectors'
             # dream_feus maps (only P2 FEUs stay active; M3/trigger FEU lines are
             # commented out — the SPS trigger comes in externally on the TCM).
@@ -276,14 +355,18 @@ class Config(RunConfigBase):
         # NB: the Fe55 code schedule below only ramps the P2 detectors' mesh+drift
         # (SCAN_START). Beam runs (3 P2 + 2 uRWELL) are configured from the GUI
         # run builder, which sets every included detector's channels.
-        def _both_det_hvs(mesh_v, drift_v):
-            """{card: {channel: V}} setting every P2 detector's mesh + drift."""
+        def _operating_hvs():
+            """{card: {channel: V}} at the beam operating point, ALL five detectors.
+
+            Walks DET_HV role by role, so the uRWELL references (drift +
+            resistive, no 'mesh') are included. The previous helper skipped any
+            detector without a 'mesh' channel, which meant both uRWELLs would
+            have sat unpowered through a beam run.
+            """
             hvs = {}
-            for det_hv in DET_HV.values():
-                if 'mesh' not in det_hv:   # uRWELLs (drift+resist) — skip in Fe55 helper
-                    continue
-                hvs.setdefault(str(det_hv['mesh'][0]), {})[str(det_hv['mesh'][1])] = mesh_v
-                hvs.setdefault(str(det_hv['drift'][0]), {})[str(det_hv['drift'][1])] = drift_v
+            for det_name, det_hv in DET_HV.items():
+                for role, (card, chan) in det_hv.items():
+                    hvs.setdefault(str(card), {})[str(chan)] = OPERATING_HV[det_name][role]
             return hvs
 
         self.sub_runs = []
@@ -311,10 +394,10 @@ class Config(RunConfigBase):
         else:
             for i in range(N_SUBRUNS):
                 self.sub_runs.append({
-                    'sub_run_name': f'mesh_{MESH_V}V_drift_{DRIFT_V}V_{i:02d}',
+                    'sub_run_name': f'beam_commissioning_{i:02d}',
                     'run_time': SUBRUN_MIN,  # Minutes
                     'post_pause_s': int(round(POST_SUBRUN_PAUSE_MIN * 60)),  # pause after this sub-run (seconds)
-                    'hvs': _both_det_hvs(MESH_V, DRIFT_V),
+                    'hvs': _operating_hvs(),
                 })
 
         self.bench_geometry = {
@@ -464,8 +547,11 @@ class Config(RunConfigBase):
             if _tm in ('external', 'self'):
                 TRIGGER_MODE = _tm
                 _SELF_TRIGGER = (_tm == 'self')
+                # Must stay in step with the module-level _DREAM_TEMPLATE_FILE
+                # map above — this branch used to pin the retired RackTcm.cfg,
+                # so any GUI-driven run silently took the drifted template.
                 _DREAM_TEMPLATE_FILE = {'self': 'P2SelfTrigger.cfg',
-                                        'external': 'RackTcm.cfg'}[_tm]
+                                        'external': 'P2B_Beam.cfg'}[_tm]
                 DREAM_CFG_TEMPLATE = _SITE_CFG.get(
                     'dream_cfg_template',
                     f'{BASE_DATA_DIR}dream_config/{_DREAM_TEMPLATE_FILE}')
@@ -542,7 +628,12 @@ if __name__ == '__main__':
                   f'drift {start["drift"]}->{start["drift"] - last} V '
                   f'({SCAN_POINTS} points x -{SCAN_STEP_V} V, gap {start["drift"] - start["mesh"]} V const)')
     else:
-        print(f'P2 mesh: {MESH_V} V   drift: {DRIFT_V} V   (gap = {DRIFT_V - MESH_V} V)')
+        print('Beam operating points:')
+        for det, roles in OPERATING_HV.items():
+            bits = '  '.join(f'{r} {v} V' for r, v in roles.items())
+            gap = (f'   gap = {roles["drift"] - roles["mesh"]} V'
+                   if 'mesh' in roles else '')
+            print(f'  {det:<18} {bits}{gap}')
     print(f'Sub-runs: {n_sub} x {config.sub_runs[0]["run_time"] if n_sub else 0} min '
           f'= {run_min} min (~{total_h:.2f} h + overhead)')
     print(f'Active FEUs: {config.get_active_feus()}')

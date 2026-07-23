@@ -106,7 +106,10 @@ def main():
                             effective_included_feus, effective_feu_connectors, effective_trigger_feu,
                             do_pedestal_threshold_run=effective_do_pedestal_threshold_run,
                             do_data_run=effective_do_data_run,
-                            self_trigger=effective_info.get('self_trigger', False))
+                            self_trigger=effective_info.get('self_trigger', False),
+                            trg_mult_more_than=effective_info.get('trg_mult_more_than', None),
+                            trg_mult_less_than=effective_info.get('trg_mult_less_than', None),
+                            daq_run_events=effective_info.get('daq_run_events', None))
                         shutil.copy(cfg_run_path, sub_run_out_raw_inner_dir)
 
                         if effective_pedestals_dir is not None:
@@ -584,7 +587,9 @@ def make_config_from_template(run_dir, cfg_template_file_path, cfg_file_run_time
                               samples_per_waveform=None, pedestal_subtraction=None,
                               common_noise_subtraction=None, zs_type=None, zs_check_sample=None,
                               latency=None, included_feus=None, feu_connectors=None, trigger_feu=None,
-                              do_pedestal_threshold_run=None, do_data_run=None, self_trigger=False):
+                              do_pedestal_threshold_run=None, do_data_run=None, self_trigger=False,
+                              trg_mult_more_than=None, trg_mult_less_than=None,
+                              daq_run_events=None):
     print('Making config file from template...')
     dest = run_dir
     cfg_file_name = os.path.basename(cfg_template_file_path)
@@ -601,7 +606,28 @@ def make_config_from_template(run_dir, cfg_template_file_path, cfg_file_run_time
         "Sys DaqRun Time": cfg_file_run_time * 60,  # Seconds
         "Sys DaqRun Mode": 'ZS' if zero_suppress_mode else 'Raw',
         "Feu * Feu_RunCtrl_ZS": _to_bit(zero_suppress_mode),
+        # Trigger source follows the run config's trigger mode rather than
+        # whatever the template happens to ship with, so a template/mode
+        # mismatch can't silently take data on the wrong trigger.
+        #   Slf = TCM multiplicity self-trigger (Fe55 bench)
+        #   Ext = external scintillator coincidence into the TCM (SPS beam)
+        "Sys DaqRun Trig": 'Slf' if self_trigger else 'Ext',
     }
+    if daq_run_events is not None:
+        # 'Sys DaqRun Events' caps a run by event count; 0 = infinite. Run length
+        # is governed by 'Sys DaqRun Time' above, so a stale count from the
+        # template would cut sub-runs short.
+        updates["Sys DaqRun Events"] = int(daq_run_events)
+    # TCM trigger-multiplicity window. Only meaningful when Dreams carry the
+    # 'Trg' role (self-trigger); with an external trigger the FEUs are pure
+    # 'Dat' and contribute no primitives. Either way, None means "keep whatever
+    # the template has" — the beam template inherits the expert's 2/4. Set them
+    # explicitly (e.g. 0/8) to open the window if a run shows a trigger rate but
+    # no recorded events.
+    if trg_mult_more_than is not None:
+        updates["Sys Trg MultMoreThan"] = int(trg_mult_more_than)
+    if trg_mult_less_than is not None:
+        updates["Sys Trg MultLessThan"] = int(trg_mult_less_than)
     if samples_per_waveform is not None:
         updates["Sys NbOfSamples"] = samples_per_waveform
     if pedestal_subtraction is not None:

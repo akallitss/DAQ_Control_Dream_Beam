@@ -135,6 +135,31 @@ DREAM_CFG_TEMPLATE = _SITE_CFG.get(
 #
 # Set LATENCY_SCAN=True (or DAQ_LATENCY_SCAN=1) for the scan, then put the
 # winning value in dream_daq_info['latency'] and set it back to False.
+# ---------------------------------------------------------------------------
+# Beam mesh-HV scan — efficiency vs gain, the deliverable that needs beam.
+# Enabled with DAQ_BEAM_HV_SCAN=1; takes precedence over LATENCY_SCAN/HV_SCAN.
+#
+# Structure: BEAM_SCAN_NOMINAL_SUBRUNS sub-runs at the operating point (the
+# primary physics dataset), then BEAM_SCAN_POINTS points stepping every P2
+# detector's mesh DOWN by BEAM_SCAN_MESH_STEP_V, drift following so each
+# detector's own drift gap stays constant (P2_IN 210 V, P2_MID/P2_OUT 250 V).
+#
+# Downward only: drift is already at its 700 V maximum at the operating point,
+# so holding the gap constant while raising mesh is not possible.
+#
+# The uRWELL references stay at their operating point throughout — they are the
+# tracking telescope, and moving them would change the reference for every
+# point of the scan.
+#
+# Sizing (2026-07-23 measured beam): 8 x 20 min ~ 2 h 49 m including the ~45 s
+# per sub-run boundary and the initial ramp. At ~1150 Hz long-run average that
+# is ~11 M events total, ~1.4 M per point.
+BEAM_HV_SCAN = os.environ.get('DAQ_BEAM_HV_SCAN', '0') == '1'
+BEAM_SCAN_NOMINAL_SUBRUNS = 2   # sub-runs at the operating point, before the scan
+BEAM_SCAN_POINTS = 6            # scan points BELOW nominal
+BEAM_SCAN_MESH_STEP_V = 10      # V per point; drift steps by the same amount
+BEAM_SCAN_SUBRUN_MIN = 20       # minutes per sub-run
+
 LATENCY_SCAN = os.environ.get('DAQ_LATENCY_SCAN', '0') == '1'
 # Centred on the reference's 32, +/- 8 in steps of 4. Widen the step first if
 # none of these centres the pulse; narrow it to 2 once the region is bracketed.
@@ -419,8 +444,43 @@ class Config(RunConfigBase):
                     hvs.setdefault(str(card), {})[str(chan)] = OPERATING_HV[det_name][role]
             return hvs
 
+        def _scan_hvs(mesh_offset):
+            """{card: {channel: V}} with every P2 mesh (and its drift) stepped
+            DOWN by mesh_offset, so each detector's drift gap is unchanged.
+            Detectors without a 'mesh' role (the uRWELL references) are held at
+            their operating point — they are the tracking telescope.
+            """
+            hvs = {}
+            for det_name, det_hv in DET_HV.items():
+                roles = OPERATING_HV[det_name]
+                shift = mesh_offset if 'mesh' in roles else 0
+                for role, (card, chan) in det_hv.items():
+                    volts = roles[role] - shift
+                    assert 0 <= volts <= MAX_HV[det_name][role], (
+                        f'{det_name} {role} scan point {volts} V out of range '
+                        f'(max {MAX_HV[det_name][role]} V)')
+                    hvs.setdefault(str(card), {})[str(chan)] = volts
+            return hvs
+
         self.sub_runs = []
-        if LATENCY_SCAN:
+        if BEAM_HV_SCAN:
+            for i in range(BEAM_SCAN_NOMINAL_SUBRUNS):
+                self.sub_runs.append({
+                    'sub_run_name': f'nominal_{i:02d}',
+                    'run_time': BEAM_SCAN_SUBRUN_MIN,
+                    'post_pause_s': int(round(POST_SUBRUN_PAUSE_MIN * 60)),
+                    'hvs': _scan_hvs(0),
+                })
+            for p in range(1, BEAM_SCAN_POINTS + 1):
+                off = p * BEAM_SCAN_MESH_STEP_V
+                self.sub_runs.append({
+                    'sub_run_name': (f'meshscan_{p:02d}_in{OPERATING_HV["P2_IN"]["mesh"] - off}'
+                                     f'_midout{OPERATING_HV["P2_MID"]["mesh"] - off}'),
+                    'run_time': BEAM_SCAN_SUBRUN_MIN,
+                    'post_pause_s': int(round(POST_SUBRUN_PAUSE_MIN * 60)),
+                    'hvs': _scan_hvs(off),
+                })
+        elif LATENCY_SCAN:
             # One sub-run per latency point, all at the beam operating point.
             # The per-sub-run 'latency' key overrides dream_daq_info['latency']
             # in dream_daq_control's {**dream_daq_info, **sub_run} merge.
@@ -683,7 +743,22 @@ if __name__ == '__main__':
     print(f'Dream template: {DREAM_CFG_TEMPLATE}')
     print(f'Gas: {config.gas}')
     print(f'Trigger: {config.trigger}')
-    if LATENCY_SCAN:
+    if BEAM_HV_SCAN:
+        inv = {}
+        for d, m in DET_HV.items():
+            for role, (cd, ch) in m.items():
+                inv[(str(cd), str(ch))] = (d, role)
+        print(f'BEAM MESH-HV SCAN: {BEAM_SCAN_NOMINAL_SUBRUNS} nominal + '
+              f'{BEAM_SCAN_POINTS} points x -{BEAM_SCAN_MESH_STEP_V} V mesh, '
+              f'{BEAM_SCAN_SUBRUN_MIN} min each')
+        for sr in config.sub_runs:
+            bits = []
+            for det in ('P2_IN', 'P2_MID', 'P2_OUT'):
+                cd, ch = DET_HV[det]['mesh']
+                cd2, ch2 = DET_HV[det]['drift']
+                bits.append(f'{det}={sr["hvs"][str(cd2)][str(ch2)]}/{sr["hvs"][str(cd)][str(ch)]}')
+            print(f'  {sr["sub_run_name"]:<28} ' + '  '.join(bits))
+    elif LATENCY_SCAN:
         print(f'LATENCY SCAN: {LATENCY_SCAN_VALUES} '
               f'(run-config default {config.dream_daq_info["latency"]}), '
               f'{LATENCY_SUBRUN_MIN} min each')

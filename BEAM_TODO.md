@@ -126,8 +126,43 @@ to Fe55. Last reviewed 2026-07-23.
       would have sat at 0 V through a beam run. `_operating_hvs()` walks
       `DET_HV` role by role — all 10 channels (card 8 ch 0-7, card 12 ch 0-1)
       are set per sub-run. Verified.
-- [ ] Take **fresh pedestals in external-trigger mode** at the beam before
-      physics runs (`do_pedestal_threshold_run`).
+- [ ] **Take the one pedestal run, before physics** (2026-07-23 decision:
+      pedestals are taken ONCE and reused, not re-taken per run):
+      ```
+      DAQ_SITE=sps DAQ_TRIGGER=external python run_config_pedestals.py
+      DAQ_SITE=sps DAQ_TRIGGER=external python daq_control.py   # with that config
+      ```
+      All 10 electrodes at **200 V** (`ped_voltage`), 30 s settle, full readout
+      (ZS off, 32 samples), `PedThrRun` on / `DataRun` off, all four FEUs.
+      Output lands in `pedestals/pedestals_<MM-DD-YY_HH-MM-SS>/pedestals/` —
+      the exact layout and naming `get_pedestals()` scans for.
+      **Take it with beam off**: `Sys PedRun Trig Cst` is an internal trigger so
+      it does not need beam, but real hits during the pedestal phase would
+      inflate the noise estimate and push the 5-sigma thresholds up.
+- [x] **Pedestal reuse now actually works** (2026-07-23). It previously did not:
+      `get_pedestals()` copied the `.prg` files into each sub-run directory as
+      `dream_pedestals_NN_ped.prg` / `dream_thresholds_NN_thr.prg`, but nothing
+      ever wrote those names into the cfg's per-FEU `PdFile`/`ZsFile` — which
+      the template ships as `None`. A run with `do_pedestal_threshold_run=False`
+      would therefore have zero-suppressed against whatever was left in FEU
+      memory: a silent data-quality failure, not an error.
+      Fixed by `set_feu_mem_file_refs()`, called from dream_daq_control after
+      `get_pedestals` and before the cfg is archived. It warns loudly for any
+      active FEU with no pedestal file, and dream_daq_control logs a warning if
+      pedestals are missing entirely while `PedThrRun` is off.
+      Also tightened the FEU-number regex in `get_pedestals` to match the FEU
+      field specifically (`_NN_ped.prg`) rather than the first 2-digit group in
+      the filename.
+      `run_config_beam.py` now has `do_pedestal_threshold_run=False`, which
+      incidentally brings `Sys Action PedThrRun` into agreement with the expert
+      reference (they reuse pedestals the same way) — the cross-check is down
+      to a single deliberate override, `Sys DaqRun Events`.
+- [ ] **Re-take pedestals after ANY setup change**: cabling, HV operating
+      point, `n_samples_per_waveform`, the Pd/CM flags, or a template sync.
+      `pedestals: 'latest'` picks the newest directory automatically, so a new
+      pedestal run is all that is needed — but nothing detects a stale one, so
+      this is a discipline item. `pedestal_run.txt` in each sub-run records
+      which pedestal set was used.
 
 ## 4. Run schedule
 - [x] `HV_SCAN` set to **False** for the first beam run (2026-07-23):

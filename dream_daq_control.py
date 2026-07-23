@@ -110,11 +110,25 @@ def main():
                             trg_mult_more_than=effective_info.get('trg_mult_more_than', None),
                             trg_mult_less_than=effective_info.get('trg_mult_less_than', None),
                             daq_run_events=effective_info.get('daq_run_events', None))
-                        shutil.copy(cfg_run_path, sub_run_out_raw_inner_dir)
-
                         if effective_pedestals_dir is not None:
                             print(f'Getting pedestal files from {effective_pedestals_dir}...')
-                            get_pedestals(effective_pedestals_dir, effective_pedestals, sub_run_dir, sub_run_out_raw_inner_dir)
+                            feu_ped_files = get_pedestals(
+                                effective_pedestals_dir, effective_pedestals,
+                                sub_run_dir, sub_run_out_raw_inner_dir)
+                            # Point the run .cfg at the copied .prg files. Skipped when
+                            # this run takes its own PedThrRun, which programs the FEU
+                            # memories directly and needs no preload.
+                            if feu_ped_files and not effective_do_pedestal_threshold_run:
+                                set_feu_mem_file_refs(cfg_run_path, feu_ped_files)
+                            elif not feu_ped_files and not effective_do_pedestal_threshold_run:
+                                logging.warning(
+                                    'No pedestals found in %s and PedThrRun is off — '
+                                    'FEUs will zero-suppress with unprogrammed thresholds',
+                                    effective_pedestals_dir)
+
+                        # Copied AFTER the pedestal refs are written so the archived
+                        # copy is the cfg RunCtrl actually used.
+                        shutil.copy(cfg_run_path, sub_run_out_raw_inner_dir)
 
                         # run_command = f'RunCtrl -c {cfg_run_path} -f {sub_run_name}'
                         # if batch_mode:
@@ -672,6 +686,50 @@ def make_config_from_template(run_dir, cfg_template_file_path, cfg_file_run_time
     return cfg_file_path
 
 
+def set_feu_mem_file_refs(filepath, feu_files, output_path=None):
+    """Point each ``Feu <N> Feu_RunCtrl_PdFile/ZsFile`` at a reused .prg file.
+
+    ``feu_files`` maps FEU number -> {'ped': name, 'thr': name}, as returned by
+    ``get_pedestals``. The names are bare filenames: RunCtrl runs with its cwd
+    set to the sub-run directory, which is exactly where get_pedestals puts the
+    copies.
+
+    Without this the copied .prg files are inert. The template ships every
+    PdFile/ZsFile as ``None`` (the template sync blanks the expert's stale
+    refs), so a run that skipped PedThrRun and relied on reused pedestals would
+    zero-suppress against whatever happened to be left in FEU memory — a silent
+    data-quality failure rather than an error.
+    """
+    output_path = output_path or filepath
+    pat = re.compile(r'^(\s*)(Feu\s+(\d+)\s+Feu_RunCtrl_(Pd|Zs)File)\s+\S.*$')
+    written, missing = 0, []
+    with open(filepath, 'r') as f:
+        lines = f.readlines()
+    new_lines = []
+    for line in lines:
+        raw = line.rstrip('\n')
+        m = pat.match(raw)
+        if m and not raw.lstrip().startswith('#'):
+            feu, kind = int(m.group(3)), ('ped' if m.group(4) == 'Pd' else 'thr')
+            name = (feu_files.get(feu) or {}).get(kind)
+            if name:
+                new_lines.append(f'{m.group(1)}{m.group(2)}         {name}\n')
+                written += 1
+                continue
+            missing.append(f'FEU {feu} {kind}')
+        new_lines.append(line)
+    with open(output_path, 'w') as f:
+        f.writelines(new_lines)
+    if written:
+        print(f'Pointed {written} FEU Pd/Zs reference(s) at reused pedestal files')
+    if missing:
+        # Loud: an active FEU with no pedestal file will zero-suppress against
+        # whatever is already in its memory.
+        print(f'WARNING: no reused pedestal/threshold file for {", ".join(missing)} '
+              f'— these FEUs keep PdFile/ZsFile None')
+    return written
+
+
 def clear_feu_mem_file_refs(filepath, output_path=None):
     """Set every active ``Feu <N|*> Feu_RunCtrl_PdFile/ZsFile`` line to ``None``
     so RunCtrl does not try to load pedestal/threshold memories from files."""
@@ -860,7 +918,9 @@ def get_pedestals(pedestals_dir, pedestals, run_dir, out_dir=None):
     :param pedestals: 'latest' or specific pedestal run directory name
     :param run_dir: Directory of current run to copy pedestal files to
     :param out_dir: If a copy of pedestal files should also be placed in out_dir
-    :return:
+    :return: {feu_number: {'ped': filename, 'thr': filename}} for the files copied
+             into run_dir, so the caller can point the run .cfg at them via
+             set_feu_mem_file_refs(). None if no pedestals could be found.
     """
     # sub_run_name = 'pedestals_noise'  # Standard name for pedestal runs
     sub_run_name = 'pedestals'  # Standard name for pedestal runs
@@ -907,16 +967,22 @@ def get_pedestals(pedestals_dir, pedestals, run_dir, out_dir=None):
     # For each .prg file found in pedestals_prg_dir (eg TbSPS25_pedestals_noise_pedthr_251022_14H39_000_04_ped.prg)
     # get the type (_thr.prg or _ped.prg) and feu number (_03_) and copy to run_dir with name reconstructed with these
     # two parameters (eg dream_pedestals_thresholds_03_thr.prg)
+    feu_files = {}
     for file in os.listdir(pedestals_prg_dir):
         print(f'Checking pedestal file: {file}')
         if file.endswith('.prg'):
-            feu_num_search = re.search(r'_(\d{2})_', file)
+            # Match the FEU field specifically (…_<seq>_<feu>_ped.prg) rather than
+            # the first 2-digit group anywhere in the name, so a date/time field
+            # can never be mistaken for a FEU number.
+            feu_num_search = re.search(r'_(\d{2})_(?:ped|thr)\.prg$', file)
             if feu_num_search:
                 feu_num = feu_num_search.group(1)
                 if '_ped.prg' in file:
                     dest_file_name = f'dream_pedestals_{feu_num}_ped.prg'
+                    feu_files.setdefault(int(feu_num), {})['ped'] = dest_file_name
                 elif '_thr.prg' in file:
                     dest_file_name = f'dream_thresholds_{feu_num}_thr.prg'
+                    feu_files.setdefault(int(feu_num), {})['thr'] = dest_file_name
                 else:
                     print(f'Unknown pedestal file type for {file}, skipping.')
                     continue
@@ -943,6 +1009,10 @@ def get_pedestals(pedestals_dir, pedestals, run_dir, out_dir=None):
                     shutil.copy(f'{pedestals_prg_dir}{file}', f'{out_dir}{file}')
             else:
                 print(f'Could not find FEU number in pedestal fdf file name {file}, skipping.')
+
+    if not feu_files:
+        print(f'WARNING: no .prg pedestal/threshold files found in {pedestals_prg_dir}')
+    return feu_files
 
 
 if __name__ == '__main__':

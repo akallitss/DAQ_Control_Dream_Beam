@@ -314,7 +314,15 @@ class Config(RunConfigBase):
             'pedestal_subtraction': True,
             'common_noise_subtraction': True,
             'zs_type': 'tpc',
-            'do_pedestal_threshold_run': True,   # Sys Action PedThrRun
+            # Pedestals are taken ONCE, by a dedicated run_config_pedestals.py run
+            # (all electrodes at 200 V), and reused for every beam run after it —
+            # so beam runs do NOT re-run PedThrRun. dream_daq_control copies the
+            # latest pedestals/<pedestals_*>/pedestals/*.prg into each sub-run dir
+            # and points the cfg's per-FEU PdFile/ZsFile at them.
+            # Re-take pedestals (python run_config_pedestals.py, then
+            # daq_control.py with it) after ANY setup change: cabling, HV
+            # operating point, n_samples, Pd/CM flags, or a template sync.
+            'do_pedestal_threshold_run': False,  # Sys Action PedThrRun
             'do_trigger_threshold_run': False,   # Sys Action TrgThrRun
             'do_data_run': True,                 # Sys Action DataRun
             # Trigger mode (from TRIGGER_MODE): self-trigger gives used

@@ -74,9 +74,10 @@ class Config(RunConfigBase):
 
         # Pedestals are per-FEU electronics baselines — take them on ALL
         # connected FEUs, not only those cabled to the included detectors.
-        # Cfg Feu 5 (Id 103, 192.168.10.115) is connected but currently has no
-        # detector assigned; merge it in with all connectors active so its
-        # Dreams run as Dat. Detector-derived FEUs keep their connector maps.
+        # As of the 5-detector beam telescope (2026-07-22) every cfg FEU (1, 3,
+        # 4, 5) already carries a detector, so this merge is a no-op; it is kept
+        # so a FEU that is connected but unassigned still gets pedestals.
+        # setdefault means detector-derived FEUs keep their own connector maps.
         extra_pedestal_feus = {5: list(range(1, 9))}
         feu_conns = {int(k): list(v)
                      for k, v in (self.dream_daq_info.get('feu_connectors') or {}).items()}

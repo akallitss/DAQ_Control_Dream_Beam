@@ -241,7 +241,11 @@ class Config(RunConfigBase):
         # read) so the GUI override at the end of this method can retarget the
         # trigger mode. Untouched unless a GUI config is loaded there.
         global TRIGGER_MODE, _SELF_TRIGGER, _DREAM_TEMPLATE_FILE, DREAM_CFG_TEMPLATE
-        self.run_name = 'run_1'
+        # DAQ_RUN_NAME overrides the default (same knob run_config_pedestals.py
+        # uses). Needed because 'run_1' is already taken on EOS by the Fe55 scan
+        # under this campaign path — reusing it would merge beam sub-runs into
+        # that directory. Every run_name-derived path below follows this.
+        self.run_name = os.environ.get('DAQ_RUN_NAME') or 'run_1'
         self.base_out_dir = BASE_DATA_DIR
         self.data_out_dir = f'{self.base_out_dir}runs/'
         self.run_out_dir = f'{self.data_out_dir}{self.run_name}/'

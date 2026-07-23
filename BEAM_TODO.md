@@ -205,8 +205,41 @@ below the 0.5x seen on the raw-mode Fe55 run — as expected with ZS on.
 (0.72-0.95) and P2_MID (0.46). No trips, no excursion — the 450 V point looks
 healthy, though it remains above the previously documented 420 V maximum.
 
+## 4a-bis. LATENCY SCAN — DONE (2026-07-23, `latency_scan_1`)
+
+Five 2-min sub-runs at 24/28/32/36/40, ~1630 Hz each (~196 k events/FEU;
+latency_028 caught a weaker spill, 130 k @ 1088 Hz). Each sub-run's cfg was
+verified on the live machine to carry its own `Feu * Dream * 12`
+(0x0018/0x001C/0x0020/0x0024/0x0028) — the per-sub-run override works in
+production.
+
+**Result: latency 32 is confirmed optimal.** Amplitude-weighted mean sample
+position in the 16-sample window (centre = 7.5):
+
+| latency | uRWELL f+b | P2_IN | P2_MID | P2_OUT |
+|---|---|---|---|---|
+| 24 | 6.14 | 3.50 | 3.23 (peak 0) | 2.95 (peak 0) |
+| 28 | 5.48 | 6.85 | 4.59 | 4.66 |
+| **32** | **7.09** | **7.32** | **7.75 (peak 7)** | **7.91 (peak 7)** |
+| 36 | 9.04 | 8.32 | 10.62 | 10.57 |
+| 40 | 9.77 | 8.64 | 11.83 (peak 15) | 12.98 (peak 15) |
+
+Monotonic and consistent across all four FEUs: at 24 the pulse is clipped at
+the start of the window, at 40 it runs off the end, and 32 lands it on the
+centre. Roughly 4 latency units ~ 3.5 samples. No change needed —
+`dream_daq_info['latency'] = 32` stays, and `LATENCY_SCAN` goes back to False.
+
+**P2_IN worth a look** (not conclusive from this data): at latency 32 it shows
+7.69 hits/event against 17.3 (P2_MID) and 20.3 (P2_OUT), and a flatter time
+profile (28.6 % of hits in the central 4 samples vs 31.5 / 31.1 %, uniform
+= 25 %). Its mean amplitude (382) sits between the others, its HV was stable
+and it drew the *highest* mesh current of the three (0.72-0.95 uA), so it is
+alive electrically — but it is contributing noticeably less beam signal.
+Note it also runs a different operating point (mesh 490 / gap 210 V) from
+MID and OUT (450 / 250 V). Check gas, cabling and the operating point before
+concluding anything.
+
 Still to do on the next beam run:
-- [ ] The latency scan (`DAQ_LATENCY_SCAN=1`) — confirm 32 centres the pulse.
 - [ ] Look at the decoded data: occupancy per plane, pulse position in the
       16-sample window, and that all five detectors show hits (this run
       confirmed data flow and integrity, not yet detector response).
@@ -214,9 +247,25 @@ Still to do on the next beam run:
       setting it False for a back-to-back series.
 
 Minor, cosmetic: processor_watcher prints `Decoder finished, events: 0` even
-when the decode is fine (verified 191 458 entries in every ROOT file). The
-count it parses is not the real one — worth fixing so a genuine zero-event
-decode is not masked.
+when the decode is fine (verified 191 458 entries in every ROOT file, and
+`Events analysed:` prints the correct count). The count it parses is not the
+real one — worth fixing so a genuine zero-event decode is not masked.
+
+- [ ] **BUG: the decoder can hang, and it blocks the whole pipeline.**
+      2026-07-23: `decode` on
+      `beam_commissioning_01/.../datrun_260723_17H10_000_03.fdf` (FEU 03) spun
+      at 99.9 % CPU for 25+ min with `rchar` frozen at 45 275 215 of a
+      64 991 958-byte file and its output ROOT frozen at 2.7 MB — an infinite
+      loop, not slow progress. processor_watcher is sequential, so nothing
+      behind it decoded: `latency_scan_1` never entered the pipeline.
+      The same FEU 03 decodes fine in other sub-runs (all five latency points
+      decoded cleanly), so it is that specific file, not the FEU.
+      Workaround used: decode by hand into a scratch dir
+      (`build/decoder/decode <fdf> <root>`), which is what the latency numbers
+      above come from. The raw fdf is intact, so nothing is lost.
+      Needs: kill the stuck process to unblock the pipeline, then re-decode
+      that file and, if it hangs again, keep it as a reproducer for the
+      decoder bug.
 
 ## 4b. Disk budget (pre-run estimate — see measured values above)
 Calibrated from the Fe55 run of 2026-07-18 (RunCtrl log: 29 305 events/FEU in

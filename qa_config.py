@@ -41,6 +41,8 @@ CONFIG = {
 
     # Watcher behavior
     'poll_interval':   10,  # seconds between scans
+    'combined_settle_s': 20,  # a combined_hits file must be untouched this long before QA reads it
+                              # (mid-write it opens with NO keys -> QA silently skips every detector)
     'stale_run_days':   1,  # runs with no new combined_hits for this many days are skipped
     'memory_kill_pct': 80,  # kill the QA process if system RAM usage exceeds this % (retried next poll)
 

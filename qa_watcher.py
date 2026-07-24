@@ -93,6 +93,9 @@ def run_watcher(config: dict, reset_signal_path: Path = None):
     exclude_runs = set(config['exclude_runs']) if config.get('exclude_runs') else set()
 
     poll_interval   = config.get('poll_interval',   10)
+    # A combined_hits file is only considered ready once it has been untouched for
+    # this long — see _stable_combined_files(). Must stay above poll_interval.
+    settle_s        = config.get('combined_settle_s', 20)
     stale_run_days  = config.get('stale_run_days',    4)
     memory_kill_pct = config.get('memory_kill_pct',  80)
     cpu_nice        = config.get('cpu_nice',         19)
@@ -192,7 +195,7 @@ def run_watcher(config: dict, reset_signal_path: Path = None):
                     if not combined_dir.exists():
                         continue
 
-                    stable = _stable_combined_files(combined_dir)
+                    stable = _stable_combined_files(combined_dir, settle_s)
                     if not stable:
                         continue
 
@@ -440,14 +443,27 @@ def _run_qa_monitored(qa_python, qa_script: Path, subrun_dir: Path,
     return proc.returncode == 0
 
 
-def _stable_combined_files(combined_dir: Path) -> list:
-    """Return sorted filenames of feu-combined ROOT files with size > 0."""
+def _stable_combined_files(combined_dir: Path, settle_s: float = 20.0) -> list:
+    """Return sorted filenames of feu-combined ROOT files that are finished being written.
+
+    Size > 0 is NOT enough: the combine step writes the file incrementally and the
+    'hits' TTree only lands in it at close. A file caught mid-write opens fine but
+    has no keys at all, so QA reports 'no hits found, skipping' for every detector
+    and produces empty plots — silently, since nothing errors out. Observed
+    2026-07-23 on beam_nominal_meshscan_1/nominal_00: QA launched 2 s before the
+    combine closed the file and skipped all five detectors.
+
+    So require the file to have been untouched for settle_s (> poll_interval)
+    before considering it ready.
+    """
     result = []
+    now = time.time()
     for f in combined_dir.iterdir():
         if f.suffix != '.root' or '_datrun_' not in f.name or 'feu-combined' not in f.name:
             continue
         try:
-            if f.stat().st_size > 0:
+            st = f.stat()
+            if st.st_size > 0 and (now - st.st_mtime) >= settle_s:
                 result.append(f.name)
         except OSError:
             continue

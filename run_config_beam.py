@@ -109,8 +109,11 @@ DREAM_CFG_TEMPLATE = _SITE_CFG.get(
     'dream_cfg_template', f'{BASE_DATA_DIR}dream_config/{_DREAM_TEMPLATE_FILE}')
 
 # ---------------------------------------------------------------------------
-# Run schedule — the three modes are checked in this order:
+# Run schedule — the modes are checked in this order:
 #
+#   BEAM_DRIFT_SCAN True : beam drift scan (mesh fixed, drift stepped up). See the
+#                       block below. Takes precedence over every mode here.
+#   BEAM_HV_SCAN True  : beam mesh scan (drift gap fixed, mesh+drift stepped down).
 #   LATENCY_SCAN True : beam latency scan. One sub-run per value in
 #                       LATENCY_SCAN_VALUES, all at the beam operating point,
 #                       to find the latency that centres the pulse in the
@@ -160,6 +163,29 @@ BEAM_SCAN_POINTS = 6            # scan points BELOW nominal
 BEAM_SCAN_MESH_STEP_V = 10      # V per point; drift steps by the same amount
 BEAM_SCAN_SUBRUN_MIN = 20       # minutes per sub-run
 
+# ---------------------------------------------------------------------------
+# Beam DRIFT scan — efficiency vs drift field. The orthogonal partner to the
+# mesh scan above: the mesh scan held the drift gap constant to isolate GAIN;
+# this holds the mesh FIXED and moves ONLY the drift electrode, so the one thing
+# changing is the drift field (electron transparency / primary collection).
+# Enabled with DAQ_BEAM_DRIFT_SCAN=1; takes precedence over every scan below.
+#
+# Full curve from ZERO drift field to the plateau: the first point sets drift =
+# mesh (gap 0, no drift field, ~no efficiency), then steps UP to 900 V so the
+# efficiency-vs-drift curve rises out of zero and flattens onto its plateau. On
+# 2026-07-24 (Alexandra) the P2 drift ceiling was opened to 900 V (MAX_HV) for
+# this. Mesh stays at last run's operating value (P2_MID/P2_OUT 450). Only
+# BEAM_DRIFT_SCAN_DETS move; the two uRWELL references stay fixed at 600/420 as
+# the tracking telescope, and P2_IN stays parked off.
+# Default 10 points 450..900 in 50 V steps, 10 min each (~100 min DAQ) — sized to
+# the 2.5 h beam window of 2026-07-24.
+BEAM_DRIFT_SCAN = os.environ.get('DAQ_BEAM_DRIFT_SCAN', '0') == '1'
+BEAM_DRIFT_SCAN_DETS = ('P2_MID', 'P2_OUT')  # detectors whose drift is scanned
+BEAM_DRIFT_SCAN_START_V = 450   # V — first point: drift = mesh, i.e. ZERO drift field
+BEAM_DRIFT_SCAN_STEP_V  = 50    # V per point, stepping UP
+BEAM_DRIFT_SCAN_POINTS  = 10    # 450, 500, ... 900 inclusive
+BEAM_DRIFT_SCAN_SUBRUN_MIN = 10  # minutes per point
+
 LATENCY_SCAN = os.environ.get('DAQ_LATENCY_SCAN', '0') == '1'
 # Centred on the reference's 32, +/- 8 in steps of 4. Widen the step first if
 # none of these centres the pulse; narrow it to 2 once the region is bracketed.
@@ -198,9 +224,13 @@ POST_SUBRUN_PAUSE_MIN = 0   # optional pause AFTER each sub-run (minutes); 0 = n
 # unsafe on P2_OUT: 440 V mesh exceeds its 420 V maximum.
 # ---------------------------------------------------------------------------
 OPERATING_HV = {
-    'P2_IN':  {'drift': 700, 'mesh': 490},   # gap = 210 V
-    'P2_MID': {'drift': 700, 'mesh': 450},   # gap = 250 V
-    'P2_OUT': {'drift': 700, 'mesh': 450},   # gap = 250 V  (see MAX_HV note)
+    'P2_IN':  {'drift': 0, 'mesh': 0},       # PARKED OFF 2026-07-24 — under
+                                             # investigation, dropped from readout.
+                                             # Actively commanded to 0 each sub-run
+                                             # (kept in DET_HV) so the channels do
+                                             # not float at the last scan setpoint.
+    'P2_MID': {'drift': 700, 'mesh': 450},   # gap = 250 V; drift scanned up to 900
+    'P2_OUT': {'drift': 700, 'mesh': 450},   # gap = 250 V; drift scanned up to 900
     'EIC_uRWELL_front': {'drift': 600, 'resist': 420},   # uRWELL-inter
     'EIC_uRWELL_back':  {'drift': 600, 'resist': 420},   # uRWELL-strip
 }
@@ -214,10 +244,16 @@ OPERATING_HV = {
 # Fe55 scan below starts from). Flagged because it is the one setpoint here that
 # exceeds a previously documented maximum — watch P2_OUT's current draw on the
 # first ramp and back off if it draws or trips.
+# P2_MID/P2_OUT drift ceiling raised 700 -> 900 V on 2026-07-24 (Alexandra) for
+# the beam drift scan (DAQ_BEAM_DRIFT_SCAN), which steps drift UP from the 700 V
+# operating point to look for the transparency optimum above it. Mesh maxima are
+# unchanged. Watch drift current on every up-step — 900 V drift over a 450 V gap
+# is a higher drift field than these detectors have run at; back a channel off if
+# it draws or trips (the monitor flags >2 uA / any trip).
 MAX_HV = {
     'P2_IN':  {'drift': 700, 'mesh': 490},
-    'P2_MID': {'drift': 700, 'mesh': 510},
-    'P2_OUT': {'drift': 700, 'mesh': 450},
+    'P2_MID': {'drift': 900, 'mesh': 510},
+    'P2_OUT': {'drift': 900, 'mesh': 450},
     'EIC_uRWELL_front': {'drift': 600, 'resist': 420},
     'EIC_uRWELL_back':  {'drift': 600, 'resist': 420},
 }
@@ -285,7 +321,10 @@ class Config(RunConfigBase):
         # spills every ~57 s that is real beam time. NB this leaves the
         # detectors biased when the series ends — power off by hand (or flip
         # this back to True for the last run of the day).
-        self.power_off_hv_at_end = False  # Power off all CAEN HV at the end of the run.
+        self.power_off_hv_at_end = True  # Power off all CAEN HV at the end of the run.
+                                         # True for the 2026-07-24 drift scan: the
+                                         # 2.5 h beam window ends after it, so ramp
+                                         # everything down rather than leave it biased.
         self.resume = False  # True to resume an existing run: skip sub-runs already marked .subrun_complete.
         self.write_all_detectors_to_json = True  # Only when making run config json template. Maybe do always?
         self.gas = 'Ar/Iso 95/5'  # Gas type for run
@@ -444,6 +483,24 @@ class Config(RunConfigBase):
                     hvs.setdefault(str(card), {})[str(chan)] = OPERATING_HV[det_name][role]
             return hvs
 
+        def _drift_scan_hvs(drift_v):
+            """{card: {channel: V}} with the BEAM_DRIFT_SCAN_DETS drift set to
+            drift_v and their mesh held at the operating point. Every other
+            detector stays at OPERATING_HV — the uRWELL references (fixed
+            tracking telescope) and the parked-off P2_IN (0 V).
+            """
+            hvs = {}
+            for det_name, det_hv in DET_HV.items():
+                roles = OPERATING_HV[det_name]
+                for role, (card, chan) in det_hv.items():
+                    scanned = det_name in BEAM_DRIFT_SCAN_DETS and role == 'drift'
+                    volts = drift_v if scanned else roles[role]
+                    assert 0 <= volts <= MAX_HV[det_name][role], (
+                        f'{det_name} {role} drift-scan point {volts} V out of '
+                        f'range (max {MAX_HV[det_name][role]} V)')
+                    hvs.setdefault(str(card), {})[str(chan)] = volts
+            return hvs
+
         def _scan_hvs(mesh_offset):
             """{card: {channel: V}} with every P2 mesh (and its drift) stepped
             DOWN by mesh_offset, so each detector's drift gap is unchanged.
@@ -463,7 +520,17 @@ class Config(RunConfigBase):
             return hvs
 
         self.sub_runs = []
-        if BEAM_HV_SCAN:
+        if BEAM_DRIFT_SCAN:
+            # Drift scan: mesh fixed, drift stepped UP over BEAM_DRIFT_SCAN_DETS.
+            for p in range(BEAM_DRIFT_SCAN_POINTS):
+                drift_v = BEAM_DRIFT_SCAN_START_V + p * BEAM_DRIFT_SCAN_STEP_V
+                self.sub_runs.append({
+                    'sub_run_name': f'drift_{drift_v:03d}',
+                    'run_time': BEAM_DRIFT_SCAN_SUBRUN_MIN,
+                    'post_pause_s': int(round(POST_SUBRUN_PAUSE_MIN * 60)),
+                    'hvs': _drift_scan_hvs(drift_v),
+                })
+        elif BEAM_HV_SCAN:
             for i in range(BEAM_SCAN_NOMINAL_SUBRUNS):
                 self.sub_runs.append({
                     'sub_run_name': f'nominal_{i:02d}',
@@ -526,7 +593,14 @@ class Config(RunConfigBase):
             'board_thickness': 5,  # mm  Thickness of PCB for test boards  Guess!
         }
 
-        self.included_detectors = ['EIC_uRWELL_front', 'P2_IN', 'P2_MID',
+        # P2_IN dropped from the readout 2026-07-24 (Alexandra) — under
+        # investigation. It stays CABLED (its detector dict below is unchanged,
+        # cfg Feu 3), so re-including it later needs only this list; its HV is
+        # parked off in OPERATING_HV. Excluding it here drops FEU 3 from the .cfg
+        # (get_active_feu_connectors → included_feus), cutting the readout to
+        # FEUs 1/4/5. The external TCM trigger has no trigger_feu, so losing
+        # FEU 3 does not touch the trigger/sync chain.
+        self.included_detectors = ['EIC_uRWELL_front', 'P2_MID',
                                    'P2_OUT', 'EIC_uRWELL_back']
 
         # Cabling confirmed at the beam 2026-07-22 (Alexandra). Cfg FEU numbers

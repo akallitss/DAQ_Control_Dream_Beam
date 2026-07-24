@@ -166,6 +166,7 @@ def run_watcher(config: dict):
                 is_stale = _run_is_stale(run_dir, raw_inner, stale_run_days)
 
                 sample_period = _read_sample_period(run_dir)
+                zs_baseline = _read_zs_baseline(run_dir)
 
                 for subrun_dir in sorted(run_dir.iterdir()):
                     if not subrun_dir.is_dir():
@@ -211,6 +212,7 @@ def run_watcher(config: dict):
                                 do_decode, do_analyze, do_combine,
                                 save_fdfs, save_decoded, n_threads,
                                 sample_period, common_noise_subtraction,
+                                zs_baseline,
                                 decode_stall_timeout_s, decode_hard_timeout_s
                             )
                             del prev_sizes[key]
@@ -250,6 +252,7 @@ def _process_file_num(fnum, all_fdf_paths, subrun_dir, ped_dir,
                        do_decode, do_analyze, do_combine,
                        save_fdfs, save_decoded, n_threads,
                        sample_period=None, common_noise_subtraction=True,
+                       zs_baseline=False,
                        decode_stall_timeout_s=DECODE_STALL_TIMEOUT_S,
                        decode_hard_timeout_s=DECODE_HARD_TIMEOUT_S):
 
@@ -294,7 +297,7 @@ def _process_file_num(fnum, all_fdf_paths, subrun_dir, ped_dir,
                 if hits_path.exists():
                     continue
                 tasks.append(pool.submit(
-                    _analyze_file, str(root_path), ped_dir, str(hits_path), analyze_exe, sample_period, common_noise_subtraction
+                    _analyze_file, str(root_path), ped_dir, str(hits_path), analyze_exe, sample_period, common_noise_subtraction, zs_baseline
                 ))
             for t in as_completed(tasks):
                 t.result()
@@ -460,6 +463,23 @@ def _make_combined_name(a_hits_path: str) -> str:
 # Run-config helpers
 # ---------------------------------------------------------------------------
 
+def _read_zs_baseline(run_dir: Path):
+    """True when the run took zero-suppressed data with on-FEU pedestal
+    subtraction (dream_daq_info in run_config.json): the decoded waveforms are
+    then re-centred at 256 and analyze_waveforms needs --zs-baseline 1."""
+    cfg_path = run_dir / 'run_config.json'
+    if not cfg_path.exists():
+        return False
+    try:
+        with open(cfg_path) as f:
+            cfg = json.load(f)
+        daq = cfg.get('dream_daq_info', {})
+        return bool(daq.get('zero_suppress')) and bool(daq.get('pedestal_subtraction'))
+    except Exception as e:
+        print(f"[watcher] Could not read zs_baseline from {cfg_path}: {e}")
+        return False
+
+
 def _read_sample_period(run_dir: Path):
     """Return dream_daq_info.sample_period from run_config.json, or None if absent."""
     cfg_path = run_dir / 'run_config.json'
@@ -541,7 +561,8 @@ def _decode_file(fdf_path: str, root_path: str, decode_exe: str,
 
 
 def _analyze_file(root_path: str, ped_dir: str, hits_out_path: str, analyze_exe: str,
-                  sample_period=None, common_noise_subtraction: bool = True):
+                  sample_period=None, common_noise_subtraction: bool = True,
+                  zs_baseline: bool = False):
     m = re.search(r'_(\d{3})_(\d{2})', os.path.basename(root_path))
     if not m:
         print(f"[analyze] Cannot extract FEU number from {root_path}, skipping")
@@ -570,6 +591,11 @@ def _analyze_file(root_path: str, ped_dir: str, hits_out_path: str, analyze_exe:
     if sample_period is not None:
         cmd += ['--tps', str(sample_period)]
     cmd += ['--cns', '1' if common_noise_subtraction else '0']
+    if zs_baseline:
+        # ZS + on-FEU pedestal subtraction: waveforms are re-centred at 256, so
+        # the analyzer must subtract 256, not the pedestal file's raw means
+        # (which are the pre-subtraction baselines, off by up to ~130 ADC).
+        cmd += ['--zs-baseline', '1']
     subprocess.run(cmd)
 
 

@@ -88,7 +88,7 @@ SITES = {
         'simulate': False,
         # Built 2026-07-18 against ROOT 6.32.02 in ~/opt/root_v6.32.02 (binaries
         # carry an rpath to it — no thisroot.sh needed to run them).
-        'reconstruction_build': '/local/home/banco/mm_dream_reconstruction/build/',
+        'reconstruction_build': '/local/home/banco/mm_strip_reconstruction/cmake-build-release/',
         # Dream .cfg template: P2SelfTrigger.cfg is a copy of the FEU software's
         # EicP2Bt/SelfTcm.cfg (source of truth for FEU Ids/IPs and TCM input
         # numbering: input 3 = Id 101, 4 = 102, 5 = 103) with Sys Name = P2Fe55

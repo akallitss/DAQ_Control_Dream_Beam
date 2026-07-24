@@ -21,6 +21,7 @@ Site switching: set SITE below.
 """
 
 import os
+import sys
 
 from run_config_base import RunConfigBase
 
@@ -532,7 +533,13 @@ class Config(RunConfigBase):
             self.hv_info['username'] = 'admin'
             self.hv_info['password'] = 'admin'
             if not SIMULATE:
-                print(f'WARNING: {creds_path} not found — using default admin/admin HV credentials.')
+                # stderr, NOT stdout: get_config_py.py runs this file and parses
+                # its stdout as JSON for the GUI's Start Run confirmation, so a
+                # warning on stdout breaks the button with "Expecting value:
+                # line 1 column 1 (char 0)". Only fires when SIMULATE is False,
+                # i.e. exactly on the real sps site where the GUI is used.
+                print(f'WARNING: {creds_path} not found — using default admin/admin HV credentials.',
+                      file=sys.stderr)
 
         # ----- Run schedule (built from module constants above) -----
         # NB: the Fe55 code schedule below only ramps the P2 detectors' mesh+drift

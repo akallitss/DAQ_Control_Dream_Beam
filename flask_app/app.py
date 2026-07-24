@@ -1444,6 +1444,21 @@ def space_usage():
     return jsonify(space_manager.disk_usage())
 
 
+@app.route("/space/local")
+def space_local():
+    """Local-only listing of the runs on the data disk (sizes + local guard
+    flags). No EOS access, so it is instant and works with Kerberos/network
+    down — it shows WHAT is on the disk; only /space/scan can say what is
+    provably backed up and therefore safe to delete."""
+    disk = request.args.get("disk", "data")
+    if disk not in space_manager.DISKS:
+        return jsonify({"success": False, "message": f"unknown disk {disk}"}), 400
+    try:
+        return jsonify(space_manager.local_scan(disk))
+    except Exception as e:
+        return jsonify({"success": False, "message": str(e)}), 500
+
+
 @app.route("/space/scan")
 def space_scan():
     disk = request.args.get("disk", "data")

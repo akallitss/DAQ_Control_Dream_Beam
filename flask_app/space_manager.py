@@ -304,6 +304,46 @@ def list_runs(disk: str) -> list:
     return sorted(runs, key=_run_num)
 
 
+def local_scan(disk: str) -> dict:
+    """What is on the disk right now — local stat() only, no EOS access, so it
+    is instant and works even when Kerberos/network is down. Reports each run's
+    size plus the local guard flags (active / newest / incomplete subruns).
+    Only the full EOS scan() can mark a run safe to delete."""
+    if disk not in DISKS:
+        raise ValueError(f'unknown disk {disk!r}')
+    act = active_run()
+    newest = newest_run()
+    root = _runs_root()
+    results = []
+    for run in list_runs(disk):
+        rroot = root / run
+        local = _local_size_map(rroot)
+        inc = incomplete_subruns(rroot)
+        r = {'run': run, 'disk': disk,
+             'size': sum(local.values()), 'files': len(local),
+             'active': run == act, 'newest': run == newest,
+             'incomplete': len(inc)}
+        r['size_h'] = human(r['size'])
+        if r['active']:
+            r['note'] = 'currently acquiring — never deletable while active'
+        elif r['newest']:
+            r['note'] = 'newest run on disk — never deletable'
+        elif inc:
+            r['note'] = f'{len(inc)} subrun(s) missing .subrun_complete'
+        else:
+            r['note'] = 'not yet verified against EOS'
+        results.append(r)
+    total = sum(r['size'] for r in results)
+    return {
+        'disk': disk, 'label': DISKS[disk]['label'],
+        'runs': results, 'n_runs': len(results),
+        'total_bytes': total, 'total_h': human(total),
+        'active_run': act,
+        'usage': disk_usage().get(disk, {}),
+        'scanned_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+    }
+
+
 def scan(disk: str, runs=None) -> dict:
     """Verify every run (or a subset); return per-run verdicts."""
     if disk not in DISKS:

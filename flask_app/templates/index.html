@@ -2044,6 +2044,10 @@ beamRenderPlot();   // initial draw (Overview is the default-active tab at load)
   }
 
   // ================= FREE SPACE (delete) =================
+  // The table is filled in two stages: renderLocalRows() shows what is on the
+  // disk instantly (local stat only, no EOS — loaded automatically when the
+  // tab opens), then "Run safety check" replaces it with the EOS-verified
+  // view where safe runs become selectable.
   function updateDelBtn() {
     const b = $("ds-delete");
     b.disabled = delSel.size === 0;
@@ -2069,6 +2073,45 @@ beamRenderPlot();   // initial draw (Overview is the default-active tab at load)
     }
     delTable = wireTable(tb, "ds-cb", delSel, updateDelBtn);
     updateDelBtn();
+  }
+  function renderLocalRows(d) {
+    const tb = $("ds-tbody"); tb.innerHTML = ""; delSel.clear(); delTable = null;
+    if (!d.runs.length) { $("ds-empty").classList.remove("d-none"); updateDelBtn(); return; }
+    $("ds-empty").classList.add("d-none");
+    for (const r of d.runs) {
+      const tr = document.createElement("tr");
+      const badge = r.active ? `<span class="shift-flag-na">● acquiring</span>`
+        : (r.newest || r.incomplete) ? `<span class="shift-flag-bad">✗ not safe</span>`
+        : `<span class="text-muted">? unverified</span>`;
+      tr.innerHTML = `
+        <td><input type="checkbox" class="form-check-input" disabled title="run the safety check first"></td>
+        <td><b>${r.run}</b>${r.active ? ' <span class="text-muted">(active)</span>' : ''}${r.newest && !r.active ? ' <span class="text-muted">(newest)</span>' : ''}</td>
+        <td class="text-end" style="font-family:var(--mono);">${r.size_h}</td>
+        <td style="font-size:0.82rem; color:var(--muted);">${r.note}</td>
+        <td>${badge}</td>`;
+      tb.appendChild(tr);
+    }
+    updateDelBtn();
+  }
+  async function loadLocal() {
+    if (mode !== "free") return;
+    try {
+      const r = await fetch(`/space/local?disk=${encodeURIComponent(diskSel.value)}`);
+      const d = await r.json();
+      if (!r.ok || d.success === false) throw new Error(d.message || "listing failed");
+      if (lastScan) return;   // an EOS-verified scan is on screen — don't downgrade it
+      $("ds-results-panel").style.display = "";
+      renderLocalRows(d);
+      $("ds-summary").innerHTML =
+        `${d.n_runs} runs · <b>${d.total_h}</b> on disk` +
+        (d.active_run ? ` · active: ${d.active_run}` : "") +
+        ` — run the safety check to see what is safe to delete`;
+      $("ds-scan-meta").textContent =
+        `Disk contents as of ${d.scanned_at} (not yet verified against EOS)`;
+    } catch (e) {
+      $("ds-scan-meta").innerHTML =
+        `<span style="color:var(--bad);">Could not list disk: ${e.message}</span>`;
+    }
   }
   async function runCheck() {
     const disk = diskSel.value;
@@ -2302,6 +2345,7 @@ beamRenderPlot();   // initial draw (Overview is the default-active tab at load)
     $("ds-restore-controls").style.display = m === "restore" ? "flex" : "none";
     $("ds-results-panel").style.display = "none";
     $("ds-restore-panel").style.display = "none";
+    if (m === "free") { lastScan = null; loadLocal(); }
   }
 
   // ---- wire ----
@@ -2309,7 +2353,7 @@ beamRenderPlot();   // initial draw (Overview is the default-active tab at load)
   $("ds-delete").addEventListener("click", openDelete);
   $("ds-select-safe").addEventListener("click", () => { if (delTable) delTable.all(); });
   $("ds-clear-sel").addEventListener("click", () => { if (delTable) delTable.clear(); });
-  diskSel.addEventListener("change", () => { $("ds-results-panel").style.display = "none"; lastScan = null; });
+  diskSel.addEventListener("change", () => { $("ds-results-panel").style.display = "none"; lastScan = null; loadLocal(); });
 
   $("ds-restore-check").addEventListener("click", runRestoreCheck);
   $("ds-restore-go").addEventListener("click", openRestore);
@@ -2320,7 +2364,7 @@ beamRenderPlot();   // initial draw (Overview is the default-active tab at load)
   $("ds-mode-restore").addEventListener("click", () => setMode("restore"));
 
   const dsTab = document.querySelector('a[href="#disk-space"]');
-  if (dsTab) dsTab.addEventListener("shown.bs.tab", loadUsage);
+  if (dsTab) dsTab.addEventListener("shown.bs.tab", () => { loadUsage(); loadLocal(); });
   setMode("free");
 })();
 </script>

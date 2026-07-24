@@ -80,6 +80,13 @@ def main():
                         res = server.receive()
         except Exception as e:
             print(f'Error: {e}\nRestarting hv control server...')
+            # Stop a running monitor thread before restarting: the CAEN session
+            # (the `with get_hv_controller` block) has just closed, so the monitor
+            # would otherwise keep polling a dead handle and spew errors.
+            if monitor_thread is not None:
+                monitor_stop_event.set()
+                monitor_thread.join(timeout=15)
+                monitor_thread = None
     print('donzo')
 
 
@@ -99,9 +106,19 @@ def set_hvs(hv_info, hvs, caen_hv, caen_lock):
                     if not power:
                         caen_hv.set_ch_pw(int(slot), int(channel), 1)
 
+    # Bound the ramp wait. This loop used to have NO exit condition: a channel that
+    # can never reach its setpoint — clamped by the crate's SVMax (as on 2026-07-24,
+    # V0Set silently clamped 800->750), a dead channel, or a channel left powered
+    # off — would spin here forever, blocking the whole run with no error. Now we
+    # give up after ramp_timeout_s and raise, so daq_control/the operator see a loud
+    # failure instead of a silent hang. HV is left where it is (not powered off);
+    # the caller decides. Timeout is generous (real 0->900 V ramps take ~1-2 min).
+    ramp_timeout_s = hv_info.get('ramp_timeout_s', 300)
+    ramp_start = time.monotonic()
     all_ramped = False
     while not all_ramped:
         all_ramped = True
+        stuck = []
         print('\nChecking HV ramp...')
         with caen_lock:
             for slot, channel_v0s in hvs.items():
@@ -111,10 +128,18 @@ def set_hvs(hv_info, hvs, caen_hv, caen_lock):
                     vmon = caen_hv.get_ch_vmon(int(slot), int(channel))
                     if abs(vmon - v0) > 1.5:  # Make sure within 1.5 V of set value
                         all_ramped = False
+                        stuck.append((slot, channel, vmon, v0))
                         print(f' Slot {slot}, Channel {channel} not ramped: {vmon:.2f} V --> {v0} V')
-        if not all_ramped:
-            print('Waiting for HV to ramp...')
-            time.sleep(10)  # lock released during sleep — monitor runs freely
+        if all_ramped:
+            break
+        if time.monotonic() - ramp_start > ramp_timeout_s:
+            detail = ', '.join(f'{s}:{c} {vm:.1f}->{v0}V' for s, c, vm, v0 in stuck)
+            raise RuntimeError(
+                f'HV ramp timed out after {ramp_timeout_s}s; channels still off '
+                f'setpoint: {detail}. Check the crate SVMax/limit on those channels '
+                f'or a dead/off channel.')
+        print('Waiting for HV to ramp...')
+        time.sleep(10)  # lock released during sleep — monitor runs freely
     print('HV Ramped')
 
 

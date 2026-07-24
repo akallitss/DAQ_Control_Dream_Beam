@@ -48,12 +48,33 @@ import re
 import time
 import datetime
 import tempfile
+import signal
 import subprocess
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from common_functions import create_dir_if_not_exist
+
+
+# Decode watchdog defaults (see _decode_file). The decoder can infinite-loop on
+# certain files; because the watcher is sequential, one such file blocks the whole
+# pipeline. These bound a single decode. Overridable via the processor config.
+DECODE_STALL_TIMEOUT_S = 180   # kill a decode whose output ROOT has not grown this long
+DECODE_HARD_TIMEOUT_S  = 1800  # absolute cap on a single decode
+
+
+class DecodeTimeout(Exception):
+    """A decode was killed for hanging (output frozen, or hard cap exceeded).
+
+    The raw FDF is preserved — renamed to <name>.hang — so the file_num can still
+    finish from the surviving FEUs and the file stays a reproducer for the bug.
+    """
+    def __init__(self, fdf_path, hang_path, reason):
+        super().__init__(f'decode of {os.path.basename(fdf_path)} killed: {reason}')
+        self.fdf_path = fdf_path
+        self.hang_path = hang_path
+        self.reason = reason
 
 
 def main():
@@ -89,6 +110,9 @@ def run_watcher(config: dict):
 
     save_fdfs    = config.get('save_fdfs',    True)
     save_decoded = config.get('save_decoded', True)
+
+    decode_stall_timeout_s = config.get('decode_stall_timeout_s', DECODE_STALL_TIMEOUT_S)
+    decode_hard_timeout_s  = config.get('decode_hard_timeout_s',  DECODE_HARD_TIMEOUT_S)
 
     pedestal_loc      = config.get('pedestal_loc', 'same')
     pedestal_base_dir = config.get('pedestal_dir', '') or ''
@@ -186,7 +210,8 @@ def run_watcher(config: dict):
                                 decode_exe, analyze_exe, combine_exe,
                                 do_decode, do_analyze, do_combine,
                                 save_fdfs, save_decoded, n_threads,
-                                sample_period, common_noise_subtraction
+                                sample_period, common_noise_subtraction,
+                                decode_stall_timeout_s, decode_hard_timeout_s
                             )
                             del prev_sizes[key]
                             found_new = True
@@ -224,7 +249,9 @@ def _process_file_num(fnum, all_fdf_paths, subrun_dir, ped_dir,
                        decode_exe, analyze_exe, combine_exe,
                        do_decode, do_analyze, do_combine,
                        save_fdfs, save_decoded, n_threads,
-                       sample_period=None, common_noise_subtraction=True):
+                       sample_period=None, common_noise_subtraction=True,
+                       decode_stall_timeout_s=DECODE_STALL_TIMEOUT_S,
+                       decode_hard_timeout_s=DECODE_HARD_TIMEOUT_S):
 
     decoded_dir  = subrun_dir / decoded_inner
     hits_dir     = subrun_dir / hits_inner
@@ -239,9 +266,17 @@ def _process_file_num(fnum, all_fdf_paths, subrun_dir, ped_dir,
                 root_path = decoded_dir / fdf.name.replace('.fdf', '.root')
                 if root_path.exists():
                     continue
-                tasks.append(pool.submit(_decode_file, str(fdf), str(root_path), decode_exe))
+                tasks.append(pool.submit(_decode_file, str(fdf), str(root_path), decode_exe,
+                                         decode_stall_timeout_s, decode_hard_timeout_s))
             for t in as_completed(tasks):
-                t.result()
+                try:
+                    t.result()
+                except DecodeTimeout as e:
+                    # One FEU's file hung and was quarantined — do NOT fail the whole
+                    # file_num. The surviving FEUs still analyze/combine below, so the
+                    # subrun completes (minus that plane) and the pipeline keeps moving.
+                    print(f"[decode]  quarantined {os.path.basename(e.hang_path)} "
+                          f"({e.reason}); pipeline continues without this FEU")
 
     # Step 2: Analyze waveforms
     if do_analyze:
@@ -299,7 +334,11 @@ def _decode_pedestals(ped_dir: str, decode_exe: str):
         if root_out.exists():
             continue
         print(f"[watcher] Decoding pedestal: {fdf.name}")
-        _decode_file(str(fdf), str(root_out), decode_exe)
+        try:
+            _decode_file(str(fdf), str(root_out), decode_exe)
+        except DecodeTimeout as e:
+            print(f"[watcher] pedestal decode hung, quarantined "
+                  f"{os.path.basename(e.hang_path)} ({e.reason}); skipping it")
 
 
 # ---------------------------------------------------------------------------
@@ -439,9 +478,66 @@ def _read_sample_period(run_dir: Path):
 # Worker functions (invoke C++ executables)
 # ---------------------------------------------------------------------------
 
-def _decode_file(fdf_path: str, root_path: str, decode_exe: str):
+def _decode_file(fdf_path: str, root_path: str, decode_exe: str,
+                 stall_timeout_s: float = DECODE_STALL_TIMEOUT_S,
+                 hard_timeout_s: float = DECODE_HARD_TIMEOUT_S):
+    """Decode one FDF, with a watchdog.
+
+    The decoder in mm_dream_reconstruction can infinite-loop on certain files —
+    100% CPU with the input read position and the output ROOT both frozen (seen
+    2026-07-23 and -24 on different files/FEUs). The watcher is sequential, so one
+    such file pegs a core AND blocks the entire pipeline behind it. Guard it: poll
+    the output ROOT while the decoder runs; if it stops growing for stall_timeout_s
+    (the hang signature) or the decode exceeds hard_timeout_s, kill the decoder,
+    drop the partial ROOT, and quarantine the FDF to <name>.hang. That lets this
+    file_num still complete from the surviving FEUs and later files keep decoding.
+    The raw FDF is renamed, never deleted — it remains a reproducer for the bug.
+    """
     print(f"[decode]  {os.path.basename(fdf_path)}")
-    subprocess.run([decode_exe, fdf_path, root_path])
+    # own session/process group so the watchdog can reap the decoder and any
+    # children it might spawn in one shot.
+    proc = subprocess.Popen([decode_exe, fdf_path, root_path], start_new_session=True)
+    start = time.time()
+    last_size, last_progress = -1, start
+    while True:
+        try:
+            proc.wait(timeout=5)
+            return  # decode finished on its own (success or its own error)
+        except subprocess.TimeoutExpired:
+            pass
+        now = time.time()
+        try:
+            size = os.path.getsize(root_path)
+        except OSError:
+            size = 0
+        if size > last_size:
+            last_size, last_progress = size, now
+        stalled  = now - last_progress > stall_timeout_s
+        over_cap = now - start > hard_timeout_s
+        if not (stalled or over_cap):
+            continue
+        reason = (f'output frozen {int(now - last_progress)}s at {size} B'
+                  if stalled else f'exceeded {int(hard_timeout_s)}s hard cap')
+        print(f"[decode]  HANG: {os.path.basename(fdf_path)} — {reason}; killing decoder")
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            proc.kill()  # fallback if the group is already gone
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            pass
+        try:
+            if os.path.exists(root_path):
+                os.remove(root_path)
+        except OSError:
+            pass
+        hang_path = fdf_path + '.hang'
+        try:
+            os.replace(fdf_path, hang_path)
+        except OSError:
+            hang_path = fdf_path
+        raise DecodeTimeout(fdf_path, hang_path, reason)
 
 
 def _analyze_file(root_path: str, ped_dir: str, hits_out_path: str, analyze_exe: str,

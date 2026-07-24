@@ -59,7 +59,13 @@ BACKUP_CONFIG_PATH = os.path.join(REPO_DIR, 'config', 'backup_config.json')
 CURRENT_RUN_STATE  = os.path.join(REPO_DIR, 'config', 'current_run_state.json')
 DELETE_LOG         = os.path.join(REPO_DIR, 'logs', 'space_manager.log')
 
-RUN_NAME_RE = re.compile(r'^run_\d+$')
+# Run dirs are named by the GUI run builder as <base>_<index> (run_19,
+# drift_scan_1, beam_nominal_meshscan_1, p2in_check_1, ...). The charset is
+# deliberately tight — letters/digits/underscore/hyphen only, no dots or
+# slashes — because this regex is also a delete-path guard. backup_watcher
+# itself syncs every dir under runs/ without a name filter, so anything the
+# builder creates is backed up and must be visible here.
+RUN_NAME_RE = re.compile(r'^[A-Za-z][A-Za-z0-9_-]*_\d+$')
 
 # Single managed disk. The label/root/fs are resolved from backup_config.json
 # at call time (see _cfg) so a regenerated config is picked up without a
@@ -144,9 +150,11 @@ def _remote_size_map(eos_dir: str):
 
 # --- Helpers ---------------------------------------------------------------
 
-def _run_num(name: str) -> int:
-    m = re.search(r'(\d+)', name)
-    return int(m.group(1)) if m else -1
+def _run_key(name: str):
+    """Sort key grouping runs by family, then index: drift_scan_1, drift_scan_2,
+    meshscan_fine_1, ... (a bare first-number sort would interleave families)."""
+    m = re.match(r'^(.*)_(\d+)$', name)
+    return (m.group(1), int(m.group(2))) if m else (name, -1)
 
 
 def active_run() -> str:
@@ -301,7 +309,7 @@ def list_runs(disk: str) -> list:
     if not root.is_dir():
         return []
     runs = [p.name for p in root.iterdir() if p.is_dir() and RUN_NAME_RE.match(p.name)]
-    return sorted(runs, key=_run_num)
+    return sorted(runs, key=_run_key)
 
 
 def local_scan(disk: str) -> dict:
@@ -482,7 +490,7 @@ def list_eos_runs():
         name = line.rstrip('/').rsplit('/', 1)[-1]
         if RUN_NAME_RE.match(name):
             out.append(name)
-    return sorted(out, key=_run_num)
+    return sorted(out, key=_run_key)
 
 
 def scan_restore() -> dict:

@@ -161,7 +161,7 @@ BEAM_HV_SCAN = os.environ.get('DAQ_BEAM_HV_SCAN', '0') == '1'
 # Detectors whose mesh AND drift step together (gap held constant → isolates gain).
 # P2_IN is deliberately excluded — it is parked off (0 V), has no gain to scan, and
 # stepping its 0 V setpoint down would go negative and fail the range assert.
-BEAM_SCAN_DETS = ('P2_MID', 'P2_OUT')
+BEAM_SCAN_DETS = ('P2_IN', 'P2_MID', 'P2_OUT')  # all three step DOWN (safe: P2_IN 400->lower stays < its 490 mesh / 700 drift max)
 # Env-overridable so a finer or continuation gain scan needs no code edit, e.g.
 # DAQ_MESH_STEP_V=5 DAQ_MESH_POINTS=12 DAQ_MESH_SUBRUN_MIN=10 DAQ_MESH_NOMINAL=1
 # gives a 5 V scan 450..390 (13 mesh points incl. the nominal) at 10 min each.
@@ -187,7 +187,10 @@ BEAM_SCAN_SUBRUN_MIN = int(os.environ.get('DAQ_MESH_SUBRUN_MIN', '20'))     # mi
 # Default 10 points 450..900 in 50 V steps, 10 min each (~100 min DAQ) — sized to
 # the 2.5 h beam window of 2026-07-24.
 BEAM_DRIFT_SCAN = os.environ.get('DAQ_BEAM_DRIFT_SCAN', '0') == '1'
-BEAM_DRIFT_SCAN_DETS = ('P2_MID', 'P2_OUT')  # detectors whose drift is scanned
+BEAM_DRIFT_SCAN_DETS = ('P2_MID', 'P2_OUT')  # detectors whose drift is scanned. P2_IN is
+                                             # EXCLUDED: its drift max is 700 V, below the
+                                             # scan's 900 V top, so it is held at its
+                                             # operating point (a fixed plane) during the scan.
 # The scan window is env-overridable so a continuation run (e.g. the top points
 # after a beam stop) needs no code edit — the committed default stays the full
 # 450..900. e.g. DAQ_DRIFT_START_V=800 DAQ_DRIFT_POINTS=3 does 800/850/900.
@@ -234,11 +237,10 @@ POST_SUBRUN_PAUSE_MIN = 0   # optional pause AFTER each sub-run (minutes); 0 = n
 # unsafe on P2_OUT: 440 V mesh exceeds its 420 V maximum.
 # ---------------------------------------------------------------------------
 OPERATING_HV = {
-    'P2_IN':  {'drift': 0, 'mesh': 0},       # PARKED OFF 2026-07-24 — under
-                                             # investigation, dropped from readout.
-                                             # Actively commanded to 0 each sub-run
-                                             # (kept in DET_HV) so the channels do
-                                             # not float at the last scan setpoint.
+    'P2_IN':  {'drift': 600, 'mesh': 400},   # gap = 200 V. REINSTATED 2026-07-24
+                                             # after repair + regas — confirmed alive
+                                             # in p2in_check_1 (Landau signal peaking
+                                             # at sample 7, ~0.01 uA, no trip).
     'P2_MID': {'drift': 700, 'mesh': 450},   # gap = 250 V; drift scanned up to 900
     'P2_OUT': {'drift': 700, 'mesh': 450},   # gap = 250 V; drift scanned up to 900
     'EIC_uRWELL_front': {'drift': 600, 'resist': 420},   # uRWELL-inter
@@ -346,10 +348,9 @@ class Config(RunConfigBase):
         # spills every ~57 s that is real beam time. NB this leaves the
         # detectors biased when the series ends — power off by hand (or flip
         # this back to True for the last run of the day).
-        self.power_off_hv_at_end = True  # Power off all CAEN HV at the end of the run.
-                                         # True for the 2026-07-24 drift scan: the
-                                         # 2.5 h beam window ends after it, so ramp
-                                         # everything down rather than leave it biased.
+        # Power off all CAEN HV at the end of the run. Env-overridable (DAQ_POWER_OFF=0)
+        # so chained runs keep HV up between them and only the last one powers off.
+        self.power_off_hv_at_end = os.environ.get('DAQ_POWER_OFF', '1') == '1'
         self.resume = False  # True to resume an existing run: skip sub-runs already marked .subrun_complete.
         self.write_all_detectors_to_json = True  # Only when making run config json template. Maybe do always?
         self.gas = 'Ar/Iso 95/5'  # Gas type for run
@@ -639,7 +640,8 @@ class Config(RunConfigBase):
             # Alive-check: read out P2_IN + the two uRWELL references only.
             self.included_detectors = ['EIC_uRWELL_front', 'P2_IN', 'EIC_uRWELL_back']
         else:
-            self.included_detectors = ['EIC_uRWELL_front', 'P2_MID',
+            # Full 5-plane telescope — P2_IN reinstated 2026-07-24.
+            self.included_detectors = ['EIC_uRWELL_front', 'P2_IN', 'P2_MID',
                                        'P2_OUT', 'EIC_uRWELL_back']
 
         # Cabling confirmed at the beam 2026-07-22 (Alexandra). Cfg FEU numbers

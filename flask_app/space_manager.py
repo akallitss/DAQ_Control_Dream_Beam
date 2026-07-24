@@ -157,13 +157,50 @@ def _run_key(name: str):
     return (m.group(1), int(m.group(2))) if m else (name, -1)
 
 
+# Line markers in daq_control's tmux pane (same source flask_app/daq_status.py
+# scrapes). Scanned newest-first: the first marker hit decides. Anything not
+# matching either list (e.g. periodic [status] lines) keeps scanning.
+_DAQ_IDLE_FLAGS = ('Run complete', 'donzo', 'Daq control session started')
+_DAQ_BUSY_FLAGS = ('Dream DAQ starting', 'Prepping DAQs', 'Ramping HVs for',
+                   'Starting DAQ Control', 'Finished with sub run', '[pause]',
+                   'Stopping DAQ process', 'Dream DAQ taking pedestals')
+
+
+def daq_mid_run() -> bool:
+    """True while daq_control's tmux pane shows a run in progress. Defaults to
+    False when tmux/pane is missing or no marker is visible — a live run is
+    still protected then by the newest-run and incomplete-subrun guards, and
+    defaulting True would recreate the stale-'acquiring' problem this solves."""
+    try:
+        out = subprocess.run(
+            ['tmux', 'capture-pane', '-pS', '-50', '-t', 'daq_control:0.0'],
+            capture_output=True, text=True,
+        )
+    except OSError:
+        return False
+    if out.returncode != 0:
+        return False
+    for line in reversed(out.stdout.splitlines()):
+        if any(f in line for f in _DAQ_IDLE_FLAGS):
+            return False
+        if any(f in line for f in _DAQ_BUSY_FLAGS):
+            return True
+    return False
+
+
 def active_run() -> str:
-    """Name of the run currently being acquired (never deletable), or ''."""
+    """Name of the run currently being acquired (never deletable), or ''.
+
+    config/current_run_state.json is a LAST-SEEN-run tracker — the GUI writes
+    it for its event counter and never clears it when a run ends — so the name
+    only counts as active while daq_control actually shows a run in progress.
+    """
     try:
         with open(CURRENT_RUN_STATE) as f:
-            return json.load(f).get('run_name', '') or ''
+            name = json.load(f).get('run_name', '') or ''
     except Exception:
         return ''
+    return name if (name and daq_mid_run()) else ''
 
 
 def newest_run() -> str:

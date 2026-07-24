@@ -158,10 +158,17 @@ DREAM_CFG_TEMPLATE = _SITE_CFG.get(
 # per sub-run boundary and the initial ramp. At ~1150 Hz long-run average that
 # is ~11 M events total, ~1.4 M per point.
 BEAM_HV_SCAN = os.environ.get('DAQ_BEAM_HV_SCAN', '0') == '1'
-BEAM_SCAN_NOMINAL_SUBRUNS = 2   # sub-runs at the operating point, before the scan
-BEAM_SCAN_POINTS = 6            # scan points BELOW nominal
-BEAM_SCAN_MESH_STEP_V = 10      # V per point; drift steps by the same amount
-BEAM_SCAN_SUBRUN_MIN = 20       # minutes per sub-run
+# Detectors whose mesh AND drift step together (gap held constant → isolates gain).
+# P2_IN is deliberately excluded — it is parked off (0 V), has no gain to scan, and
+# stepping its 0 V setpoint down would go negative and fail the range assert.
+BEAM_SCAN_DETS = ('P2_MID', 'P2_OUT')
+# Env-overridable so a finer or continuation gain scan needs no code edit, e.g.
+# DAQ_MESH_STEP_V=5 DAQ_MESH_POINTS=12 DAQ_MESH_SUBRUN_MIN=10 DAQ_MESH_NOMINAL=1
+# gives a 5 V scan 450..390 (13 mesh points incl. the nominal) at 10 min each.
+BEAM_SCAN_NOMINAL_SUBRUNS = int(os.environ.get('DAQ_MESH_NOMINAL', '2'))    # sub-runs at the operating point, before the scan
+BEAM_SCAN_POINTS = int(os.environ.get('DAQ_MESH_POINTS', '6'))              # scan points BELOW nominal
+BEAM_SCAN_MESH_STEP_V = int(os.environ.get('DAQ_MESH_STEP_V', '10'))        # V per point; drift steps by the same amount
+BEAM_SCAN_SUBRUN_MIN = int(os.environ.get('DAQ_MESH_SUBRUN_MIN', '20'))     # minutes per sub-run
 
 # ---------------------------------------------------------------------------
 # Beam DRIFT scan — efficiency vs drift field. The orthogonal partner to the
@@ -505,15 +512,17 @@ class Config(RunConfigBase):
             return hvs
 
         def _scan_hvs(mesh_offset):
-            """{card: {channel: V}} with every P2 mesh (and its drift) stepped
-            DOWN by mesh_offset, so each detector's drift gap is unchanged.
-            Detectors without a 'mesh' role (the uRWELL references) are held at
-            their operating point — they are the tracking telescope.
+            """{card: {channel: V}} with every BEAM_SCAN_DETS detector's mesh AND
+            drift stepped DOWN by mesh_offset, so each detector's drift gap is
+            unchanged (isolates gain). Every other detector is held at its
+            operating point: the uRWELL references (fixed tracking telescope) and
+            the parked-off P2_IN (0 V — NOT stepped; it has no gain to scan and
+            stepping its 0 V setpoint would go negative).
             """
             hvs = {}
             for det_name, det_hv in DET_HV.items():
                 roles = OPERATING_HV[det_name]
-                shift = mesh_offset if 'mesh' in roles else 0
+                shift = mesh_offset if det_name in BEAM_SCAN_DETS else 0
                 for role, (card, chan) in det_hv.items():
                     volts = roles[role] - shift
                     assert 0 <= volts <= MAX_HV[det_name][role], (
@@ -544,8 +553,7 @@ class Config(RunConfigBase):
             for p in range(1, BEAM_SCAN_POINTS + 1):
                 off = p * BEAM_SCAN_MESH_STEP_V
                 self.sub_runs.append({
-                    'sub_run_name': (f'meshscan_{p:02d}_in{OPERATING_HV["P2_IN"]["mesh"] - off}'
-                                     f'_midout{OPERATING_HV["P2_MID"]["mesh"] - off}'),
+                    'sub_run_name': f'meshscan_{p:02d}_midout{OPERATING_HV["P2_MID"]["mesh"] - off}',
                     'run_time': BEAM_SCAN_SUBRUN_MIN,
                     'post_pause_s': int(round(POST_SUBRUN_PAUSE_MIN * 60)),
                     'hvs': _scan_hvs(off),

@@ -181,10 +181,13 @@ BEAM_SCAN_SUBRUN_MIN = 20       # minutes per sub-run
 # the 2.5 h beam window of 2026-07-24.
 BEAM_DRIFT_SCAN = os.environ.get('DAQ_BEAM_DRIFT_SCAN', '0') == '1'
 BEAM_DRIFT_SCAN_DETS = ('P2_MID', 'P2_OUT')  # detectors whose drift is scanned
-BEAM_DRIFT_SCAN_START_V = 450   # V — first point: drift = mesh, i.e. ZERO drift field
-BEAM_DRIFT_SCAN_STEP_V  = 50    # V per point, stepping UP
-BEAM_DRIFT_SCAN_POINTS  = 10    # 450, 500, ... 900 inclusive
-BEAM_DRIFT_SCAN_SUBRUN_MIN = 10  # minutes per point
+# The scan window is env-overridable so a continuation run (e.g. the top points
+# after a beam stop) needs no code edit — the committed default stays the full
+# 450..900. e.g. DAQ_DRIFT_START_V=800 DAQ_DRIFT_POINTS=3 does 800/850/900.
+BEAM_DRIFT_SCAN_START_V = int(os.environ.get('DAQ_DRIFT_START_V', '450'))  # first point: drift = mesh, ZERO drift field
+BEAM_DRIFT_SCAN_STEP_V  = int(os.environ.get('DAQ_DRIFT_STEP_V',  '50'))   # V per point, stepping UP
+BEAM_DRIFT_SCAN_POINTS  = int(os.environ.get('DAQ_DRIFT_POINTS',  '10'))   # default 450, 500, ... 900 inclusive
+BEAM_DRIFT_SCAN_SUBRUN_MIN = int(os.environ.get('DAQ_DRIFT_SUBRUN_MIN', '10'))  # minutes per point
 
 LATENCY_SCAN = os.environ.get('DAQ_LATENCY_SCAN', '0') == '1'
 # Centred on the reference's 32, +/- 8 in steps of 4. Widen the step first if

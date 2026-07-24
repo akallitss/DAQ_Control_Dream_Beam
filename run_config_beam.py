@@ -267,6 +267,21 @@ MAX_HV = {
     'EIC_uRWELL_front': {'drift': 600, 'resist': 420},
     'EIC_uRWELL_back':  {'drift': 600, 'resist': 420},
 }
+# ---------------------------------------------------------------------------
+# P2_IN alive-check (DAQ_P2IN_CHECK=1): a short fixed-HV run to confirm the
+# re-inserted / repaired P2_IN responds to beam. Reads out ONLY P2_IN + the two
+# uRWELL references (P2_MID/P2_OUT excluded from readout AND powered off);
+# P2_IN at DAQ_P2IN_MESH / DAQ_P2IN_DRIFT (default 400 mesh / 600 drift, gap 200).
+# Takes precedence over every scan. One sub-run of DAQ_P2IN_MIN minutes.
+# ---------------------------------------------------------------------------
+P2IN_CHECK = os.environ.get('DAQ_P2IN_CHECK', '0') == '1'
+P2IN_CHECK_MIN = int(os.environ.get('DAQ_P2IN_MIN', '12'))   # minutes of data
+if P2IN_CHECK:
+    OPERATING_HV['P2_IN']  = {'drift': int(os.environ.get('DAQ_P2IN_DRIFT', '600')),
+                              'mesh':  int(os.environ.get('DAQ_P2IN_MESH',  '400'))}
+    OPERATING_HV['P2_MID'] = {'drift': 0, 'mesh': 0}   # not read out in the P2_IN check
+    OPERATING_HV['P2_OUT'] = {'drift': 0, 'mesh': 0}
+
 for _det, _roles in OPERATING_HV.items():
     for _role, _v in _roles.items():
         assert _v <= MAX_HV[_det][_role], (
@@ -532,7 +547,16 @@ class Config(RunConfigBase):
             return hvs
 
         self.sub_runs = []
-        if BEAM_DRIFT_SCAN:
+        if P2IN_CHECK:
+            # Single fixed-HV run: P2_IN at its check point, uRWELLs at operating,
+            # P2_MID/P2_OUT off (see OPERATING_HV override above).
+            self.sub_runs.append({
+                'sub_run_name': f'p2in_check_m{OPERATING_HV["P2_IN"]["mesh"]}_d{OPERATING_HV["P2_IN"]["drift"]}',
+                'run_time': P2IN_CHECK_MIN,
+                'post_pause_s': 0,
+                'hvs': _operating_hvs(),
+            })
+        elif BEAM_DRIFT_SCAN:
             # Drift scan: mesh fixed, drift stepped UP over BEAM_DRIFT_SCAN_DETS.
             for p in range(BEAM_DRIFT_SCAN_POINTS):
                 drift_v = BEAM_DRIFT_SCAN_START_V + p * BEAM_DRIFT_SCAN_STEP_V
@@ -611,8 +635,12 @@ class Config(RunConfigBase):
         # (get_active_feu_connectors → included_feus), cutting the readout to
         # FEUs 1/4/5. The external TCM trigger has no trigger_feu, so losing
         # FEU 3 does not touch the trigger/sync chain.
-        self.included_detectors = ['EIC_uRWELL_front', 'P2_MID',
-                                   'P2_OUT', 'EIC_uRWELL_back']
+        if P2IN_CHECK:
+            # Alive-check: read out P2_IN + the two uRWELL references only.
+            self.included_detectors = ['EIC_uRWELL_front', 'P2_IN', 'EIC_uRWELL_back']
+        else:
+            self.included_detectors = ['EIC_uRWELL_front', 'P2_MID',
+                                       'P2_OUT', 'EIC_uRWELL_back']
 
         # Cabling confirmed at the beam 2026-07-22 (Alexandra). Cfg FEU numbers
         # are TCM input ports; Id/IP from RackTcm.cfg:

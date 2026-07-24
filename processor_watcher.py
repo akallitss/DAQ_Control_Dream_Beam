@@ -47,8 +47,8 @@ import json
 import re
 import time
 import datetime
-import tempfile
 import signal
+import tempfile
 import subprocess
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -58,8 +58,10 @@ from common_functions import create_dir_if_not_exist
 
 
 # Decode watchdog defaults (see _decode_file). The decoder can infinite-loop on
-# certain files; because the watcher is sequential, one such file blocks the whole
-# pipeline. These bound a single decode. Overridable via the processor config.
+# certain FDFs (100% CPU, input position and output ROOT both frozen — seen on
+# the banco P2 setup 2026-07-23/24, same DreamDecoder source); one such file
+# would block the pipeline forever. These bound a single decode. Overridable via
+# the processor config. Ported from the banco fork's watcher, 2026-07-24.
 DECODE_STALL_TIMEOUT_S = 180   # kill a decode whose output ROOT has not grown this long
 DECODE_HARD_TIMEOUT_S  = 1800  # absolute cap on a single decode
 
@@ -67,8 +69,9 @@ DECODE_HARD_TIMEOUT_S  = 1800  # absolute cap on a single decode
 class DecodeTimeout(Exception):
     """A decode was killed for hanging (output frozen, or hard cap exceeded).
 
-    The raw FDF is preserved — renamed to <name>.hang — so the file_num can still
-    finish from the surviving FEUs and the file stays a reproducer for the bug.
+    The raw FDF is preserved — renamed to <name>.hang — so the file_num can
+    still finish from the surviving FEUs and the file stays a reproducer for
+    the decoder bug.
     """
     def __init__(self, fdf_path, hang_path, reason):
         super().__init__(f'decode of {os.path.basename(fdf_path)} killed: {reason}')
@@ -111,9 +114,6 @@ def run_watcher(config: dict):
     save_fdfs    = config.get('save_fdfs',    True)
     save_decoded = config.get('save_decoded', True)
 
-    decode_stall_timeout_s = config.get('decode_stall_timeout_s', DECODE_STALL_TIMEOUT_S)
-    decode_hard_timeout_s  = config.get('decode_hard_timeout_s',  DECODE_HARD_TIMEOUT_S)
-
     pedestal_loc      = config.get('pedestal_loc', 'same')
     pedestal_base_dir = config.get('pedestal_dir', '') or ''
 
@@ -124,6 +124,8 @@ def run_watcher(config: dict):
     stale_run_days = config.get('stale_run_days',  4)
     free_threads   = config.get('free_threads',    2)
     n_threads      = max(1, (os.cpu_count() or 1) - free_threads)
+    decode_stall_timeout_s = config.get('decode_stall_timeout_s', DECODE_STALL_TIMEOUT_S)
+    decode_hard_timeout_s  = config.get('decode_hard_timeout_s',  DECODE_HARD_TIMEOUT_S)
 
     print(f"[watcher] runs_dir      : {runs_dir}")
     if include_runs:
@@ -147,98 +149,106 @@ def run_watcher(config: dict):
             sys.stdout.flush()
             idle_line = False
 
-    while True:
-        found_new = False
+    def _scan_once() -> bool:
+        """Run one newest-first scan and process at most ONE file_num.
 
+        Runs, subruns and file_nums are all walked newest-first, and the scan
+        returns as soon as it processes a single file_num so the caller can
+        immediately rescan.  This keeps the watcher always working the newest
+        available data, only draining older backlog when nothing newer needs
+        processing (i.e. it works backwards in general).  Returns True if it
+        processed a file_num, False if a full pass found nothing to do.
+        """
         if not runs_dir.exists():
-            pass
-        else:
-            for run_dir in sorted(runs_dir.iterdir()):
-                if not run_dir.is_dir():
-                    continue
-                if include_runs is not None and run_dir.name not in include_runs:
-                    continue
-                if run_dir.name in exclude_runs:
-                    continue
-                if run_dir.name in checked_stale_runs:
+            return False
+
+        for run_dir in _newest_first(d for d in runs_dir.iterdir() if d.is_dir()):
+            if include_runs is not None and run_dir.name not in include_runs:
+                continue
+            if run_dir.name in exclude_runs:
+                continue
+            if run_dir.name in checked_stale_runs:
+                continue
+
+            is_stale = _run_is_stale(run_dir, raw_inner, stale_run_days)
+
+            sample_period = _read_sample_period(run_dir)
+            feu_det_map   = _read_feu_detector_map(run_dir)
+            zs_baseline   = _read_zs_baseline(run_dir)
+
+            for subrun_dir in _newest_first(d for d in run_dir.iterdir() if d.is_dir()):
+                raw_dir = subrun_dir / raw_inner
+                if not raw_dir.exists():
                     continue
 
-                is_stale = _run_is_stale(run_dir, raw_inner, stale_run_days)
+                ped_dir = _resolve_pedestal_dir(raw_dir, pedestal_loc, pedestal_base_dir)
 
-                sample_period = _read_sample_period(run_dir)
-                zs_baseline = _read_zs_baseline(run_dir)
+                if do_decode and ped_dir:
+                    _decode_pedestals(ped_dir, decode_exe,
+                                      decode_stall_timeout_s, decode_hard_timeout_s)
 
-                for subrun_dir in sorted(run_dir.iterdir()):
-                    if not subrun_dir.is_dir():
+                all_fnums  = _get_data_file_nums(raw_dir)
+                done_fnums = _get_processed_file_nums(
+                    subrun_dir, combined_inner, hits_inner, decoded_inner,
+                    do_combine, do_analyze
+                )
+
+                for fnum in sorted(all_fnums - done_fnums, reverse=True):
+                    all_fdf_group = [
+                        raw_dir / f for f in os.listdir(raw_dir)
+                        if _is_data_fdf(f) and _extract_file_num(f) == fnum
+                    ]
+                    if not all_fdf_group:
                         continue
 
-                    raw_dir = subrun_dir / raw_inner
-                    if not raw_dir.exists():
+                    key = (run_dir.name, subrun_dir.name, fnum)
+                    current = {p.name: p.stat().st_size for p in all_fdf_group if p.exists()}
+                    if not current or any(s == 0 for s in current.values()):
+                        prev_sizes[key] = current
                         continue
 
-                    ped_dir = _resolve_pedestal_dir(raw_dir, pedestal_loc, pedestal_base_dir)
+                    if prev_sizes.get(key) == current:
+                        _end_idle()
+                        print(f"[watcher] {run_dir.name}/{subrun_dir.name}  "
+                              f"file_num={fnum:03d}  ({len(all_fdf_group)} FEU(s))")
+                        _process_file_num(
+                            fnum, all_fdf_group, subrun_dir, ped_dir,
+                            decoded_inner, hits_inner, combined_inner,
+                            decode_exe, analyze_exe, combine_exe,
+                            do_decode, do_analyze, do_combine,
+                            save_fdfs, save_decoded, n_threads,
+                            sample_period, common_noise_subtraction,
+                            feu_det_map, zs_baseline,
+                            decode_stall_timeout_s, decode_hard_timeout_s
+                        )
+                        del prev_sizes[key]
+                        return True
+                    else:
+                        prev_sizes[key] = current
 
-                    if do_decode and ped_dir:
-                        _decode_pedestals(ped_dir, decode_exe)
+            if is_stale:
+                checked_stale_runs.add(run_dir.name)
+                _end_idle()
+                print(f"[watcher] Marked stale (will skip): {run_dir.name}")
 
-                    all_fnums  = _get_data_file_nums(raw_dir)
-                    done_fnums = _get_processed_file_nums(
-                        subrun_dir, combined_inner, hits_inner, decoded_inner,
-                        do_combine, do_analyze
-                    )
+        return False
 
-                    for fnum in sorted(all_fnums - done_fnums):
-                        all_fdf_group = [
-                            raw_dir / f for f in os.listdir(raw_dir)
-                            if _is_data_fdf(f) and _extract_file_num(f) == fnum
-                        ]
-                        if not all_fdf_group:
-                            continue
-
-                        key = (run_dir.name, subrun_dir.name, fnum)
-                        current = {p.name: p.stat().st_size for p in all_fdf_group if p.exists()}
-                        if not current or any(s == 0 for s in current.values()):
-                            prev_sizes[key] = current
-                            continue
-
-                        if prev_sizes.get(key) == current:
-                            _end_idle()
-                            print(f"[watcher] {run_dir.name}/{subrun_dir.name}  "
-                                  f"file_num={fnum:03d}  ({len(all_fdf_group)} FEU(s))")
-                            _process_file_num(
-                                fnum, all_fdf_group, subrun_dir, ped_dir,
-                                decoded_inner, hits_inner, combined_inner,
-                                decode_exe, analyze_exe, combine_exe,
-                                do_decode, do_analyze, do_combine,
-                                save_fdfs, save_decoded, n_threads,
-                                sample_period, common_noise_subtraction,
-                                zs_baseline,
-                                decode_stall_timeout_s, decode_hard_timeout_s
-                            )
-                            del prev_sizes[key]
-                            found_new = True
-                        else:
-                            prev_sizes[key] = current
-
-                if is_stale:
-                    checked_stale_runs.add(run_dir.name)
-                    _end_idle()
-                    print(f"[watcher] Marked stale (will skip): {run_dir.name}")
-
-        if found_new:
+    while True:
+        if _scan_once():
             idle_ticks = 0
+            continue
+
+        idle_ticks += 1
+        elapsed = idle_ticks * poll_interval
+        ts = datetime.datetime.now().strftime('%H:%M:%S')
+        sp = _SPINNER[idle_ticks % 4]
+        if not runs_dir.exists():
+            msg = f'[watcher] {sp} waiting for runs_dir  #{idle_ticks}  {ts}'
         else:
-            idle_ticks += 1
-            elapsed = idle_ticks * poll_interval
-            ts = datetime.datetime.now().strftime('%H:%M:%S')
-            sp = _SPINNER[idle_ticks % 4]
-            if not runs_dir.exists():
-                msg = f'[watcher] {sp} waiting for runs_dir  #{idle_ticks}  {ts}'
-            else:
-                msg = f'[watcher] {sp} idle  #{idle_ticks}  {elapsed}s  {ts}'
-            sys.stdout.write(f'\r{msg}          ')
-            sys.stdout.flush()
-            idle_line = True
+            msg = f'[watcher] {sp} idle  #{idle_ticks}  {elapsed}s  {ts}'
+        sys.stdout.write(f'\r{msg}          ')
+        sys.stdout.flush()
+        idle_line = True
         time.sleep(poll_interval)
 
 
@@ -252,7 +262,7 @@ def _process_file_num(fnum, all_fdf_paths, subrun_dir, ped_dir,
                        do_decode, do_analyze, do_combine,
                        save_fdfs, save_decoded, n_threads,
                        sample_period=None, common_noise_subtraction=True,
-                       zs_baseline=False,
+                       feu_det_map=None, zs_baseline=False,
                        decode_stall_timeout_s=DECODE_STALL_TIMEOUT_S,
                        decode_hard_timeout_s=DECODE_HARD_TIMEOUT_S):
 
@@ -275,11 +285,10 @@ def _process_file_num(fnum, all_fdf_paths, subrun_dir, ped_dir,
                 try:
                     t.result()
                 except DecodeTimeout as e:
-                    # One FEU's file hung and was quarantined — do NOT fail the whole
-                    # file_num. The surviving FEUs still analyze/combine below, so the
-                    # subrun completes (minus that plane) and the pipeline keeps moving.
+                    # Continue with the surviving FEUs; the quarantined FDF
+                    # stays behind as <name>.hang for offline debugging.
                     print(f"[decode]  quarantined {os.path.basename(e.hang_path)} "
-                          f"({e.reason}); pipeline continues without this FEU")
+                          f"({e.reason}); continuing with surviving FEUs")
 
     # Step 2: Analyze waveforms
     if do_analyze:
@@ -297,7 +306,8 @@ def _process_file_num(fnum, all_fdf_paths, subrun_dir, ped_dir,
                 if hits_path.exists():
                     continue
                 tasks.append(pool.submit(
-                    _analyze_file, str(root_path), ped_dir, str(hits_path), analyze_exe, sample_period, common_noise_subtraction, zs_baseline
+                    _analyze_file, str(root_path), ped_dir, str(hits_path), analyze_exe,
+                    sample_period, common_noise_subtraction, feu_det_map, zs_baseline
                 ))
             for t in as_completed(tasks):
                 t.result()
@@ -325,7 +335,9 @@ def _process_file_num(fnum, all_fdf_paths, subrun_dir, ped_dir,
                 print(f"[cleanup] Removed {f.name}")
 
 
-def _decode_pedestals(ped_dir: str, decode_exe: str):
+def _decode_pedestals(ped_dir: str, decode_exe: str,
+                      decode_stall_timeout_s=DECODE_STALL_TIMEOUT_S,
+                      decode_hard_timeout_s=DECODE_HARD_TIMEOUT_S):
     """Decode pedestal FDFs in ped_dir in-place, skipping already-decoded ones."""
     ped_path = Path(ped_dir)
     if not ped_path.exists():
@@ -338,10 +350,28 @@ def _decode_pedestals(ped_dir: str, decode_exe: str):
             continue
         print(f"[watcher] Decoding pedestal: {fdf.name}")
         try:
-            _decode_file(str(fdf), str(root_out), decode_exe)
+            _decode_file(str(fdf), str(root_out), decode_exe,
+                         decode_stall_timeout_s, decode_hard_timeout_s)
         except DecodeTimeout as e:
-            print(f"[watcher] pedestal decode hung, quarantined "
+            print(f"[decode]  quarantined pedestal "
                   f"{os.path.basename(e.hang_path)} ({e.reason}); skipping it")
+
+
+# ---------------------------------------------------------------------------
+# Ordering
+# ---------------------------------------------------------------------------
+
+def _newest_first(dirs):
+    """Sort directories newest-first by the last integer in their name.
+
+    Runs are ``run_<N>`` (higher N == newer) and subruns end in a ``_<k>``
+    creation index (higher k == newer), so the trailing integer orders both by
+    recency.  Names without a number sort last.
+    """
+    def key(p):
+        nums = re.findall(r'\d+', p.name)
+        return int(nums[-1]) if nums else -1
+    return sorted(dirs, key=key, reverse=True)
 
 
 # ---------------------------------------------------------------------------
@@ -463,23 +493,6 @@ def _make_combined_name(a_hits_path: str) -> str:
 # Run-config helpers
 # ---------------------------------------------------------------------------
 
-def _read_zs_baseline(run_dir: Path):
-    """True when the run took zero-suppressed data with on-FEU pedestal
-    subtraction (dream_daq_info in run_config.json): the decoded waveforms are
-    then re-centred at 256 and analyze_waveforms needs --zs-baseline 1."""
-    cfg_path = run_dir / 'run_config.json'
-    if not cfg_path.exists():
-        return False
-    try:
-        with open(cfg_path) as f:
-            cfg = json.load(f)
-        daq = cfg.get('dream_daq_info', {})
-        return bool(daq.get('zero_suppress')) and bool(daq.get('pedestal_subtraction'))
-    except Exception as e:
-        print(f"[watcher] Could not read zs_baseline from {cfg_path}: {e}")
-        return False
-
-
 def _read_sample_period(run_dir: Path):
     """Return dream_daq_info.sample_period from run_config.json, or None if absent."""
     cfg_path = run_dir / 'run_config.json'
@@ -494,6 +507,65 @@ def _read_sample_period(run_dir: Path):
         return None
 
 
+def _read_zs_baseline(run_dir: Path) -> bool:
+    """True when the run took zero-suppressed data with ON-FEU pedestal
+    subtraction (dream_daq_info in run_config.json): the decoded waveforms are
+    then re-centred at 256 and analyze_waveforms needs --zs-baseline 1 (the
+    pedestal file's per-channel means would be the wrong baseline; its RMS is
+    still used for thresholds). ZS without on-FEU subtraction sits on the raw
+    per-channel baselines, where the pedestal means ARE correct — hence the
+    two-condition test. Ported from the banco P2 fork, 2026-07-24."""
+    cfg_path = run_dir / 'run_config.json'
+    if not cfg_path.exists():
+        return False
+    try:
+        with open(cfg_path) as f:
+            cfg = json.load(f)
+        daq = cfg.get('dream_daq_info', {})
+        return bool(daq.get('zero_suppress')) and bool(daq.get('pedestal_subtraction'))
+    except Exception as e:
+        print(f"[watcher] Could not read zs_baseline from {cfg_path}: {e}")
+        return False
+
+
+def _read_feu_detector_map(run_dir: Path) -> dict:
+    """Return {feu_num: detector_label} from run_config.json, or {} if absent.
+
+    Each detector's ``dream_feus`` maps a connector name to a ``(feu, channel)``
+    pair, so a detector can span several FEUs (e.g. beam ``mx17_A`` uses FEU 3+4)
+    and, conversely, one FEU can serve several detectors (e.g. the cosmic-bench
+    ``m3`` quadrants all sit on FEU 1).  When a FEU serves more than one included
+    detector the labels are joined with ``/`` so the analyze line stays a single
+    whitespace-free token.  Restricted to ``included_detectors`` when present.
+    """
+    cfg_path = run_dir / 'run_config.json'
+    if not cfg_path.exists():
+        return {}
+    try:
+        with open(cfg_path) as f:
+            cfg = json.load(f)
+    except Exception as e:
+        print(f"[watcher] Could not read detectors from {cfg_path}: {e}")
+        return {}
+
+    detectors = cfg.get('detectors', []) or []
+    included  = cfg.get('included_detectors')
+    if included:
+        detectors = [d for d in detectors if d.get('name') in set(included)]
+
+    feu_map: dict = {}
+    for det in detectors:
+        name = det.get('name')
+        if not name:
+            continue
+        for feu_ch in (det.get('dream_feus') or {}).values():
+            if isinstance(feu_ch, (list, tuple)) and feu_ch:
+                feu = int(feu_ch[0])
+                if name not in feu_map.setdefault(feu, []):
+                    feu_map[feu].append(name)
+    return {feu: '/'.join(names) for feu, names in feu_map.items()}
+
+
 # ---------------------------------------------------------------------------
 # Worker functions (invoke C++ executables)
 # ---------------------------------------------------------------------------
@@ -503,15 +575,15 @@ def _decode_file(fdf_path: str, root_path: str, decode_exe: str,
                  hard_timeout_s: float = DECODE_HARD_TIMEOUT_S):
     """Decode one FDF, with a watchdog.
 
-    The decoder in mm_dream_reconstruction can infinite-loop on certain files —
-    100% CPU with the input read position and the output ROOT both frozen (seen
-    2026-07-23 and -24 on different files/FEUs). The watcher is sequential, so one
-    such file pegs a core AND blocks the entire pipeline behind it. Guard it: poll
-    the output ROOT while the decoder runs; if it stops growing for stall_timeout_s
-    (the hang signature) or the decode exceeds hard_timeout_s, kill the decoder,
-    drop the partial ROOT, and quarantine the FDF to <name>.hang. That lets this
-    file_num still complete from the surviving FEUs and later files keep decoding.
-    The raw FDF is renamed, never deleted — it remains a reproducer for the bug.
+    DreamDecoder can infinite-loop on certain files — 100% CPU with the input
+    read position and the output ROOT both frozen (seen on the banco P2 setup
+    2026-07-23/24; same decoder source). The watcher is sequential per subrun,
+    so one such file pegs a core AND blocks the pipeline behind it. Guard it:
+    poll the output ROOT while the decoder runs; if it stops growing for
+    stall_timeout_s (the hang signature) or the decode exceeds hard_timeout_s,
+    kill the decoder, drop the partial ROOT, and quarantine the FDF to
+    <name>.hang. The raw FDF is renamed, never deleted — it remains a
+    reproducer for the decoder bug.
     """
     print(f"[decode]  {os.path.basename(fdf_path)}")
     # own session/process group so the watchdog can reap the decoder and any
@@ -561,13 +633,14 @@ def _decode_file(fdf_path: str, root_path: str, decode_exe: str,
 
 
 def _analyze_file(root_path: str, ped_dir: str, hits_out_path: str, analyze_exe: str,
-                  sample_period=None, common_noise_subtraction: bool = True,
+                  sample_period=None, common_noise_subtraction: bool = True, feu_det_map=None,
                   zs_baseline: bool = False):
     m = re.search(r'_(\d{3})_(\d{2})', os.path.basename(root_path))
     if not m:
         print(f"[analyze] Cannot extract FEU number from {root_path}, skipping")
         return
     feu_num = int(m.group(2))
+    detector = (feu_det_map or {}).get(feu_num)
 
     ped_path = ''
     if ped_dir and os.path.isdir(ped_dir):
@@ -586,15 +659,13 @@ def _analyze_file(root_path: str, ped_dir: str, hits_out_path: str, analyze_exe:
         else:
             print(f"[analyze] No pedestal for FEU {feu_num}, continuing without")
 
-    print(f"[analyze] {os.path.basename(root_path)}")
+    det_tag = f"det={detector} " if detector else ""
+    print(f"[analyze] {det_tag}feu={feu_num:02d}  {os.path.basename(root_path)}")
     cmd = [analyze_exe, root_path, hits_out_path, ped_path]
     if sample_period is not None:
         cmd += ['--tps', str(sample_period)]
     cmd += ['--cns', '1' if common_noise_subtraction else '0']
     if zs_baseline:
-        # ZS + on-FEU pedestal subtraction: waveforms are re-centred at 256, so
-        # the analyzer must subtract 256, not the pedestal file's raw means
-        # (which are the pre-subtraction baselines, off by up to ~130 ADC).
         cmd += ['--zs-baseline', '1']
     subprocess.run(cmd)
 

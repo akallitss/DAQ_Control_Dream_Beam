@@ -852,6 +852,22 @@ document.getElementById("take-pedestals").addEventListener("click", async () => 
 
 // git reset button handler
 document.getElementById("git-reset").addEventListener("click", async () => {
+  // Loud confirmation: Git Reset runs `git reset --hard origin && git pull`,
+  // which PERMANENTLY discards every uncommitted local change in
+  // DAQ_Control_Dream_Beam. As of 2026-07-24 those uncommitted changes include
+  // the deployed new-processor wiring (run_config_beam.py -> mm_strip_reconstruction
+  // build) and the upgraded processor_watcher.py; a reset silently reverts the
+  // pipeline to the OLD analyzer. So make the user really mean it.
+  const ok = confirm(
+    "\u26A0\uFE0F  STOP \u2014 Dylan wants to know: do you REALLY want to do this?\n\n" +
+    "Git Reset runs `git reset --hard origin && git pull`.\n" +
+    "It PERMANENTLY throws away ALL uncommitted local changes in this repo.\n\n" +
+    "Right now that includes the live new-processor deployment\n" +
+    "(run_config_beam.py + processor_watcher.py). A reset will revert the\n" +
+    "reconstruction pipeline back to the OLD analyzer.\n\n" +
+    "If you are not 100% sure, press Cancel and ask Dylan first."
+  );
+  if (!ok) return;
   const res = await fetch("/git_reset", { method: "POST" });
   const data = await res.json();
   showPopup(data.message, "#17a2b8");

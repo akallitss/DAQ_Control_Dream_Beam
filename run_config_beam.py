@@ -237,10 +237,10 @@ POST_SUBRUN_PAUSE_MIN = 0   # optional pause AFTER each sub-run (minutes); 0 = n
 # unsafe on P2_OUT: 440 V mesh exceeds its 420 V maximum.
 # ---------------------------------------------------------------------------
 OPERATING_HV = {
-    'P2_IN':  {'drift': 600, 'mesh': 400},   # gap = 200 V. REINSTATED 2026-07-24
-                                             # after repair + regas — confirmed alive
-                                             # in p2in_check_1 (Landau signal peaking
-                                             # at sample 7, ~0.01 uA, no trip).
+    'P2_IN':  {'drift': 630, 'mesh': 430},   # gap = 200 V. REINSTATED 2026-07-24
+                                             # after repair + regas (alive in
+                                             # p2in_check_1). Mesh raised to its 430 V
+                                             # ceiling on Alexandra's instruction.
     'P2_MID': {'drift': 700, 'mesh': 450},   # gap = 250 V; drift scanned up to 900
     'P2_OUT': {'drift': 700, 'mesh': 450},   # gap = 250 V; drift scanned up to 900
     'EIC_uRWELL_front': {'drift': 600, 'resist': 420},   # uRWELL-inter
@@ -263,8 +263,8 @@ OPERATING_HV = {
 # is a higher drift field than these detectors have run at; back a channel off if
 # it draws or trips (the monitor flags >2 uA / any trip).
 MAX_HV = {
-    'P2_IN':  {'drift': 700, 'mesh': 490},
-    'P2_MID': {'drift': 900, 'mesh': 510},
+    'P2_IN':  {'drift': 700, 'mesh': 430},   # mesh ceiling 430 V (Alexandra 2026-07-24)
+    'P2_MID': {'drift': 900, 'mesh': 450},   # mesh ceiling lowered 510 -> 450 (Alexandra 2026-07-24)
     'P2_OUT': {'drift': 900, 'mesh': 450},
     'EIC_uRWELL_front': {'drift': 600, 'resist': 420},
     'EIC_uRWELL_back':  {'drift': 600, 'resist': 420},
@@ -650,16 +650,21 @@ class Config(RunConfigBase):
         #   cfg Feu 3 = Id 101 (.113) -> P2_IN
         #   cfg Feu 4 = Id 102 (.114) -> P2_MID
         #   cfg Feu 5 = Id 103 (.115) -> P2_OUT
-        # P2: connectors 4-7, each a bot/top Dream pair filling FEU Dream conn
-        # 1-8; all rotated_inverted.
-        _p2_dream_feus = lambda feu: {
-            f'c_{conn}_{pos}': (feu, 2 * (conn - 4) + (1 if pos == 'bot' else 2))
-            for conn in (4, 5, 6, 7) for pos in ('bot', 'top')
-        }
-        _p2_orientation = {
-            f'c_{conn}_{pos}': 'rotated_inverted'
-            for conn in (4, 5, 6, 7) for pos in ('bot', 'top')
-        }
+        # P2: four connectors, each a bot/top Dream pair filling FEU Dream conn
+        # 1-8 IN ORDER; all rotated_inverted. MID/OUT are cabled on connectors
+        # 4-7; P2_IN is on 4,5,6,8 (connector 8 in place of 7, confirmed
+        # 2026-07-24). The Dream-channel assignment is by index, so which physical
+        # connector sits on which readout channel is correct for each.
+        def _p2_dream_feus(feu, conns=(4, 5, 6, 7)):
+            return {
+                f'c_{conn}_{pos}': (feu, 2 * i + (1 if pos == 'bot' else 2))
+                for i, conn in enumerate(conns) for pos in ('bot', 'top')
+            }
+        def _p2_orientation(conns=(4, 5, 6, 7)):
+            return {
+                f'c_{conn}_{pos}': 'rotated_inverted'
+                for conn in conns for pos in ('bot', 'top')
+            }
         # uRWELL x/y strips on cfg Feu 1 (Id 68): front on Dream conn 1-4, back
         # on 5-8. Orientation: x normal; y inverted (front) / rotated (back).
         def _urwell(feu, base, y_orient):
@@ -695,8 +700,8 @@ class Config(RunConfigBase):
                 'det_center_coords': {'x': 0, 'y': 0, 'z': DET_Z_MM['P2_IN']},
                 'det_orientation': {'x': 0, 'y': 0, 'z': 0},
                 'hv_channels': DET_HV['P2_IN'],
-                'dream_feus': _p2_dream_feus(3),
-                'dream_feu_orientation': dict(_p2_orientation),
+                'dream_feus': _p2_dream_feus(3, (4, 5, 6, 8)),
+                'dream_feu_orientation': _p2_orientation((4, 5, 6, 8)),
             },
             {
                 'name': 'P2_MID',
@@ -709,7 +714,7 @@ class Config(RunConfigBase):
                 'det_orientation': {'x': 0, 'y': 0, 'z': 0},
                 'hv_channels': DET_HV['P2_MID'],
                 'dream_feus': _p2_dream_feus(4),
-                'dream_feu_orientation': dict(_p2_orientation),
+                'dream_feu_orientation': _p2_orientation(),
             },
             {
                 'name': 'P2_OUT',
@@ -722,7 +727,7 @@ class Config(RunConfigBase):
                 'det_orientation': {'x': 0, 'y': 0, 'z': 0},
                 'hv_channels': DET_HV['P2_OUT'],
                 'dream_feus': _p2_dream_feus(5),
-                'dream_feu_orientation': dict(_p2_orientation),
+                'dream_feu_orientation': _p2_orientation(),
             },
             {
                 'name': 'EIC_uRWELL_back',

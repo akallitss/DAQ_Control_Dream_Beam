@@ -109,10 +109,43 @@ DREAM_CFG_TEMPLATE = _SITE_CFG.get(
     'dream_cfg_template', f'{BASE_DATA_DIR}dream_config/{_DREAM_TEMPLATE_FILE}')
 
 # ---------------------------------------------------------------------------
+# RUN PLAN — the single knob that decides what the next run does.
+#
+# This is what the GUI "Start Run" button reads. That button re-runs this file
+# to regenerate run_config_beam.json, but it cannot set environment variables,
+# so a mode gated ONLY on a DAQ_* env var is unreachable from the GUI — which is
+# the only reason ~/overnight_scans.sh existed. Setting RUN_PLAN here makes the
+# scans startable with one click. The DAQ_* env vars still work and still win,
+# so scripted and one-off runs are unaffected.
+#
+#   'commissioning'   : N_SUBRUNS identical sub-runs of SUBRUN_MIN minutes at
+#                       the beam operating point (OPERATING_HV).
+#   'drift_scan'      : mesh fixed, drift stepped UP (drift block below).
+#   'mesh_scan'       : drift gap fixed, mesh+drift stepped DOWN together.
+#   'drift_then_mesh' : the full overnight plan as ONE run — every drift point,
+#                       then every mesh point. This is what overnight_scans.sh
+#                       did as two separate daq_control invocations.
+# ---------------------------------------------------------------------------
+RUN_PLAN = os.environ.get('DAQ_RUN_PLAN', 'drift_then_mesh')
+_RUN_PLANS = ('commissioning', 'drift_scan', 'mesh_scan', 'drift_then_mesh')
+assert RUN_PLAN in _RUN_PLANS, f'RUN_PLAN {RUN_PLAN!r} not one of {_RUN_PLANS}'
+
+# Mesh-scan shape for the plan-driven (GUI) runs: the 5 V / 12 point / 10 min
+# scan overnight_scans.sh asked for, rather than the coarser committed defaults
+# further down. setdefault, so an explicitly exported DAQ_MESH_* still wins.
+if RUN_PLAN in ('mesh_scan', 'drift_then_mesh'):
+    os.environ.setdefault('DAQ_MESH_NOMINAL',    '1')
+    os.environ.setdefault('DAQ_MESH_POINTS',     '12')
+    os.environ.setdefault('DAQ_MESH_STEP_V',     '5')
+    os.environ.setdefault('DAQ_MESH_SUBRUN_MIN', '10')
+
+# ---------------------------------------------------------------------------
 # Run schedule — the modes are checked in this order:
 #
+#   BEAM_DRIFT_SCAN and BEAM_HV_SCAN both True : drift points, then mesh points,
+#                       in a single run. Takes precedence over every mode here.
 #   BEAM_DRIFT_SCAN True : beam drift scan (mesh fixed, drift stepped up). See the
-#                       block below. Takes precedence over every mode here.
+#                       block below.
 #   BEAM_HV_SCAN True  : beam mesh scan (drift gap fixed, mesh+drift stepped down).
 #   LATENCY_SCAN True : beam latency scan. One sub-run per value in
 #                       LATENCY_SCAN_VALUES, all at the beam operating point,
@@ -157,7 +190,8 @@ DREAM_CFG_TEMPLATE = _SITE_CFG.get(
 # Sizing (2026-07-23 measured beam): 8 x 20 min ~ 2 h 49 m including the ~45 s
 # per sub-run boundary and the initial ramp. At ~1150 Hz long-run average that
 # is ~11 M events total, ~1.4 M per point.
-BEAM_HV_SCAN = os.environ.get('DAQ_BEAM_HV_SCAN', '0') == '1'
+BEAM_HV_SCAN = (os.environ.get('DAQ_BEAM_HV_SCAN', '0') == '1'
+                or RUN_PLAN in ('mesh_scan', 'drift_then_mesh'))
 # Detectors whose mesh AND drift step together (gap held constant → isolates gain).
 # P2_IN is deliberately excluded — it is parked off (0 V), has no gain to scan, and
 # stepping its 0 V setpoint down would go negative and fail the range assert.
@@ -186,7 +220,8 @@ BEAM_SCAN_SUBRUN_MIN = int(os.environ.get('DAQ_MESH_SUBRUN_MIN', '20'))     # mi
 # the tracking telescope, and P2_IN stays parked off.
 # Default 10 points 450..900 in 50 V steps, 10 min each (~100 min DAQ) — sized to
 # the 2.5 h beam window of 2026-07-24.
-BEAM_DRIFT_SCAN = os.environ.get('DAQ_BEAM_DRIFT_SCAN', '0') == '1'
+BEAM_DRIFT_SCAN = (os.environ.get('DAQ_BEAM_DRIFT_SCAN', '0') == '1'
+                   or RUN_PLAN in ('drift_scan', 'drift_then_mesh'))
 BEAM_DRIFT_SCAN_DETS = ('P2_MID', 'P2_OUT')  # detectors whose drift is scanned. P2_IN is
                                              # EXCLUDED: its drift max is 700 V, below the
                                              # scan's 900 V top, so it is held at its
@@ -333,7 +368,15 @@ class Config(RunConfigBase):
         # uses). Needed because 'run_1' is already taken on EOS by the Fe55 scan
         # under this campaign path — reusing it would merge beam sub-runs into
         # that directory. Every run_name-derived path below follows this.
-        self.run_name = os.environ.get('DAQ_RUN_NAME') or 'run_1'
+        # Name follows the plan, so a GUI-started scan is not called 'run_N'.
+        # The _1 suffix is what iterate_run_num.py bumps when the directory
+        # already exists, so repeat scans land in _2, _3, ... automatically.
+        _plan_run_name = {
+            'drift_then_mesh': 'drift_mesh_scan_1',
+            'drift_scan':      'drift_scan_1',
+            'mesh_scan':       'mesh_scan_1',
+        }.get(RUN_PLAN, 'run_1')
+        self.run_name = os.environ.get('DAQ_RUN_NAME') or _plan_run_name
         self.base_out_dir = BASE_DATA_DIR
         self.data_out_dir = f'{self.base_out_dir}runs/'
         self.run_out_dir = f'{self.data_out_dir}{self.run_name}/'
@@ -547,6 +590,39 @@ class Config(RunConfigBase):
                     hvs.setdefault(str(card), {})[str(chan)] = volts
             return hvs
 
+        def _drift_scan_sub_runs():
+            """Drift scan: mesh fixed, drift stepped UP over BEAM_DRIFT_SCAN_DETS."""
+            out = []
+            for p in range(BEAM_DRIFT_SCAN_POINTS):
+                drift_v = BEAM_DRIFT_SCAN_START_V + p * BEAM_DRIFT_SCAN_STEP_V
+                out.append({
+                    'sub_run_name': f'drift_{drift_v:03d}',
+                    'run_time': BEAM_DRIFT_SCAN_SUBRUN_MIN,
+                    'post_pause_s': int(round(POST_SUBRUN_PAUSE_MIN * 60)),
+                    'hvs': _drift_scan_hvs(drift_v),
+                })
+            return out
+
+        def _mesh_scan_sub_runs():
+            """Mesh scan: drift gap fixed, mesh+drift stepped DOWN together."""
+            out = []
+            for i in range(BEAM_SCAN_NOMINAL_SUBRUNS):
+                out.append({
+                    'sub_run_name': f'nominal_{i:02d}',
+                    'run_time': BEAM_SCAN_SUBRUN_MIN,
+                    'post_pause_s': int(round(POST_SUBRUN_PAUSE_MIN * 60)),
+                    'hvs': _scan_hvs(0),
+                })
+            for p in range(1, BEAM_SCAN_POINTS + 1):
+                off = p * BEAM_SCAN_MESH_STEP_V
+                out.append({
+                    'sub_run_name': f'meshscan_{p:02d}_midout{OPERATING_HV["P2_MID"]["mesh"] - off}',
+                    'run_time': BEAM_SCAN_SUBRUN_MIN,
+                    'post_pause_s': int(round(POST_SUBRUN_PAUSE_MIN * 60)),
+                    'hvs': _scan_hvs(off),
+                })
+            return out
+
         self.sub_runs = []
         if P2IN_CHECK:
             # Single fixed-HV run: P2_IN at its check point, uRWELLs at operating,
@@ -557,32 +633,16 @@ class Config(RunConfigBase):
                 'post_pause_s': 0,
                 'hvs': _operating_hvs(),
             })
+        elif BEAM_DRIFT_SCAN and BEAM_HV_SCAN:
+            # Full overnight plan in ONE run: every drift point, then every mesh
+            # point. The two halves use disjoint sub-run names (drift_* vs
+            # nominal_*/meshscan_*), so daq_control's .subrun_complete markers
+            # and the resume logic work on the combined run unchanged.
+            self.sub_runs = _drift_scan_sub_runs() + _mesh_scan_sub_runs()
         elif BEAM_DRIFT_SCAN:
-            # Drift scan: mesh fixed, drift stepped UP over BEAM_DRIFT_SCAN_DETS.
-            for p in range(BEAM_DRIFT_SCAN_POINTS):
-                drift_v = BEAM_DRIFT_SCAN_START_V + p * BEAM_DRIFT_SCAN_STEP_V
-                self.sub_runs.append({
-                    'sub_run_name': f'drift_{drift_v:03d}',
-                    'run_time': BEAM_DRIFT_SCAN_SUBRUN_MIN,
-                    'post_pause_s': int(round(POST_SUBRUN_PAUSE_MIN * 60)),
-                    'hvs': _drift_scan_hvs(drift_v),
-                })
+            self.sub_runs = _drift_scan_sub_runs()
         elif BEAM_HV_SCAN:
-            for i in range(BEAM_SCAN_NOMINAL_SUBRUNS):
-                self.sub_runs.append({
-                    'sub_run_name': f'nominal_{i:02d}',
-                    'run_time': BEAM_SCAN_SUBRUN_MIN,
-                    'post_pause_s': int(round(POST_SUBRUN_PAUSE_MIN * 60)),
-                    'hvs': _scan_hvs(0),
-                })
-            for p in range(1, BEAM_SCAN_POINTS + 1):
-                off = p * BEAM_SCAN_MESH_STEP_V
-                self.sub_runs.append({
-                    'sub_run_name': f'meshscan_{p:02d}_midout{OPERATING_HV["P2_MID"]["mesh"] - off}',
-                    'run_time': BEAM_SCAN_SUBRUN_MIN,
-                    'post_pause_s': int(round(POST_SUBRUN_PAUSE_MIN * 60)),
-                    'hvs': _scan_hvs(off),
-                })
+            self.sub_runs = _mesh_scan_sub_runs()
         elif LATENCY_SCAN:
             # One sub-run per latency point, all at the beam operating point.
             # The per-sub-run 'latency' key overrides dream_daq_info['latency']
@@ -863,14 +923,23 @@ if __name__ == '__main__':
     print(f'Dream template: {DREAM_CFG_TEMPLATE}')
     print(f'Gas: {config.gas}')
     print(f'Trigger: {config.trigger}')
-    if BEAM_HV_SCAN:
+    if BEAM_HV_SCAN or BEAM_DRIFT_SCAN:
         inv = {}
         for d, m in DET_HV.items():
             for role, (cd, ch) in m.items():
                 inv[(str(cd), str(ch))] = (d, role)
-        print(f'BEAM MESH-HV SCAN: {BEAM_SCAN_NOMINAL_SUBRUNS} nominal + '
-              f'{BEAM_SCAN_POINTS} points x -{BEAM_SCAN_MESH_STEP_V} V mesh, '
-              f'{BEAM_SCAN_SUBRUN_MIN} min each')
+        print(f'RUN PLAN: {RUN_PLAN}')
+        if BEAM_DRIFT_SCAN:
+            last_drift = (BEAM_DRIFT_SCAN_START_V
+                          + (BEAM_DRIFT_SCAN_POINTS - 1) * BEAM_DRIFT_SCAN_STEP_V)
+            print(f'BEAM DRIFT SCAN: {BEAM_DRIFT_SCAN_POINTS} points '
+                  f'{BEAM_DRIFT_SCAN_START_V}->{last_drift} V '
+                  f'x +{BEAM_DRIFT_SCAN_STEP_V} V drift on {BEAM_DRIFT_SCAN_DETS}, '
+                  f'{BEAM_DRIFT_SCAN_SUBRUN_MIN} min each')
+        if BEAM_HV_SCAN:
+            print(f'BEAM MESH-HV SCAN: {BEAM_SCAN_NOMINAL_SUBRUNS} nominal + '
+                  f'{BEAM_SCAN_POINTS} points x -{BEAM_SCAN_MESH_STEP_V} V mesh '
+                  f'on {BEAM_SCAN_DETS}, {BEAM_SCAN_SUBRUN_MIN} min each')
         for sr in config.sub_runs:
             bits = []
             for det in ('P2_IN', 'P2_MID', 'P2_OUT'):
@@ -895,8 +964,12 @@ if __name__ == '__main__':
             gap = (f'   gap = {roles["drift"] - roles["mesh"]} V'
                    if 'mesh' in roles else '')
             print(f'  {det:<18} {bits}{gap}')
-    print(f'Sub-runs: {n_sub} x {config.sub_runs[0]["run_time"] if n_sub else 0} min '
-          f'= {run_min} min (~{total_h:.2f} h + overhead)')
+    # A combined plan mixes sub-run lengths, so only claim "N x M min" when the
+    # schedule really is uniform.
+    _times = sorted({sr['run_time'] for sr in config.sub_runs})
+    _shape = (f'{n_sub} x {_times[0]} min' if len(_times) == 1
+              else f'{n_sub} sub-runs of ' + '/'.join(str(t) for t in _times) + ' min')
+    print(f'Sub-runs: {_shape} = {run_min} min (~{total_h:.2f} h + overhead)')
     print(f'Active FEUs: {config.get_active_feus()}')
 
     print('donzo')

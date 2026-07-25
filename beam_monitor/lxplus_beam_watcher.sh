@@ -65,6 +65,33 @@ MAX_STALE_S="${MAX_STALE_S:-600}"
 # cross-node restart guard. Keep it >= the acrontab period.
 GRACE_S="${GRACE_S:-900}"
 
+# A watcher that cannot reach NXCALS still publishes on schedule, so freshness
+# alone says nothing about health — it publishes "connected": false forever and
+# looks perfectly alive. Restart it, but no more often than this: the usual cause
+# is an expired ticket, and restarting cannot conjure credentials, so a short
+# period here would just thrash. One attempt per half hour is enough to pick up a
+# ticket that has since been reseeded.
+UNHEALTHY_BACKOFF_S="${UNHEALTHY_BACKOFF_S:-1800}"
+
+# --- Kerberos -----------------------------------------------------------------
+# NXCALS is Hadoop/Spark: its Java client needs a real (INITIAL) TGT. A ticket
+# forwarded over ssh — Flags FfRA, lowercase f — is not enough; it authenticates
+# to AFS and EOS happily but fails the Hadoop handshake with KrbException 101,
+# "Invalid option setting in ticket request". Setting forwardable=false in
+# krb5.conf does not help; the ticket itself is the problem.
+#
+# So the watcher gets credentials from a KEYTAB when one exists, into its OWN
+# cache. The private cache matters as much as the keytab: the default cache
+# (/run/user/<uid>/krb5cc) is shared by every login session on the node, and any
+# ssh with GSSAPIDelegateCredentials=yes silently overwrites it with a forwarded
+# ticket — which is exactly how a good ticket got clobbered on 2026-07-25.
+#
+# In /tmp, deliberately, not in AFS $HOME: reading an AFS file needs a token,
+# which needs the ticket that the file is meant to provide.
+KEYTAB="${KEYTAB:-$HOME/private/.krb5.keytab}"
+PRINCIPAL="${PRINCIPAL:-$(id -un)@CERN.CH}"
+WATCHER_CCACHE="${WATCHER_CCACHE:-/tmp/krb5cc_sps_beam_$(id -u)}"
+
 # Seam for testing the decision logic off-lxplus: override to run a stub instead
 # of the real watcher (see the self-test in the commit that introduced this).
 WATCHER_CMD="${WATCHER_CMD:-}"
@@ -76,6 +103,20 @@ NOW="$(date +%s)"
 UNIT="${UNIT:-sps-beam-watcher}"
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$HOST] $*" | tee -a "$KEEPALIVE_LOG"; }
+
+# Refresh the watcher's private cache from the keytab. Called before every start
+# and on every tick while the watcher is running, so the ticket is renewed long
+# before its ~25 h life runs out and the feed never has to notice. Returns
+# non-zero (and says so once) when there is no keytab, leaving the watcher to
+# fall back on whatever is in the default cache.
+kinit_from_keytab() {
+    [ -r "$KEYTAB" ] || return 1
+    if KRB5CCNAME="FILE:$WATCHER_CCACHE" kinit -kt "$KEYTAB" "$PRINCIPAL" 2>>"$KEEPALIVE_LOG"; then
+        return 0
+    fi
+    log "WARNING: kinit -kt from $KEYTAB failed for $PRINCIPAL"
+    return 1
+}
 
 # NXCALS/Spark needs Java 11 and a bound local IP on lxplus.
 export JAVA_HOME="${JAVA_HOME:-/usr/lib/jvm/java-11-openjdk-11.0.25.0.9-7.el9.x86_64}"
@@ -110,6 +151,15 @@ state_age_s() {
     # "aged in the future"; treat that as fresh rather than restart on it.
     [ "$age" -lt 0 ] && age=0
     echo "$age"
+}
+
+# Is the published state reporting a working NXCALS connection? Echoes "true",
+# "false", or nothing when the field is absent/unreadable — absent is treated as
+# "do not judge", so an older state format never triggers restarts.
+state_connected() {
+    [ -f "$STATE_FILE" ] || return 0
+    sed -n 's/.*"connected"[[:space:]]*:[[:space:]]*\(true\|false\).*/\1/p' \
+        "$STATE_FILE" 2>/dev/null | head -1
 }
 
 # --- lockfile: "host pid started_at" ------------------------------------------
@@ -157,7 +207,17 @@ start_watcher() {
     fi
     # exec, so the unit's MainPID is the watcher itself and not a wrapping shell
     # — the kill path below and the lockfile PID both depend on that.
-    local inner="cd '$REPO_DIR' && export JAVA_HOME='$JAVA_HOME' PATH='$PATH' \
+    # Point the watcher at its own credential cache when the keytab gave us one,
+    # so a stray delegated ssh cannot pull the ticket out from under it.
+    local ccname=''
+    if kinit_from_keytab; then
+        ccname="export KRB5CCNAME='FILE:$WATCHER_CCACHE'; "
+        log "kinit -kt OK -> $WATCHER_CCACHE ($PRINCIPAL)"
+    else
+        log "NOTE: no usable keytab at $KEYTAB — watcher will use the default cache, which expires and is shared with login sessions"
+    fi
+
+    local inner="cd '$REPO_DIR' && ${ccname}export JAVA_HOME='$JAVA_HOME' PATH='$PATH' \
 SPARK_LOCAL_IP='$SPARK_LOCAL_IP' SPS_BEAM_STATE='$SPS_BEAM_STATE' \
 SPS_BEAM_LOG_DIR='$SPS_BEAM_LOG_DIR'; exec $cmd >> '$HOME/sps_beam_watcher.log' 2>&1"
 
@@ -194,12 +254,33 @@ SPS_BEAM_LOG_DIR='$SPS_BEAM_LOG_DIR'; exec $cmd >> '$HOME/sps_beam_watcher.log' 
 
 # --- decide -------------------------------------------------------------------
 AGE=$(state_age_s)
+CONNECTED=$(state_connected)
 read_lock
 
-if [ -n "$AGE" ] && [ "$AGE" -lt "$MAX_STALE_S" ]; then
+if [ -n "$AGE" ] && [ "$AGE" -lt "$MAX_STALE_S" ] && [ "$CONNECTED" != "false" ]; then
     # Publishing normally. Silent on the happy path so acron does not mail every
-    # 10 minutes; the log line is enough of a heartbeat.
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$HOST] OK: state ${AGE}s old" >> "$KEEPALIVE_LOG"
+    # 10 minutes; the log line is enough of a heartbeat. Top up the ticket while
+    # we are here — cheap, and it keeps the watcher from ever reaching expiry.
+    kinit_from_keytab >/dev/null 2>&1
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$HOST] OK: state ${AGE}s old connected=${CONNECTED:-?}" >> "$KEEPALIVE_LOG"
+    exit 0
+fi
+
+# Publishing on time, but every query is failing — the watcher is up and useless.
+# Restart it (a fresh kinit -kt comes with the restart, which is the usual cure),
+# but at most once per UNHEALTHY_BACKOFF_S so a real credential outage does not
+# turn into a restart every tick.
+if [ -n "$AGE" ] && [ "$AGE" -lt "$MAX_STALE_S" ] && [ "$CONNECTED" = "false" ]; then
+    if [ "$LOCK_STARTED" -gt 0 ] && [ $((NOW - LOCK_STARTED)) -lt "$UNHEALTHY_BACKOFF_S" ]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$HOST] UNHEALTHY: publishing (${AGE}s) but connected=false; last start $((NOW - LOCK_STARTED))s ago, backing off ${UNHEALTHY_BACKOFF_S}s" >> "$KEEPALIVE_LOG"
+        exit 0
+    fi
+    log "publishing (${AGE}s old) but connected=false — restarting with fresh credentials"
+    if local_watcher_alive; then
+        systemctl --user stop "$UNIT" 2>/dev/null
+        kill "$LOCK_PID" 2>/dev/null
+    fi
+    start_watcher
     exit 0
 fi
 

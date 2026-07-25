@@ -96,6 +96,34 @@ mkstate $(( $(date +%s) + 7200 )); rm -f "$LOCKFILE" "$KEEPALIVE_LOG"
 bash "$SCRIPT" >/dev/null 2>&1
 chk "no restart on skew" "$(started)" "0"
 
+echo "== 10. fresh but connected=false, recent start -> back off =="
+mkcstate(){ printf '{"connected": %s, "timestamp": "%s"}\n' "$2" \
+            "$(date -d "@$1" '+%Y-%m-%dT%H:%M:%S')" > "$STATE"; }
+mkcstate $(date +%s) false
+echo "$HOST 999999 $(date +%s)" > "$LOCKFILE"; rm -f "$KEEPALIVE_LOG"
+bash "$SCRIPT" >/dev/null 2>&1
+chk "no restart within backoff" "$(started)" "0"
+chk "logged UNHEALTHY" "$(grep -c UNHEALTHY "$KEEPALIVE_LOG")" "1"
+
+echo "== 11. fresh but connected=false, past backoff -> restart =="
+mkcstate $(date +%s) false
+echo "$HOST 999999 $(( $(date +%s) - 99999 ))" > "$LOCKFILE"; rm -f "$KEEPALIVE_LOG"
+bash "$SCRIPT" >/dev/null 2>&1
+chk "restarted" "$(started)" "1"
+chk "reason logged" "$(grep -c 'connected=false — restarting' "$KEEPALIVE_LOG")" "1"
+kill "$(awk '{print $2}' "$LOCKFILE")" 2>/dev/null
+
+echo "== 12. fresh and connected=true -> no-op =="
+mkcstate $(date +%s) true
+echo "$HOST 999999 $(( $(date +%s) - 99999 ))" > "$LOCKFILE"; rm -f "$KEEPALIVE_LOG"
+bash "$SCRIPT" >/dev/null 2>&1
+chk "no restart when connected" "$(started)" "0"
+
+echo "== 13. no 'connected' field at all -> judged on freshness only =="
+mkstate $(date +%s); echo "$HOST 999999 $(( $(date +%s) - 99999 ))" > "$LOCKFILE"; rm -f "$KEEPALIVE_LOG"
+bash "$SCRIPT" >/dev/null 2>&1
+chk "old format not restarted" "$(started)" "0"
+
 echo; echo "passed=$pass failed=$fail"
 rm -rf "$T"
 [ "$fail" -eq 0 ]

@@ -45,6 +45,21 @@ CONFIG = {
                               # (mid-write it opens with NO keys -> QA silently skips every detector)
     'stale_run_days':   1,  # runs with no new combined_hits for this many days are skipped
     'memory_kill_pct': 80,  # kill the QA process if system RAM usage exceeds this % (retried next poll)
+    'qa_timeout_s':  1800,  # kill the QA process after this long; null = no timeout.
+                            # The run loop is serial, so without this a single wedged
+                            # subrun blocks every other run (drift_scan_2/drift_850 sat
+                            # in the mean/RMS step for 15.5 h on 2026-07-24).
+    'qa_max_attempts':  2,  # give up on a subrun after this many failed attempts, so one
+                            # that always fails cannot be retried forever
+
+    # Waveform plots — both OFF. These dominate the QA runtime: with the mean/RMS
+    # step enabled a subrun took ~60-90 min, so the watcher fell permanently behind
+    # the DAQ. The 8 per-detector hit plots still run and take seconds.
+    'wf_mean_rms':    False,  # per-strip waveform mean/RMS colour maps
+    'wf_event_plots': False,  # per-event waveform figures on beam runs
+    'wf_step_size':   50000,  # events per batch for the mean/RMS reduction when enabled.
+                              # Measured on a 2.34 M-entry decoded file: 778 s at the old
+                              # 200 vs 18 s at 50000 for identical output (~400 MB peak).
 
     # CPU throttling — keep QA from starving the DAQ.
     'cpu_nice':         19,          # nice level (also ionice idle class); null = no niceing

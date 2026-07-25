@@ -39,6 +39,28 @@ Config keys (see qa_config.py to generate the JSON):
                               0-1 for the DAQ on a 6-core box.
   qa_threads              : cap numpy/BLAS/uproot thread pools to this many threads
                               (default: null = derived from len(cpu_affinity), else unlimited).
+  qa_timeout_s            : kill the QA process if it runs longer than this (default: 1800).
+                              Without a timeout a single wedged subrun blocks the whole
+                              watcher indefinitely — the loop is serial, so nothing else
+                              gets processed. Observed 2026-07-24: drift_scan_2/drift_850
+                              sat in the waveform mean/RMS step for 15.5 h and only stopped
+                              because the watcher was restarted the next morning.
+  qa_max_attempts         : give up on a subrun after this many failed attempts (default: 2).
+                              A killed subrun is retried, but without a cap a subrun that
+                              always fails is retried forever and starves everything else.
+                              Only timeouts and non-zero exits count towards this. Memory
+                              kills do NOT: system RAM is usually pushed over the threshold
+                              by some other process on the box, so giving up on those would
+                              silently drop QA for a subrun that was never at fault.
+  wf_mean_rms             : per-strip waveform mean/RMS maps (default: false).
+                              By far the most expensive step in the QA — leave off unless
+                              you specifically need it.
+  wf_event_plots          : per-event waveform figures on beam runs (default: false).
+  wf_step_size            : events per batch for the mean/RMS reduction (default: 50000).
+
+State:
+  Progress for every mode is persisted to config/qa_state.json so a restart does not
+  reprocess subruns that already completed.
 """
 
 import os
@@ -104,6 +126,12 @@ def run_watcher(config: dict, reset_signal_path: Path = None):
     if qa_threads is None and cpu_affinity:
         qa_threads = len(cpu_affinity)
 
+    qa_timeout_s    = config.get('qa_timeout_s',    1800)
+    qa_max_attempts = config.get('qa_max_attempts',    2)
+    wf_mean_rms     = config.get('wf_mean_rms',    False)
+    wf_event_plots  = config.get('wf_event_plots', False)
+    wf_step_size    = config.get('wf_step_size',   50000)
+
     # QA entry point and interpreter, relative to analysis_dir (defaults = nTof layout).
     qa_script  = analysis_dir / config.get('qa_script_rel_path', 'ntof_daq_analysis/detector_qa.py')
     qa_python  = analysis_dir / config.get('qa_python_rel_path', '.venv/bin/python')
@@ -121,8 +149,15 @@ def run_watcher(config: dict, reset_signal_path: Path = None):
     print(f"[qa_watcher] cpu_nice        : {cpu_nice}")
     print(f"[qa_watcher] cpu_affinity    : {cpu_affinity if cpu_affinity else 'all cores'}")
     print(f"[qa_watcher] qa_threads      : {qa_threads if qa_threads else 'unlimited'}")
+    print(f"[qa_watcher] qa_timeout      : {f'{qa_timeout_s}s' if qa_timeout_s else 'none'}"
+          f"  max_attempts={qa_max_attempts}")
+    print(f"[qa_watcher] wf_mean_rms     : {wf_mean_rms}"
+          f"{f'  (step_size={wf_step_size:,})' if wf_mean_rms else ''}")
+    print(f"[qa_watcher] wf_event_plots  : {wf_event_plots}")
     _log('START', runs_dir=runs_dir, mode=mode, memory_kill_pct=f'{memory_kill_pct}%',
-         cpu_nice=cpu_nice, cpu_affinity=cpu_affinity, qa_threads=qa_threads)
+         cpu_nice=cpu_nice, cpu_affinity=cpu_affinity, qa_threads=qa_threads,
+         qa_timeout_s=qa_timeout_s, wf_mean_rms=wf_mean_rms,
+         wf_event_plots=wf_event_plots, wf_step_size=wf_step_size)
 
     state_path = reset_signal_path.parent / 'qa_state.json' if reset_signal_path else None
 
@@ -138,10 +173,41 @@ def run_watcher(config: dict, reset_signal_path: Path = None):
             sys.stdout.flush()
             idle_line = False
 
-    # Per-mode tracking state, keyed by (run_name, subrun_name)
-    seen_files:  dict = _load_state(state_path)  # 'all' mode: frozenset of filenames at last QA run
-    done_first:  set  = set()  # 'first' mode: subruns already processed
-    done_fnums:  dict = {}  # 'per_file' mode: set of completed file_nums
+    # Per-mode tracking state, keyed by (run_name, subrun_name).  All of it is
+    # persisted: 'first'/'per_file' progress used to be in-memory only, so every
+    # restart reprocessed subruns that had already completed.
+    seen_files, done_first, done_fnums, attempts = _load_state(state_path)
+
+    def _record(akey: str, status: str, mark_done, **logdetail):
+        """Post-QA bookkeeping shared by all three modes.
+
+        status is what _run_qa_monitored returned:
+          'ok'      — mark the unit done and clear its failure count.
+          'memory'  — killed because *system* RAM crossed the threshold, which is
+                      usually another process's fault (concurrent analysis jobs on
+                      this box routinely take several GB). Retried indefinitely and
+                      deliberately NOT counted against qa_max_attempts: giving up
+                      here would silently drop QA for a perfectly good subrun once
+                      something unrelated spiked memory twice.
+          'timeout' / 'error'
+                    — the QA itself wedged or failed. Counted, and once
+                      qa_max_attempts is reached the unit is marked done anyway so
+                      it cannot block every other run forever.
+        """
+        if status == 'ok':
+            attempts.pop(akey, None)
+            mark_done()
+            _log('QA_DONE', **logdetail)
+        elif status != 'memory':
+            n = attempts.get(akey, 0) + 1
+            attempts[akey] = n
+            if n >= qa_max_attempts:
+                mark_done()
+                _end_idle()
+                print(f"[qa_watcher] Giving up on {akey} after {n} failed attempts"
+                      f" ({status}) — skipping")
+                _log('QA_GIVEUP', attempts=n, reason=status, **logdetail)
+        _save_state(state_path, seen_files, done_first, done_fnums, attempts)
 
     while True:
         found_new = False
@@ -153,8 +219,9 @@ def run_watcher(config: dict, reset_signal_path: Path = None):
                     seen_files.clear()
                     done_first.clear()
                     done_fnums.clear()
+                    attempts.clear()
                     checked_stale_runs.clear()
-                    _save_state(state_path, seen_files)
+                    _save_state(state_path, seen_files, done_first, done_fnums, attempts)
                     _end_idle()
                     print("[qa_watcher] Reset: all runs will be reprocessed")
                 else:
@@ -163,8 +230,12 @@ def run_watcher(config: dict, reset_signal_path: Path = None):
                     done_first -= {k for k in done_first if k[0] in reset}
                     for key in list(done_fnums):
                         if key[0] in reset: del done_fnums[key]
+                    # attempts keys are 'run/subrun' or 'run/subrun#file_num';
+                    # clear the counts too so a reset run gets its full retries back.
+                    for akey in [k for k in attempts if k.split('/', 1)[0] in reset]:
+                        del attempts[akey]
                     checked_stale_runs -= reset
-                    _save_state(state_path, seen_files)
+                    _save_state(state_path, seen_files, done_first, done_fnums, attempts)
                     _end_idle()
                     print(f"[qa_watcher] Reset: {sorted(reset)} will be reprocessed")
 
@@ -210,15 +281,16 @@ def run_watcher(config: dict, reset_signal_path: Path = None):
                                   f"  n_files={len(stable)}  mem={mem_pct:.1f}%  free={free_mb:.0f}MB")
                             _log('QA_LAUNCH', run=run_dir.name, subrun=subrun_dir.name,
                                  n_files=len(stable), mem_pct=f'{mem_pct:.1f}%', free_mb=f'{free_mb:.0f}')
-                            completed_ok = _run_qa_monitored(
+                            qa_status = _run_qa_monitored(
                                 qa_python, qa_script, subrun_dir, run_config_path,
                                 'all', memory_kill_pct=memory_kill_pct,
                                 cpu_nice=cpu_nice, cpu_affinity=cpu_affinity,
-                                qa_threads=qa_threads)
-                            if completed_ok:
-                                seen_files[key] = current
-                                _save_state(state_path, seen_files)
-                                _log('QA_DONE', run=run_dir.name, subrun=subrun_dir.name)
+                                qa_threads=qa_threads, timeout_s=qa_timeout_s,
+                                wf_mean_rms=wf_mean_rms, wf_event_plots=wf_event_plots,
+                                wf_step_size=wf_step_size)
+                            _record(f'{key[0]}/{key[1]}', qa_status,
+                                    lambda: seen_files.__setitem__(key, current),
+                                    run=run_dir.name, subrun=subrun_dir.name)
                             found_new = True
 
                     elif mode == 'first':
@@ -230,14 +302,16 @@ def run_watcher(config: dict, reset_signal_path: Path = None):
                                       f"  file_num=0  mem={mem_pct:.1f}%  free={free_mb:.0f}MB")
                                 _log('QA_LAUNCH', run=run_dir.name, subrun=subrun_dir.name,
                                      file_num=0, mem_pct=f'{mem_pct:.1f}%', free_mb=f'{free_mb:.0f}')
-                                completed_ok = _run_qa_monitored(
+                                qa_status = _run_qa_monitored(
                                     qa_python, qa_script, subrun_dir, run_config_path,
                                     'first', memory_kill_pct=memory_kill_pct,
                                     cpu_nice=cpu_nice, cpu_affinity=cpu_affinity,
-                                    qa_threads=qa_threads)
-                                if completed_ok:
-                                    done_first.add(key)
-                                    _log('QA_DONE', run=run_dir.name, subrun=subrun_dir.name)
+                                    qa_threads=qa_threads, timeout_s=qa_timeout_s,
+                                    wf_mean_rms=wf_mean_rms, wf_event_plots=wf_event_plots,
+                                    wf_step_size=wf_step_size)
+                                _record(f'{key[0]}/{key[1]}', qa_status,
+                                        lambda: done_first.add(key),
+                                        run=run_dir.name, subrun=subrun_dir.name)
                                 found_new = True
 
                     elif mode == 'per_file':
@@ -250,15 +324,17 @@ def run_watcher(config: dict, reset_signal_path: Path = None):
                                   f"  file_num={fnum:03d}  mem={mem_pct:.1f}%  free={free_mb:.0f}MB")
                             _log('QA_LAUNCH', run=run_dir.name, subrun=subrun_dir.name,
                                  file_num=fnum, mem_pct=f'{mem_pct:.1f}%', free_mb=f'{free_mb:.0f}')
-                            completed_ok = _run_qa_monitored(
+                            qa_status = _run_qa_monitored(
                                 qa_python, qa_script, subrun_dir, run_config_path,
                                 'per_file', file_num=fnum, memory_kill_pct=memory_kill_pct,
                                 cpu_nice=cpu_nice, cpu_affinity=cpu_affinity,
-                                qa_threads=qa_threads)
-                            if completed_ok:
-                                completed.add(fnum)
-                                _log('QA_DONE', run=run_dir.name, subrun=subrun_dir.name,
-                                     file_num=fnum)
+                                qa_threads=qa_threads, timeout_s=qa_timeout_s,
+                                wf_mean_rms=wf_mean_rms, wf_event_plots=wf_event_plots,
+                                wf_step_size=wf_step_size)
+                            done_fnums[key] = completed  # so _record's _save_state sees it
+                            _record(f'{key[0]}/{key[1]}#{fnum}', qa_status,
+                                    lambda f=fnum: completed.add(f),
+                                    run=run_dir.name, subrun=subrun_dir.name, file_num=fnum)
                             found_new = True
                         done_fnums[key] = completed
 
@@ -288,25 +364,73 @@ def run_watcher(config: dict, reset_signal_path: Path = None):
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _load_state(state_path: Path) -> dict:
+_STATE_VERSION = 2
+
+
+def _state_key(s: str) -> tuple:
+    """'run/subrun' -> ('run', 'subrun'); tolerates a missing subrun part."""
+    parts = s.split('/', 1)
+    return (parts[0], parts[1]) if len(parts) == 2 else (parts[0], '')
+
+
+def _load_state(state_path: Path) -> tuple:
+    """
+    Load watcher progress as (seen_files, done_first, done_fnums, attempts).
+
+      seen_files : {(run, subrun): frozenset(filenames)}  — 'all' mode
+      done_first : {(run, subrun)}                        — 'first' mode
+      done_fnums : {(run, subrun): set(file_nums)}        — 'per_file' mode
+      attempts   : {'run/subrun[#file_num]': n_failures}
+
+    A version-less file is the legacy layout, where the whole document was the
+    'all'-mode seen_files map; it is upgraded in place on the next save rather
+    than discarded.
+    """
+    empty = ({}, set(), {}, {})
     if state_path is None or not state_path.exists():
-        return {}
+        return empty
     try:
         with open(state_path) as f:
             raw = json.load(f)
-        return {tuple(k.split('/', 1)): frozenset(v) for k, v in raw.items()}
     except Exception as e:
         print(f"[qa_watcher] Could not load state from {state_path}: {e}")
-        return {}
+        return empty
+
+    try:
+        if not isinstance(raw, dict):
+            raise ValueError('state file is not a JSON object')
+        if 'version' not in raw:
+            return ({_state_key(k): frozenset(v) for k, v in raw.items()}, set(), {}, {})
+        return (
+            {_state_key(k): frozenset(v) for k, v in (raw.get('seen_files') or {}).items()},
+            {_state_key(k) for k in (raw.get('done_first') or [])},
+            {_state_key(k): set(v) for k, v in (raw.get('done_fnums') or {}).items()},
+            dict(raw.get('attempts') or {}),
+        )
+    except Exception as e:
+        print(f"[qa_watcher] Malformed state in {state_path} ({e}) — starting fresh")
+        return empty
 
 
-def _save_state(state_path: Path, seen_files: dict):
+def _save_state(state_path: Path, seen_files: dict, done_first: set,
+                done_fnums: dict, attempts: dict):
+    """Persist progress for every mode so a restart resumes instead of redoing work."""
     if state_path is None:
         return
     try:
-        raw = {f"{k[0]}/{k[1]}": sorted(v) for k, v in seen_files.items()}
-        with open(state_path, 'w') as f:
-            json.dump(raw, f, indent=2)
+        payload = {
+            'version':    _STATE_VERSION,
+            'seen_files': {f'{k[0]}/{k[1]}': sorted(v) for k, v in seen_files.items()},
+            'done_first': sorted(f'{k[0]}/{k[1]}' for k in done_first),
+            'done_fnums': {f'{k[0]}/{k[1]}': sorted(v) for k, v in done_fnums.items()},
+            'attempts':   dict(attempts),
+        }
+        # Write-then-rename: a crash mid-write leaves the previous state intact
+        # instead of a truncated file that would be discarded as malformed.
+        tmp = state_path.with_name(state_path.name + '.part')
+        with open(tmp, 'w') as f:
+            json.dump(payload, f, indent=2)
+        tmp.replace(state_path)
     except Exception as e:
         print(f"[qa_watcher] Could not save state to {state_path}: {e}")
 
@@ -394,18 +518,43 @@ def _thread_limited_env(qa_threads) -> dict:
     return env
 
 
+def _kill_qa(proc, run_label: str):
+    """SIGTERM the QA process, escalating to SIGKILL if it ignores it."""
+    proc.terminate()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+    print(f"[qa_watcher] QA process killed ({run_label}) — will retry next poll")
+
+
 def _run_qa_monitored(qa_python, qa_script: Path, subrun_dir: Path,
                        run_config_path: Path, mode: str, file_num: int = None,
                        memory_kill_pct: float = 80, monitor_interval: float = 1.0,
-                       cpu_nice=19, cpu_affinity=None, qa_threads=None) -> bool:
+                       cpu_nice=19, cpu_affinity=None, qa_threads=None,
+                       timeout_s: float = 1800, wf_mean_rms: bool = False,
+                       wf_event_plots: bool = False, wf_step_size: int = None) -> str:
     """
-    Launch detector_qa.py as a subprocess and monitor system RAM while it runs.
+    Launch detector_qa.py as a subprocess and monitor it while it runs.
 
-    Polls every monitor_interval seconds (default 1 s).  If system RAM usage
-    crosses memory_kill_pct (default 80%), the process is terminated (SIGTERM,
-    then SIGKILL after 5 s) and False is returned.
-    Returns True if the process completed without being killed.
-    A killed run is NOT marked done in the caller's state — it will be retried.
+    Polls every monitor_interval seconds (default 1 s) and kills the process
+    (SIGTERM, then SIGKILL after 5 s) if either:
+      - system RAM usage crosses memory_kill_pct (default 80%), or
+      - the process has run longer than timeout_s (default 1800 s).
+
+    Returns one of:
+      'ok'      — exited 0 on its own
+      'memory'  — killed on the system memory threshold
+      'timeout' — killed for exceeding timeout_s
+      'error'   — exited non-zero
+    The caller distinguishes these because they deserve different retry policies
+    (see _record in run_watcher): a memory kill is usually caused by an unrelated
+    process and must stay retryable, while a timeout means the QA itself wedged.
+
+    The timeout is what keeps a single pathological subrun from stalling the whole
+    watcher: the run loop is serial, so before it existed a wedged QA process
+    blocked every other run for as long as it hung.
 
     cpu_nice / cpu_affinity / qa_threads throttle CPU use so the QA yields to the
     DAQ (see _build_qa_command and _thread_limited_env).
@@ -416,31 +565,40 @@ def _run_qa_monitored(qa_python, qa_script: Path, subrun_dir: Path,
            '--mode', mode]
     if file_num is not None:
         cmd += ['--file_num', str(file_num)]
+    cmd.append('--wf-mean-rms'    if wf_mean_rms    else '--no-wf-mean-rms')
+    cmd.append('--wf-event-plots' if wf_event_plots else '--no-wf-event-plots')
+    if wf_step_size:
+        cmd += ['--wf-step-size', str(int(wf_step_size))]
 
     cmd = _build_qa_command(cmd, cpu_nice, cpu_affinity)
     env = _thread_limited_env(qa_threads)
 
     run_label = f"{subrun_dir.parent.name}/{subrun_dir.name}"
-    proc = subprocess.Popen(cmd, env=env)
+    proc      = subprocess.Popen(cmd, env=env)
+    started   = time.time()
 
     while proc.poll() is None:
         time.sleep(monitor_interval)
+
+        elapsed = time.time() - started
+        if timeout_s and elapsed >= timeout_s:
+            print(f"\n[qa_watcher] QA exceeded {timeout_s}s ({elapsed:.0f}s elapsed)"
+                  f" — killing QA process ({run_label})")
+            _log('QA_TIMEOUT', run=subrun_dir.parent.name, subrun=subrun_dir.name,
+                 elapsed_s=f'{elapsed:.0f}', timeout_s=timeout_s)
+            _kill_qa(proc, run_label)
+            return 'timeout'
+
         mem_pct, free_mb = _mem_usage_pct()
         if mem_pct >= memory_kill_pct:
             print(f"\n[qa_watcher] Memory {mem_pct:.1f}% >= {memory_kill_pct}%"
                   f" — killing QA process ({run_label})")
             _log('QA_KILLED', run=subrun_dir.parent.name, subrun=subrun_dir.name,
                  mem_pct=f'{mem_pct:.1f}%', free_mb=f'{free_mb:.0f}', threshold=f'{memory_kill_pct}%')
-            proc.terminate()
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait()
-            print(f"[qa_watcher] QA process killed ({run_label}) — will retry next poll")
-            return False
+            _kill_qa(proc, run_label)
+            return 'memory'
 
-    return proc.returncode == 0
+    return 'ok' if proc.returncode == 0 else 'error'
 
 
 def _stable_combined_files(combined_dir: Path, settle_s: float = 20.0) -> list:

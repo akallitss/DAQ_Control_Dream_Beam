@@ -21,6 +21,14 @@ Modes:
     first    — use only file_num == 0 (fast for long runs)
     per_file — use only the single file_num given by --file_num
 
+Waveform plots (both OFF by default — they dominate the runtime):
+    --wf-mean-rms      per-strip mean/RMS colour maps from the decoded files.
+                       Reduces every decoded event in the subrun, so it costs far
+                       more than every other plot combined; --wf-step-size tunes
+                       the batch size it streams with.
+    --wf-event-plots   per-event waveform+hits figures for beam runs
+                       (WF_N_EVENTS evenly-spaced events per detector).
+
 Detectors processed: every included detector with a dict-valued dream_feus map
 (P2, mx17, ...); scintillators/PMTs are skipped.
 """
@@ -47,6 +55,20 @@ WF_N_EVENTS          = 30    # number of evenly-spaced events to plot
 # beam_types for which per-event waveform figures are produced
 WF_BEAM_TYPES        = ('sps_beam', 'neutrons', 'noise-generator')
 
+# Waveform plots are opt-in: they cost far more than the rest of the QA put
+# together, and the watcher cannot keep up with the DAQ while they run.
+WF_MEAN_RMS_DEFAULT    = False
+WF_EVENT_PLOTS_DEFAULT = False
+
+# Events per batch when streaming decoded files in _load_wf_stats_from_decoded.
+# Each batch pays a fixed cost (one groupby + three Series.add re-alignments
+# against a MultiIndex that grows to n_channels*n_samples), so small batches are
+# pathologically slow: measured on a 2.34 M-entry decoded file, step_size=200
+# took 778 s vs 18 s at 50_000 — a 43x difference for identical output. Peak RSS
+# at 50_000 is ~400 MB; 100_000 gains only ~4% for +45% memory and 200_000 is
+# slower again, so 50_000 is the knee of the curve.
+WF_STEP_SIZE         = 50_000
+
 
 # ---------------------------------------------------------------------------
 # Entry point
@@ -59,16 +81,31 @@ def main():
     parser.add_argument('--mode',        default='all', choices=['all', 'first', 'per_file'])
     parser.add_argument('--file_num',    type=int,      default=None,
                         help='File number to process (per_file mode only)')
+    parser.add_argument('--wf-mean-rms', action=argparse.BooleanOptionalAction,
+                        default=WF_MEAN_RMS_DEFAULT,
+                        help='Per-strip waveform mean/RMS maps from the decoded '
+                             'files (slow — off by default)')
+    parser.add_argument('--wf-event-plots', action=argparse.BooleanOptionalAction,
+                        default=WF_EVENT_PLOTS_DEFAULT,
+                        help='Per-event waveform figures for beam runs (off by default)')
+    parser.add_argument('--wf-step-size', type=int, default=WF_STEP_SIZE,
+                        help=f'Events per batch for the mean/RMS reduction '
+                             f'(default {WF_STEP_SIZE})')
     args = parser.parse_args()
 
-    run_qa(Path(args.subrun_dir), Path(args.run_config), args.mode, args.file_num)
+    run_qa(Path(args.subrun_dir), Path(args.run_config), args.mode, args.file_num,
+           wf_mean_rms=args.wf_mean_rms, wf_event_plots=args.wf_event_plots,
+           wf_step_size=args.wf_step_size)
 
 
 # ---------------------------------------------------------------------------
 # Core QA runner
 # ---------------------------------------------------------------------------
 
-def run_qa(subrun_dir: Path, run_config_path: Path, mode: str = 'all', file_num: int = None):
+def run_qa(subrun_dir: Path, run_config_path: Path, mode: str = 'all', file_num: int = None,
+           wf_mean_rms: bool = WF_MEAN_RMS_DEFAULT,
+           wf_event_plots: bool = WF_EVENT_PLOTS_DEFAULT,
+           wf_step_size: int = WF_STEP_SIZE):
     with open(run_config_path) as f:
         run_cfg = json.load(f)
 
@@ -86,17 +123,50 @@ def run_qa(subrun_dir: Path, run_config_path: Path, mode: str = 'all', file_num:
 
     included = set(run_cfg.get('included_detectors') or [])
 
+    # Detectors to plot, paired with their FEU sets.  Scintillators and other
+    # non-strip detectors have no dream_feus dict and are skipped.
+    dets = []
     for det_cfg in run_cfg.get('detectors', []):
         name = det_cfg['name']
         if included and name not in included:
             continue
         if not isinstance(det_cfg.get('dream_feus'), dict):
-            continue  # Skip scintillators and non-strip detectors
+            continue
+        dets.append((name, {v[0] for v in det_cfg['dream_feus'].values()}))
 
-        feu_ids = {v[0] for v in det_cfg['dream_feus'].values()}
+    if not dets:
+        print('[qa] No strip detectors to process, skipping')
+        return
 
-        df = _load_hits(combined_dir, feu_ids, mode, file_num)
-        if df is None or df.empty:
+    # Read the combined hits ONCE and slice per detector below.  Previously each
+    # detector called _load_hits itself, so the entire 'hits' tree (~370 MB) was
+    # re-read and re-decompressed once per detector — five full passes per subrun
+    # to keep a different FEU subset each time.
+    df_all = _load_hits(combined_dir, mode, file_num)
+    if df_all is None or df_all.empty:
+        print('[qa] No hits found in subrun, skipping')
+        return
+
+    # Waveform mean/RMS is reduced once per FEU across the whole subrun rather
+    # than inside the detector loop: detectors can share a FEU (the uRWELL front
+    # and back both read FEU 1), and the per-detector version reduced those same
+    # decoded files twice.
+    wf_stats = {}
+    if wf_mean_rms:
+        decoded_dir = subrun_dir / DECODED_ROOT_DIR
+        all_feus    = sorted({f for _, feus in dets for f in feus})
+        if not decoded_dir.exists():
+            print(f'[qa/wf] No {DECODED_ROOT_DIR}/ in {subrun_dir}, skipping mean/RMS')
+        elif all_feus:
+            print(f'[qa/wf] Computing per-strip mean/RMS for FEUs {all_feus} '
+                  f'(step_size={wf_step_size:,}) ...')
+            wf_stats = _load_wf_stats_from_decoded(
+                decoded_dir, all_feus, step_size=wf_step_size,
+                mode=mode, file_num=file_num)
+
+    for name, feu_ids in dets:
+        df = df_all[df_all['feu'].isin(feu_ids)].copy()
+        if df.empty:
             print(f'[qa] {name} — no hits found, skipping')
             continue
 
@@ -118,11 +188,12 @@ def run_qa(subrun_dir: Path, run_config_path: Path, mode: str = 'all', file_num:
         _plot_hits_per_event(df, title, out_dir)
         _plot_time_vs_channel(df, title, out_dir)
 
-        # --- Waveform mean/RMS stats (all runs) ---
-        _plot_wf_stats(subrun_dir, feu_ids, title, out_dir, ns_per_sample)
+        # --- Waveform mean/RMS maps (opt-in: --wf-mean-rms) ---
+        if wf_stats:
+            _plot_wf_stats(wf_stats, sorted(feu_ids), title, out_dir, ns_per_sample)
 
-        # --- Beam runs: per-event waveform plots ---
-        if run_cfg.get('beam_type') in WF_BEAM_TYPES:
+        # --- Beam runs: per-event waveform plots (opt-in: --wf-event-plots) ---
+        if wf_event_plots and run_cfg.get('beam_type') in WF_BEAM_TYPES:
             _plot_beam_waveforms(subrun_dir, df, feu_ids, title, out_dir, ns_per_sample)
 
         plt.close('all')
@@ -138,8 +209,22 @@ def _extract_file_num(filename: str):
     return int(m.group(1)) if m else None
 
 
-def _load_hits(combined_dir: Path, feu_ids: set, mode: str,
-               file_num: int = None) -> pd.DataFrame:
+def _decoded_file_num(filename: str):
+    """File number of a decoded per-FEU file, e.g. ..._000_01.root -> 0.
+
+    Decoded files are named <...>_<file_num:03d>_<feu:02d>.root, so the combined
+    'feu-combined' pattern used by _extract_file_num does not match them.
+    """
+    m = re.search(r'_(\d{3})_(\d{2})\.root$', filename)
+    return int(m.group(1)) if m else None
+
+
+def _load_hits(combined_dir: Path, mode: str, file_num: int = None) -> pd.DataFrame:
+    """Load the subrun's combined hits for every FEU.
+
+    Returns the full frame; callers slice it per detector with df['feu'].isin(...)
+    so one read serves all detectors.
+    """
     all_files = sorted(
         f for f in combined_dir.iterdir()
         if f.suffix == '.root' and '_datrun_' in f.name and 'feu-combined' in f.name
@@ -157,12 +242,10 @@ def _load_hits(combined_dir: Path, feu_ids: set, mode: str,
         return None
 
     try:
-        df = uproot.concatenate([f'{f}:hits' for f in all_files], library='pd')
+        return uproot.concatenate([f'{f}:hits' for f in all_files], library='pd')
     except Exception as e:
         print(f'[qa] Failed to load hits: {e}')
         return None
-
-    return df[df['feu'].isin(feu_ids)].copy()
 
 
 # ---------------------------------------------------------------------------
@@ -483,9 +566,10 @@ def _plot_waveform_hits_event(waveforms: dict, df_all: pd.DataFrame, evt_id: int
     _save(fig, out_dir, f'waveform_event_{evt_id:06d}.png')
 
 
-def _load_wf_stats_from_decoded(decoded_dir: Path, feu_ids) -> dict:
+def _load_wf_stats_from_decoded(decoded_dir: Path, feu_ids, step_size: int = WF_STEP_SIZE,
+                                mode: str = 'all', file_num: int = None) -> dict:
     """
-    Stream all decoded root files and compute per-(channel, sample) mean and
+    Stream the decoded root files and compute per-(channel, sample) mean and
     population-std (RMS) amplitude across all events.
 
     Files are read in bounded event-batches, and each batch is reduced to
@@ -495,6 +579,15 @@ def _load_wf_stats_from_decoded(decoded_dir: Path, feu_ids) -> dict:
     previous version concatenated every event of every file into one frame and
     could exhaust RAM on large subruns.  The mean/RMS returned are exact (all
     events), identical to a single groupby over the whole subrun.
+
+    mode/file_num select the same decoded files that _load_hits selects combined
+    files, so 'first' and 'per_file' actually limit this reduction.  Previously it
+    ignored both and reduced every decoded file in the subrun, which defeated the
+    point of 'first' mode on the single most expensive step of the QA.
+
+    step_size is the batch size in events — see WF_STEP_SIZE; small values are
+    pathologically slow because the per-batch reduction cost is nearly fixed.
+
     Returns {feu: DataFrame(channel, sample, mean, rms)}.
     """
     result    = {}
@@ -505,6 +598,11 @@ def _load_wf_stats_from_decoded(decoded_dir: Path, feu_ids) -> dict:
         feu_files = [f for f in all_files if f.suffix == '.root' and feu_str in f.name
                      and 'pedestal' not in f.name.lower()]  # skip 32-sample pedestal files
 
+        if mode == 'first':
+            feu_files = [f for f in feu_files if _decoded_file_num(f.name) == 0]
+        elif mode == 'per_file' and file_num is not None:
+            feu_files = [f for f in feu_files if _decoded_file_num(f.name) == file_num]
+
         # Running per-(channel, sample) totals, indexed by a (channel, sample)
         # MultiIndex.  None until the first non-empty batch is accumulated.
         cnt = tot = sq = None
@@ -512,7 +610,7 @@ def _load_wf_stats_from_decoded(decoded_dir: Path, feu_ids) -> dict:
             try:
                 batches = uproot.iterate(
                     f'{fpath}:nt', ['sample', 'channel', 'amplitude'],
-                    step_size=200, library='np')
+                    step_size=step_size, library='np')
                 for batch in batches:
                     samples_arr, channels_arr, amps_arr = (
                         batch['sample'], batch['channel'], batch['amplitude'])
@@ -652,19 +750,23 @@ def _plot_wf_mean_rms_per_strip(stats: dict, feu_ids, title: str, out_dir: Path)
         _save(fig, out_dir, f'waveform_strip_mean_rms_feu{feu:02d}.png')
 
 
-def _plot_wf_stats(subrun_dir: Path, feu_ids, title: str, out_dir: Path,
+def _plot_wf_stats(wf_stats: dict, feu_ids, title: str, out_dir: Path,
                    ns_per_sample: float = WF_NS_PER_SAMPLE) -> None:
-    """Compute and save per-strip waveform mean/RMS plots for any run type."""
-    decoded_dir = subrun_dir / DECODED_ROOT_DIR
-    if not decoded_dir.exists() or not feu_ids:
+    """Save one detector's per-strip waveform mean/RMS plots.
+
+    Takes stats already reduced by _load_wf_stats_from_decoded (shared across all
+    detectors in the subrun) rather than reducing the decoded files itself, so a
+    FEU read by two detectors is only reduced once.  Both plot helpers skip FEUs
+    absent from wf_stats, so passing the shared dict is safe.
+    """
+    if not wf_stats or not feu_ids:
+        return
+    if not any(f in wf_stats for f in feu_ids):
         return
 
-    print(f'[qa/wf] Computing per-strip mean/RMS across all decoded files ...')
-    wf_stats = _load_wf_stats_from_decoded(decoded_dir, sorted(feu_ids))
-    if wf_stats:
-        _plot_wf_mean_rms(wf_stats, sorted(feu_ids), title, out_dir, ns_per_sample)
-        _plot_wf_mean_rms_per_strip(wf_stats, sorted(feu_ids), title, out_dir)
-        print(f'[qa/wf] Saved waveform mean/RMS plots → {out_dir}')
+    _plot_wf_mean_rms(wf_stats, sorted(feu_ids), title, out_dir, ns_per_sample)
+    _plot_wf_mean_rms_per_strip(wf_stats, sorted(feu_ids), title, out_dir)
+    print(f'[qa/wf] Saved waveform mean/RMS plots → {out_dir}')
 
 
 def _plot_beam_waveforms(subrun_dir: Path, df: pd.DataFrame, feu_ids,

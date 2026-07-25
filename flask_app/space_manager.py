@@ -320,22 +320,25 @@ def verify_run(disk: str, run: str) -> dict:
 def _apply_local_guards(v: dict, run: str, act: str, newest: str) -> dict:
     """Downgrade a verify verdict for runs that must never be deleted no matter
     what EOS says: the active run, the newest run on disk, and runs with
-    incomplete subruns."""
+    incomplete subruns. The guard text is APPENDED to the EOS verdict, never
+    replacing it — the guard says why the run is not deletable, not whether it
+    is backed up, and hiding the backup status reads as 'not on EOS' in the
+    GUI."""
     v['active'] = (run == act)
     v['newest'] = (run == newest)
+    guard = ''
     if v['active']:
+        guard = 'currently acquiring — never deletable while active'
+    elif v['newest']:
+        guard = 'newest run on disk (possibly still being written) — refusing'
+    else:
+        inc = incomplete_subruns(_runs_root() / run)
+        if inc:
+            guard = (f'{len(inc)} subrun(s) missing .subrun_complete '
+                     f'(possibly mid-write) — refusing')
+    if guard:
         v['safe'] = False
-        v['reason'] = 'currently acquiring — never deletable while active'
-        return v
-    if v['newest']:
-        v['safe'] = False
-        v['reason'] = 'newest run on disk (possibly still being written) — refusing'
-        return v
-    inc = incomplete_subruns(_runs_root() / run)
-    if inc:
-        v['safe'] = False
-        v['reason'] = (f'{len(inc)} subrun(s) missing .subrun_complete '
-                       f'(possibly mid-write) — refusing')
+        v['reason'] = f"{v['reason']} · {guard}" if v.get('reason') else guard
     return v
 
 

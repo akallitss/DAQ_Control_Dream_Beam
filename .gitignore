@@ -220,6 +220,9 @@ config/gui_run_config.json
 config/json_run_configs/
 
 # Runtime state written by the GUI / watchers — machine-specific, never shared
+# (logs/*.log is covered by the *.log rule above; these are the JSON siblings,
+# e.g. logs/space_scan_hint.json, a measured listing-time hint for the scanner)
+logs/*.json
 config/*_state.json
 config/processor_config_nov25.json
 beam_monitor/logs/

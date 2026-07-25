@@ -16,6 +16,7 @@ import pty
 import select
 import threading
 import time
+import uuid
 import json
 from datetime import datetime, timedelta
 import pandas as pd
@@ -364,6 +365,23 @@ def restart_all():
     try:
         subprocess.Popen([f"{BASH_DIR}/restart_daq_tmux_processes.sh"])
         return jsonify({"success": True, "message": "All processes restarted"})
+    except Exception as e:
+        return jsonify({"success": False, "message": str(e)}), 500
+
+
+@app.route("/restart_flask", methods=["POST"])
+def restart_flask():
+    """Restart ONLY the Flask GUI server (tmux `flask_server`), leaving the DAQ,
+    HV, and watcher sessions running — the "Restart GUI" button. Picks up edited
+    Python/template code without disturbing a live run.
+
+    The restart runs detached (screen) because it kills the process serving this
+    request, so this response is sent ~2 s before the server goes down; the GUI
+    drops for ~3 s and the page reconnects itself."""
+    try:
+        subprocess.Popen([f"{BASH_DIR}/restart_flask.sh"])
+        return jsonify({"success": True,
+                        "message": "GUI restarting — reconnecting in a few seconds…"})
     except Exception as e:
         return jsonify({"success": False, "message": str(e)}), 500
 
@@ -1361,15 +1379,57 @@ def system_stats_history():
 # beam_monitor/beam_intensity_controller.py). Flask only reads the watcher's
 # published state and CSV history. Intensity is in 1e10 protons per spill.
 
+# A published state older than this is not "the beam", it's a memory of it: the
+# watcher republishes every ~30 s (bridge every 20 s), so anything past a few
+# minutes means the chain is broken somewhere (lxplus watcher dead, Kerberos
+# expired, EOS unreachable) and the on/off answer is UNKNOWN, not the last one
+# seen. Same cutoff as get_beam_watcher_status() in daq_status.py.
+BEAM_STALE_S = float(os.environ.get("SPS_BEAM_STALE_S", 180))
+
+
 def _beam_read_state():
     """The beam watcher's latest published state, or a disconnected stub if it isn't
-    running yet / hasn't written the file."""
+    running yet / hasn't written the file.
+
+    Adds `stale`/`age_s`: freshness is judged from the payload timestamp, NOT the
+    file mtime — beam_bridge.py rewrites the local copy on every poll, so a frozen
+    state pulled from EOS still looks freshly written on disk. When stale, beam_on
+    is forced to None so nothing downstream can report a two-day-old BEAM ON as
+    current."""
     try:
         with open(BEAM_STATE_PATH) as f:
-            return json.load(f)
+            state = json.load(f)
     except Exception:
-        return {"connected": False, "last_error": "beam watcher not running",
+        return {"connected": False, "stale": True, "age_s": None,
+                "last_error": "beam watcher not running",
                 "unit": BEAM_UNIT, "beam_on": None}
+
+    try:
+        stamp = state.get("timestamp") or state.get("updated")
+        age = (datetime.now() - datetime.fromisoformat(stamp)).total_seconds()
+    except Exception:
+        age = None          # unparseable/absent stamp -> treat as unknown age
+    state["age_s"] = age
+    state["stale"] = age is None or age > BEAM_STALE_S
+    if state["stale"]:
+        state["beam_on"] = None
+        if not state.get("last_error"):
+            state["last_error"] = (
+                f"beam state has not been updated for {_fmt_age(age)} "
+                "— is the lxplus watcher / beam bridge running?"
+                if age is not None else
+                "beam state has no usable timestamp — cannot tell if it is current")
+    return state
+
+
+def _fmt_age(seconds):
+    """Coarse human age ('4 min', '2 d') for stale-data messages."""
+    if seconds is None:
+        return "unknown"
+    for div, unit in ((86400, "d"), (3600, "h"), (60, "min")):
+        if seconds >= div:
+            return f"{seconds / div:.0f} {unit}"
+    return f"{seconds:.0f} s"
 
 
 @app.route("/beam/status")
@@ -1478,6 +1538,189 @@ def space_scan():
         return jsonify(space_manager.scan(disk))
     except Exception as e:
         return jsonify({"success": False, "message": str(e)}), 500
+
+
+# --- Background jobs for the long space operations -------------------------
+# The EOS-backed operations take ~9 s (listing) to minutes (deleting), which is
+# too long to hold a request open and gives the GUI nothing to draw. Each one
+# runs on a worker thread that publishes progress into _space_jobs; the browser
+# starts a job, then polls /space/job/<id>.
+#
+# Honesty note on the bar: the `xrdfs ls -R` listing CANNOT be tracked. It
+# emits nothing for ~8.8 s and then dumps every line in ~0.06 s, because the
+# cost is connect + Kerberos + the server-side walk. So the listing phase
+# reports indeterminate and the GUI animates it against the previous run's
+# duration (space_manager.listing_estimate_s), clearly labelled as an estimate.
+# The phases after it — per-run verification, per-item deletion — are counted
+# for real.
+_space_jobs = {}
+_space_jobs_lock = threading.Lock()
+_SPACE_JOB_TTL = 900        # forget finished jobs after 15 min
+
+
+def _space_job_prune():
+    now = time.time()
+    for jid in [j for j, v in _space_jobs.items()
+                if v.get("finished_at") and now - v["finished_at"] > _SPACE_JOB_TTL]:
+        _space_jobs.pop(jid, None)
+
+
+def _space_job_start(kind, fn):
+    """Run fn(progress) on a worker thread; return the new job id."""
+    jid = uuid.uuid4().hex[:12]
+    job = {"id": jid, "kind": kind, "phase": "starting", "done": 0, "total": None,
+           "msg": "", "items": [], "running": True, "result": None, "error": None,
+           "started_at": time.time(), "finished_at": None,
+           "listing_estimate_s": space_manager.listing_estimate_s()}
+    with _space_jobs_lock:
+        _space_job_prune()
+        _space_jobs[jid] = job
+
+    def progress(phase, done, total, msg, item=None):
+        with _space_jobs_lock:
+            job.update(phase=phase, done=done, total=total, msg=msg)
+            if item is not None:
+                job["items"].append(item)
+
+    def run():
+        try:
+            out = fn(progress)
+            with _space_jobs_lock:
+                job["result"] = out
+        except Exception as e:
+            with _space_jobs_lock:
+                job["error"] = str(e)
+        finally:
+            with _space_jobs_lock:
+                job["running"] = False
+                job["finished_at"] = time.time()
+
+    threading.Thread(target=run, daemon=True, name=f"space-{kind}-{jid}").start()
+    return jid
+
+
+@app.route("/space/estimate")
+def space_estimate():
+    """How long the last EOS listing took. The GUI animates the untrackable
+    listing phase against this, so the bar is calibrated to the real link."""
+    return jsonify({"listing_s": space_manager.listing_estimate_s()})
+
+
+@app.route("/space/job/<job_id>")
+def space_job_status(job_id):
+    """Poll a running space job. `since` trims the per-item log to what the
+    caller has not seen yet, so polling stays cheap on long deletes."""
+    with _space_jobs_lock:
+        job = _space_jobs.get(job_id)
+        if job is None:
+            return jsonify({"success": False, "message": "unknown or expired job"}), 404
+        try:
+            since = int(request.args.get("since", 0))
+        except ValueError:
+            since = 0
+        out = {k: v for k, v in job.items() if k != "items"}
+        out["items"] = job["items"][since:]
+        out["n_items"] = len(job["items"])
+        out["elapsed"] = round(time.time() - job["started_at"], 2)
+    return jsonify(out)
+
+
+@app.route("/space/job/check", methods=["POST"])
+def space_job_check():
+    """Start an EOS safety check. mode=prune runs the per-component scan, any
+    other value runs the whole-run scan."""
+    data = request.get_json(silent=True) or {}
+    mode = data.get("mode", "prune")
+    if mode == "prune":
+        fn = lambda p: space_manager.component_scan(verify=True, force=True, progress=p)
+    else:
+        disk = data.get("disk", "data")
+        if disk not in space_manager.DISKS:
+            return jsonify({"success": False, "message": f"unknown disk {disk}"}), 400
+        fn = lambda p: space_manager.scan(disk, force=True, progress=p)
+    return jsonify({"job": _space_job_start("check", fn)})
+
+
+@app.route("/space/job/delete_components", methods=["POST"])
+def space_job_delete_components():
+    """Start a component delete. Same guards as the synchronous route —
+    space_manager re-verifies every piece against a fresh EOS listing."""
+    data = request.get_json(silent=True) or {}
+    items = data.get("items") or []
+    confirm = data.get("confirm")
+    if not isinstance(items, list) or not items:
+        return jsonify({"success": False, "message": "nothing selected"}), 400
+    if confirm != "DELETE":
+        return jsonify({"success": False, "message": "confirmation text did not match"}), 400
+    comps = sorted({i.get("component") for i in items if isinstance(i, dict)} - {None})
+    runs = sorted({i.get("run") for i in items if isinstance(i, dict)} - {None})
+
+    def fn(p):
+        out = space_manager.delete_components(items, progress=p)
+        log_event("SPACE_DELETE_COMPONENTS", "disk_space",
+                  runs=",".join(runs), components=",".join(comps),
+                  items=len(items), freed=out["freed_h"],
+                  ok=out["n_deleted"], failed=out["n_failed"])
+        out["success"] = out["n_failed"] == 0
+        out["usage"] = space_manager.disk_usage().get("data", {})
+        return out
+
+    return jsonify({"job": _space_job_start("delete", fn)})
+
+
+@app.route("/space/components")
+def space_components():
+    """The run -> subrun -> component tree with a delete verdict per component.
+
+    verify=0 skips EOS entirely (instant, works offline) so the tab can paint
+    the breakdown immediately; verify=1 issues ONE recursive EOS listing for
+    the whole tree and marks each component safe/unsafe from it.
+    """
+    verify = request.args.get("verify", "1") not in ("0", "false", "no")
+    force = request.args.get("force", "0") in ("1", "true", "yes")
+    try:
+        return jsonify(space_manager.component_scan(verify=verify, force=force))
+    except Exception as e:
+        return jsonify({"success": False, "message": str(e)}), 500
+
+
+@app.route("/space/preflight", methods=["POST"])
+def space_preflight():
+    """Dry-run a component selection: bytes freed, what is refused and why, and
+    which subruns the processor would reprocess. Read-only — deletes nothing."""
+    data = request.get_json(silent=True) or {}
+    items = data.get("items") or []
+    if not isinstance(items, list):
+        return jsonify({"success": False, "message": "items must be a list"}), 400
+    try:
+        return jsonify(space_manager.preflight_components(items))
+    except Exception as e:
+        return jsonify({"success": False, "message": str(e)}), 500
+
+
+@app.route("/space/delete_components", methods=["POST"])
+def space_delete_components():
+    """Delete selected (run, subrun, component) triples. space_manager
+    re-verifies every one against a FRESH EOS listing before removing it, so
+    the client verdict is never trusted."""
+    data = request.get_json(silent=True) or {}
+    items = data.get("items") or []
+    confirm = data.get("confirm")
+    if not isinstance(items, list) or not items:
+        return jsonify({"success": False, "message": "nothing selected"}), 400
+    # Typed confirmation must match exactly, so a stray click can't delete.
+    if confirm != "DELETE":
+        return jsonify({"success": False, "message": "confirmation text did not match"}), 400
+    out = space_manager.delete_components(items)
+    comps = sorted({i.get("component") for i in items if isinstance(i, dict)} - {None})
+    runs = sorted({i.get("run") for i in items if isinstance(i, dict)} - {None})
+    log_event("SPACE_DELETE_COMPONENTS", "disk_space",
+              runs=",".join(runs), components=",".join(comps),
+              items=len(items), freed=out["freed_h"],
+              ok=out["n_deleted"], failed=out["n_failed"])
+    out["success"] = out["n_failed"] == 0
+    out["usage"] = space_manager.disk_usage().get("data", {})
+    return jsonify(out)
 
 
 @app.route("/space/delete", methods=["POST"])

@@ -7,18 +7,40 @@ nTof_x17_DAQ space_manager).
 Provides a read-only *scan/check* and a heavily guarded *delete* for freeing
 space in the local run store, plus a *restore* that pulls runs back from EOS:
 
-  <source_dir>/<runs_subdir>/<run>    processed runs, backed up to EOS
+  <source_dir>/<runs_subdir>/<run>/<subrun>/<component>/   processed runs -> EOS
+  <source_dir>/dream_run/<run>/<subrun>/                   raw acquisition staging
 
-(x17 managed two disks — an HDD run store and an SSD raw-staging dir; our
-setup is a single data tree, and the raw dream_run staging is excluded from
-backup entirely, so only the runs tree is managed here.)
+Deletion works at three granularities, all sharing one safety model:
 
-Safety model — a run is only ever "safe to delete" when its data is provably
-preserved on EOS: EVERY file in the run tree must be present on EOS at
-matching size (relative path + byte size; data is write-once). This is
-exactly the check backup_watcher uses, over the SAME file set — the full
-recursive tree, so subrun raw data AND the processing outputs
-(decoded_root/hits_root/combined_hits_root) and dotfile markers all count.
+  * whole run        delete_run() / delete_runs()
+  * component        delete_components() over (run, subrun, component) triples,
+                     e.g. "drop the decoded waveforms from every subrun of
+                     highstat_eff_1 but keep the combined hits"
+
+COMPONENTS (see the table below) are the deletable pieces of a subrun:
+
+  dream_run           raw .fdf acquisition staging. NOT backed up to EOS (it is
+                      in backup_config's exclude_dirs) — it is a plain
+                      shutil.copy duplicate of raw_daq_data made by
+                      dream_daq_control. Safe iff every staged .fdf is present
+                      on EOS under that subrun's raw_daq_data at matching size
+                      (the same bytes, just the authoritative copy). The small
+                      non-.fdf staging artifacts (.prg/.cfg/.par/.log) are
+                      reproducible and do not block deletion.
+  raw_fdf             the *.fdf files inside raw_daq_data. Deliberately NOT the
+                      whole directory: run_time.txt, RunCtrl_*.log,
+                      pedestal_run.txt, *.cfg and *.prg live there too, are
+                      negligible in size, and are the run's provenance — they
+                      are always preserved.
+  decoded_root        decoded waveforms (whole directory)
+  hits_root           per-FEU hits, pre-combination (whole directory)
+  combined_hits_root  combined hits, the physics product (whole directory)
+
+Safety model — a thing is only ever "safe to delete" when its data is provably
+preserved on EOS: EVERY file it covers must be present on EOS at matching size
+(relative path + byte size; data is write-once). This is exactly the check
+backup_watcher uses. backup_watcher is push-only (it never removes anything
+from EOS), so deleting locally cannot propagate to the backup.
 
 Extra guards beyond x17's:
   * the run named in config/current_run_state.json (actively acquiring) is
@@ -26,12 +48,24 @@ Extra guards beyond x17's:
   * the NEWEST run on disk (by mtime) is never deletable — between runs the
     state file may already point at the next run while this one still has
     files in flight;
-  * a run with any subrun directory missing its .subrun_complete marker is
-    never deletable (possibly still being written / crashed mid-subrun).
+  * a subrun missing its .subrun_complete marker is never deletable (possibly
+    still being written / crashed mid-subrun). At run granularity ANY
+    incomplete subrun blocks the whole run; at component granularity only the
+    offending subrun is blocked.
 
-Nothing here trusts a caller-supplied verdict: delete_run() re-runs the full
-verification itself immediately before it removes anything, and refuses any
-path that is not a plain run directory directly under the runs root.
+Nothing here trusts a caller-supplied verdict: every delete entry point
+re-runs the full verification itself, against a FRESH EOS listing, immediately
+before it removes anything, and refuses any path that does not resolve inside
+the expected root.
+
+Performance — every xrdfs invocation costs ~5-10 s of connect + Kerberos
+handshake against eosproject, regardless of how much it lists (a
+non-recursive ls of a 3-entry directory measured 5-10 s while network RTT is
+0.4 ms). So this module issues exactly ONE `xrdfs ls -l -R` for the entire
+runs tree and partitions the result in memory, instead of one call per run.
+That turned a linear-in-run-count scan into a constant one (~8 s total), and
+is what makes per-component verification affordable at all — the naive form
+would need a call per component per subrun.
 
 All locations come from config/backup_config.json (source_dir, runs_subdir,
 xrootd_url, eos_dir), so this always agrees with the backup watcher about
@@ -42,6 +76,7 @@ legacy FUSE mount is not used anywhere.
 import os
 import re
 import json
+import time
 import shutil
 import subprocess
 from pathlib import Path
@@ -66,6 +101,8 @@ DELETE_LOG         = os.path.join(REPO_DIR, 'logs', 'space_manager.log')
 # itself syncs every dir under runs/ without a name filter, so anything the
 # builder creates is backed up and must be visible here.
 RUN_NAME_RE = re.compile(r'^[A-Za-z][A-Za-z0-9_-]*_\d+$')
+# Subruns are <base>_NN (beam_commissioning_00). Same guard role as above.
+SUBRUN_NAME_RE = re.compile(r'^[A-Za-z][A-Za-z0-9_-]*$')
 
 # Single managed disk. The label/root/fs are resolved from backup_config.json
 # at call time (see _cfg) so a regenerated config is picked up without a
@@ -73,6 +110,72 @@ RUN_NAME_RE = re.compile(r'^[A-Za-z][A-Za-z0-9_-]*_\d+$')
 DISKS = {
     'data': {'label': 'Data disk (runs)'},
 }
+
+# The raw acquisition staging tree, a sibling of runs/ under source_dir. Named
+# in backup_config's exclude_dirs, i.e. never uploaded to EOS.
+DREAM_RUN_SUBDIR = 'dream_run'
+
+
+# --- Components -------------------------------------------------------------
+# 'dir'    : directory under the subrun that holds the component ('' = the
+#            subrun dir itself, used by dream_run whose files are loose).
+# 'suffix' : if set, only files with this suffix belong to the component; the
+#            rest of the directory is left alone. This is what keeps
+#            run_time.txt & friends when raw FDFs are dropped.
+# 'tree'   : which local tree the component lives in — 'runs' or 'dream_run'.
+# 'derived': True for products the processor can recompute from an earlier
+#            stage; used only for UI wording.
+COMPONENTS = {
+    'dream_run': {
+        'label': 'Raw staging (dream_run)',
+        'blurb': 'Duplicate .fdf copies left behind by acquisition. Never backed up — '
+                 'verified against the raw_daq_data copy on EOS.',
+        'tree': 'dream_run', 'dir': '', 'suffix': None,
+        'derived': False, 'order': 0,
+    },
+    'raw_fdf': {
+        'label': 'Raw FDFs',
+        'blurb': 'The *.fdf files in raw_daq_data. Logs, run_time.txt, pedestal_run.txt, '
+                 '*.cfg and *.prg in the same directory are always kept.',
+        'tree': 'runs', 'dir': 'raw_daq_data', 'suffix': '.fdf',
+        'derived': False, 'order': 1,
+    },
+    'decoded_root': {
+        'label': 'Decoded waveforms',
+        'blurb': 'decoded_root/ — full waveforms, re-derivable from the FDFs.',
+        'tree': 'runs', 'dir': 'decoded_root', 'suffix': None,
+        'derived': True, 'order': 2,
+    },
+    'hits_root': {
+        'label': 'Per-FEU hits',
+        'blurb': 'hits_root/ — per-FEU hits before combination.',
+        'tree': 'runs', 'dir': 'hits_root', 'suffix': None,
+        'derived': True, 'order': 3,
+    },
+    'combined_hits_root': {
+        'label': 'Combined hits',
+        'blurb': 'combined_hits_root/ — the physics product. Also the processor\'s '
+                 '"already done" marker (see reprocess_warnings).',
+        'tree': 'runs', 'dir': 'combined_hits_root', 'suffix': None,
+        'derived': True, 'order': 4,
+    },
+}
+
+COMPONENT_ORDER = sorted(COMPONENTS, key=lambda c: COMPONENTS[c]['order'])
+
+# Directories under a subrun that belong to a component (for classifying the
+# local walk). dream_run is a separate tree so it is not in here.
+_DIR_TO_COMPONENT = {c['dir']: k for k, c in COMPONENTS.items()
+                     if c['tree'] == 'runs' and c['dir']}
+
+# processor_watcher._get_processed_file_nums() treats the LAST enabled pipeline
+# stage's output directory as the "this file_num is done" marker. With the
+# default do_combine=True that is combined_hits_root: delete it while the FDFs
+# are still on disk and the watcher will re-decode, re-analyze and re-combine
+# the subrun from scratch. Deleting decoded_root/hits_root while
+# combined_hits_root survives is invisible to it.
+REPROCESS_SENTINEL = 'combined_hits_root'
+REPROCESS_INPUT    = 'raw_fdf'
 
 
 # --- Config ----------------------------------------------------------------
@@ -91,6 +194,10 @@ def _cfg():
 
 def _runs_root() -> Path:
     return _cfg()[0]
+
+
+def _dream_run_root() -> Path:
+    return Path(_cfg()[1]) / DREAM_RUN_SUBDIR
 
 
 # --- Size maps -------------------------------------------------------------
@@ -146,6 +253,191 @@ def _remote_size_map(eos_dir: str):
         if path.startswith(base):
             sizes[path[len(base):]] = size
     return sizes
+
+
+# One recursive listing of the WHOLE runs tree, briefly cached. See the module
+# docstring: the cost of xrdfs is per-invocation, not per-entry, so this single
+# call replaces what used to be one call per run. The TTL only exists so that
+# the scan -> preflight -> confirm click path does not pay for it three times;
+# every delete re-lists with force=True and never trusts the cache.
+_REMOTE_TTL = 90.0
+_remote_cache = {'t': 0.0, 'map': None}
+
+# How long the last EOS listing took, and how many entries it returned. Used
+# ONLY to drive the progress estimate in the GUI. `xrdfs ls -R` cannot be
+# tracked for real: measured against this EOS, all 4533 lines arrive in a 0.06 s
+# burst after 8.83 s of silence, because the whole cost is connect + Kerberos +
+# the server-side directory walk, which emits nothing until it is finished.
+# So the listing phase can honestly show only an elapsed-vs-typical estimate;
+# the phases after it are counted for real.
+SCAN_HINT_PATH = os.path.join(REPO_DIR, 'logs', 'space_scan_hint.json')
+DEFAULT_LISTING_S = 9.0
+
+
+def _read_hint() -> dict:
+    try:
+        with open(SCAN_HINT_PATH) as f:
+            return json.load(f) or {}
+    except Exception:
+        return {}
+
+
+def _write_hint(**kw):
+    h = _read_hint()
+    h.update(kw)
+    try:
+        os.makedirs(os.path.dirname(SCAN_HINT_PATH), exist_ok=True)
+        with open(SCAN_HINT_PATH, 'w') as f:
+            json.dump(h, f)
+    except Exception:
+        pass
+
+
+def listing_estimate_s() -> float:
+    """Best guess at how long the next EOS listing will take, from the last one."""
+    try:
+        v = float(_read_hint().get('listing_s') or 0)
+    except (TypeError, ValueError):
+        v = 0.0
+    return v if 0.5 <= v <= 120 else DEFAULT_LISTING_S
+
+
+def _noop_progress(phase, done, total, msg, item=None):
+    pass
+
+
+def _remote_runs_map(force: bool = False, progress=None):
+    """{'<run>/<subrun>/<component>/<file>': size} for the entire EOS runs tree,
+    or None if the listing failed. Failures are never cached."""
+    progress = progress or _noop_progress
+    now = time.time()
+    if (not force and _remote_cache['map'] is not None
+            and now - _remote_cache['t'] < _REMOTE_TTL):
+        progress('listing', 1, 1, f"{len(_remote_cache['map'])} files (cached)")
+        return _remote_cache['map']
+    _, _, _, eos_runs = _cfg()
+    progress('listing', 0, None, 'contacting EOS (xrdfs)…')
+    t0 = time.time()
+    m = _remote_size_map(eos_runs)
+    dt = time.time() - t0
+    if m is not None:
+        _remote_cache['map'] = m
+        _remote_cache['t'] = time.time()
+        _write_hint(listing_s=round(dt, 2), entries=len(m))
+        progress('listing', 1, 1, f'{len(m)} files listed on EOS in {dt:.1f}s')
+    else:
+        progress('listing', 1, 1, 'EOS listing FAILED')
+    return m
+
+
+def _partition_by_run(rmap: dict) -> dict:
+    """{run: {relpath-within-run: size}} from the flat whole-tree listing."""
+    out = {}
+    for k, v in rmap.items():
+        run, _, rest = k.partition('/')
+        if rest:
+            out.setdefault(run, {})[rest] = v
+    return out
+
+
+def invalidate_remote_cache():
+    _remote_cache['map'] = None
+    _remote_cache['t'] = 0.0
+
+
+# --- Local tree ------------------------------------------------------------
+
+def _component_of(rel_parts):
+    """Classify a path relative to a RUN root into (subrun, component).
+
+    component is None for files that belong to no deletable component — the
+    run-level loose files (dream_daq.log, run_config.json), the subrun-level
+    loose files (hv_monitor.csv, .subrun_complete) and the non-.fdf contents of
+    raw_daq_data. Those are always preserved.
+    """
+    if len(rel_parts) < 2:
+        return None, None                      # <run>/<file>
+    subrun = rel_parts[0]
+    if len(rel_parts) == 2:
+        return subrun, None                    # <subrun>/<file>
+    comp = _DIR_TO_COMPONENT.get(rel_parts[1])
+    if comp is None:
+        return subrun, None                    # unknown subdir -> not deletable
+    suffix = COMPONENTS[comp]['suffix']
+    if suffix and not rel_parts[-1].lower().endswith(suffix):
+        return subrun, None                    # e.g. run_time.txt in raw_daq_data
+    return subrun, comp
+
+
+def _local_tree() -> dict:
+    """Walk the runs tree ONCE and the dream_run tree once, and return
+
+      {run: {'subruns': {subrun: {'components': {comp: {rel: size}},
+                                  'other': {'files': n, 'size': b}}},
+             'other': {'files': n, 'size': b}}}
+
+    where component relpaths are relative to the RUN root, so they line up
+    directly with _partition_by_run() keys for the EOS comparison.
+    """
+    runs_root = _runs_root()
+    tree = {}
+
+    def _run_entry(run):
+        return tree.setdefault(run, {'subruns': {}, 'other': {'files': 0, 'size': 0}})
+
+    def _sub_entry(run, subrun):
+        e = _run_entry(run)['subruns'].setdefault(
+            subrun, {'components': {}, 'other': {'files': 0, 'size': 0}})
+        return e
+
+    if runs_root.is_dir():
+        for f in runs_root.rglob('*'):
+            try:
+                if not f.is_file() or f.is_symlink():
+                    continue
+                size = f.stat().st_size
+                rel = f.relative_to(runs_root).as_posix()
+            except OSError:
+                continue
+            parts = rel.split('/')
+            run = parts[0]
+            if not RUN_NAME_RE.match(run):
+                continue
+            subrun, comp = _component_of(parts[1:])
+            if subrun is None:
+                e = _run_entry(run)['other']
+                e['files'] += 1
+                e['size'] += size
+                continue
+            se = _sub_entry(run, subrun)
+            if comp is None:
+                se['other']['files'] += 1
+                se['other']['size'] += size
+            else:
+                se['components'].setdefault(comp, {})['/'.join(parts[1:])] = size
+
+    # dream_run/<run>/<subrun>/<file> — a separate tree, mapped onto the same
+    # run/subrun grid so the UI can show it as just another component.
+    dr_root = _dream_run_root()
+    if dr_root.is_dir():
+        for f in dr_root.rglob('*'):
+            try:
+                if not f.is_file() or f.is_symlink():
+                    continue
+                size = f.stat().st_size
+                rel = f.relative_to(dr_root).as_posix()
+            except OSError:
+                continue
+            parts = rel.split('/')
+            if len(parts) < 3:
+                continue                       # loose file, not in a subrun
+            run, subrun = parts[0], parts[1]
+            if not RUN_NAME_RE.match(run):
+                continue
+            _sub_entry(run, subrun)['components'].setdefault(
+                'dream_run', {})['/'.join(parts[1:])] = size
+
+    return tree
 
 
 # --- Helpers ---------------------------------------------------------------
@@ -222,6 +514,11 @@ def newest_run() -> str:
     return newest
 
 
+def subrun_complete(run: str, subrun: str) -> bool:
+    """True when daq_control's end-of-subrun marker is present."""
+    return (_runs_root() / run / subrun / '.subrun_complete').is_file()
+
+
 def incomplete_subruns(run_root: Path) -> list:
     """Subrun dirs under run_root missing their .subrun_complete marker
     (daq_control writes it when a subrun finishes cleanly). A run with any
@@ -276,11 +573,76 @@ def disk_usage() -> dict:
 
 # --- Verification ----------------------------------------------------------
 
-def verify_run(disk: str, run: str) -> dict:
+def _verify_files(local: dict, remote: dict) -> dict:
+    """Compare a {rel: size} local set against the run's EOS map."""
+    ok = missing = mismatch = 0
+    for rel, sz in local.items():
+        rsz = remote.get(rel)
+        if rsz == sz:
+            ok += 1
+        elif rsz is None:
+            missing += 1
+        else:
+            mismatch += 1
+    return {'ok': ok, 'missing': missing, 'mismatch': mismatch}
+
+
+def _verify_component(comp: str, local: dict, remote: dict) -> dict:
+    """Verdict for one component of one subrun.
+
+    `local` is {relpath-within-run: size} for the component's files; `remote`
+    is the EOS map for that run. dream_run is special: its files live outside
+    the backed-up tree, so each .fdf is looked up under the sibling
+    raw_daq_data path instead, and its non-.fdf staging artifacts are
+    reproducible and never block.
+    """
+    res = {'component': comp, 'files': len(local), 'size': sum(local.values()),
+           'ok': 0, 'missing': 0, 'mismatch': 0, 'safe': False, 'reason': ''}
+    if not local:
+        res['reason'] = 'nothing present'
+        return res
+
+    if comp == 'dream_run':
+        fdf = {rel: sz for rel, sz in local.items() if rel.lower().endswith('.fdf')}
+        res['staging_files'] = len(local) - len(fdf)
+        if not fdf:
+            # Pure staging artifacts with no raw data to protect.
+            res['safe'] = True
+            res['reason'] = f'{len(local)} reproducible staging file(s), no .fdf'
+            return res
+        # <subrun>/<name>.fdf  ->  <subrun>/raw_daq_data/<name>.fdf on EOS
+        mapped = {}
+        for rel, sz in fdf.items():
+            parts = rel.split('/')
+            mapped['/'.join([parts[0], 'raw_daq_data', parts[-1]])] = sz
+        counts = _verify_files(mapped, remote)
+        res.update(counts)
+        if counts['missing'] == 0 and counts['mismatch'] == 0:
+            res['safe'] = True
+            res['reason'] = (f"all {counts['ok']} .fdf verified on EOS via raw_daq_data"
+                             + (f"; {res['staging_files']} staging file(s) reproducible"
+                                if res['staging_files'] else ''))
+        else:
+            res['reason'] = (f"{counts['missing']} missing + {counts['mismatch']} "
+                             f"size-mismatched under raw_daq_data on EOS")
+        return res
+
+    counts = _verify_files(local, remote)
+    res.update(counts)
+    if counts['missing'] == 0 and counts['mismatch'] == 0:
+        res['safe'] = True
+        res['reason'] = f"all {counts['ok']} files verified on EOS"
+    else:
+        res['reason'] = (f"{counts['missing']} missing + {counts['mismatch']} "
+                         f"size-mismatched on EOS")
+    return res
+
+
+def verify_run(disk: str, run: str, force: bool = False) -> dict:
     """Compare a local run against EOS, file by file (relpath + size) over the
     complete run tree — raw subrun data, processing outputs, loose files and
-    markers alike."""
-    runs_root, _, _, eos_runs = _cfg()
+    markers alike. Sources the single whole-tree EOS listing."""
+    runs_root, _, _, _ = _cfg()
     root = runs_root / run
     res = {'run': run, 'disk': disk, 'size': 0, 'files': 0,
            'ok': 0, 'missing': 0, 'mismatch': 0,
@@ -291,29 +653,23 @@ def verify_run(disk: str, run: str) -> dict:
     local = _local_size_map(root)
     res['files'] = len(local)
     res['size'] = sum(local.values())
-    # Compare against the EOS copy of THIS run.
-    remote = _remote_size_map(f"{eos_runs}/{run}")
-    if remote is None:
+    rmap = _remote_runs_map(force=force)
+    if rmap is None:
         res['unverifiable'] = True
-        res['reason'] = 'could not list run on EOS (Kerberos/network?) — NOT safe'
+        res['reason'] = 'could not list runs on EOS (Kerberos/network?) — NOT safe'
         return res
-    missing = mismatch = ok = 0
-    for rel, sz in local.items():
-        rsz = remote.get(rel)
-        if rsz == sz:
-            ok += 1
-        elif rsz is None:
-            missing += 1
-        else:
-            mismatch += 1
-    res.update(ok=ok, missing=missing, mismatch=mismatch)
-    if missing == 0 and mismatch == 0 and ok == len(local) and len(local) > 0:
+    remote = _partition_by_run(rmap).get(run, {})
+    counts = _verify_files(local, remote)
+    res.update(counts)
+    if (counts['missing'] == 0 and counts['mismatch'] == 0
+            and counts['ok'] == len(local) and len(local) > 0):
         res['safe'] = True
-        res['reason'] = f'all {ok} files verified on EOS'
+        res['reason'] = f"all {counts['ok']} files verified on EOS"
     elif len(local) == 0:
         res['reason'] = 'run directory is empty'
     else:
-        res['reason'] = f'{missing} missing + {mismatch} size-mismatched on EOS'
+        res['reason'] = (f"{counts['missing']} missing + {counts['mismatch']} "
+                         f"size-mismatched on EOS")
     return res
 
 
@@ -340,6 +696,17 @@ def _apply_local_guards(v: dict, run: str, act: str, newest: str) -> dict:
         v['safe'] = False
         v['reason'] = f"{v['reason']} · {guard}" if v.get('reason') else guard
     return v
+
+
+def _run_guard(run: str, act: str, newest: str) -> str:
+    """Run-wide reason this run may not be touched at all, or ''. Unlike
+    _apply_local_guards this does NOT consider incomplete subruns: at component
+    granularity an incomplete subrun blocks only itself."""
+    if run == act:
+        return 'currently acquiring — never deletable while active'
+    if run == newest:
+        return 'newest run on disk (possibly still being written) — refusing'
+    return ''
 
 
 # --- Scan ------------------------------------------------------------------
@@ -392,19 +759,26 @@ def local_scan(disk: str) -> dict:
     }
 
 
-def scan(disk: str, runs=None) -> dict:
-    """Verify every run (or a subset); return per-run verdicts."""
+def scan(disk: str, runs=None, force: bool = True, progress=None) -> dict:
+    """Verify every run (or a subset); return per-run verdicts. One EOS listing
+    for the whole tree, not one per run — this is the check the user explicitly
+    asks for, so it re-lists by default rather than reusing the cache."""
+    progress = progress or _noop_progress
     if disk not in DISKS:
         raise ValueError(f'unknown disk {disk!r}')
     names = runs if runs else list_runs(disk)
     act = active_run()
     newest = newest_run()
+    # One shared listing for every run below.
+    _remote_runs_map(force=force, progress=progress)
     results = []
-    for run in names:
+    for i, run in enumerate(names):
+        progress('verify', i, len(names), f'verifying {run}')
         v = verify_run(disk, run)
         v = _apply_local_guards(v, run, act, newest)
         v['size_h'] = human(v.get('size', 0))
         results.append(v)
+    progress('verify', len(names), len(names), 'verification complete')
     safe_bytes = sum(r['size'] for r in results if r['safe'])
     return {
         'disk': disk, 'label': DISKS[disk]['label'],
@@ -414,6 +788,126 @@ def scan(disk: str, runs=None) -> dict:
         'safe_bytes': safe_bytes, 'safe_bytes_h': human(safe_bytes),
         'active_run': act,
         'usage': disk_usage().get(disk, {}),
+        'scanned_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+    }
+
+
+def component_scan(verify: bool = True, force: bool = False, progress=None) -> dict:
+    """The run -> subrun -> component tree with a delete verdict on every
+    component.
+
+    verify=False skips EOS entirely (instant, works offline): sizes and local
+    guards are filled in but nothing is marked safe. verify=True issues ONE
+    recursive EOS listing and verifies every component from it.
+
+    progress(phase, done, total, msg) is called through the three phases —
+    'scan' (local walk), 'listing' (the opaque EOS call) and 'verify' (per run,
+    genuinely counted).
+    """
+    progress = progress or _noop_progress
+    progress('scan', 0, None, 'walking the local run tree…')
+    act = active_run()
+    newest = newest_run()
+    tree = _local_tree()
+    progress('scan', 1, 1, f'{len(tree)} run(s) on disk')
+
+    rmap = _remote_runs_map(force=force, progress=progress) if verify else None
+    unverifiable = verify and rmap is None
+    by_run = _partition_by_run(rmap) if rmap is not None else {}
+
+    runs_out = []
+    names = sorted(tree, key=_run_key)
+    for idx, run in enumerate(names):
+        progress('verify', idx, len(names), f'verifying {run}')
+        rentry = tree[run]
+        remote = by_run.get(run, {})
+        guard = _run_guard(run, act, newest)
+
+        subs_out = []
+        run_comp = {c: {'size': 0, 'files': 0, 'safe_size': 0, 'n_safe': 0, 'n_total': 0}
+                    for c in COMPONENT_ORDER}
+        for subrun in sorted(rentry['subruns']):
+            sentry = rentry['subruns'][subrun]
+            complete = subrun_complete(run, subrun)
+            sub_guard = guard or ('' if complete else
+                                  'missing .subrun_complete (possibly mid-write) — refusing')
+
+            comps_out = {}
+            for comp in COMPONENT_ORDER:
+                local = sentry['components'].get(comp)
+                if not local:
+                    continue
+                if verify and not unverifiable:
+                    v = _verify_component(comp, local, remote)
+                else:
+                    v = {'component': comp, 'files': len(local),
+                         'size': sum(local.values()), 'ok': 0, 'missing': 0,
+                         'mismatch': 0, 'safe': False,
+                         'reason': ('could not list EOS (Kerberos/network?) — NOT safe'
+                                    if unverifiable else 'not yet verified against EOS')}
+                if sub_guard:
+                    v['safe'] = False
+                    v['reason'] = f"{v['reason']} · {sub_guard}" if v['reason'] else sub_guard
+                v['size_h'] = human(v['size'])
+                comps_out[comp] = v
+
+                agg = run_comp[comp]
+                agg['size'] += v['size']
+                agg['files'] += v['files']
+                agg['n_total'] += 1
+                if v['safe']:
+                    agg['n_safe'] += 1
+                    agg['safe_size'] += v['size']
+
+            sub_size = sum(v['size'] for v in comps_out.values()) + sentry['other']['size']
+            subs_out.append({
+                'subrun': subrun, 'run': run, 'complete': complete,
+                'guard': sub_guard, 'components': comps_out,
+                'other': sentry['other'], 'other_h': human(sentry['other']['size']),
+                'size': sub_size, 'size_h': human(sub_size),
+            })
+
+        run_comp = {c: v for c, v in run_comp.items() if v['n_total']}
+        for c, v in run_comp.items():
+            v['size_h'] = human(v['size'])
+            v['safe_size_h'] = human(v['safe_size'])
+        run_size = (sum(v['size'] for v in run_comp.values())
+                    + rentry['other']['size']
+                    + sum(s['other']['size'] for s in subs_out))
+        runs_out.append({
+            'run': run, 'guard': guard,
+            'active': run == act, 'newest': run == newest,
+            'components': run_comp, 'subruns': subs_out,
+            'n_subruns': len(subs_out),
+            'other': rentry['other'], 'other_h': human(rentry['other']['size']),
+            'size': run_size, 'size_h': human(run_size),
+        })
+
+    progress('verify', len(names), len(names), 'verification complete')
+
+    totals = {c: {'size': 0, 'safe_size': 0} for c in COMPONENT_ORDER}
+    for r in runs_out:
+        for c, v in r['components'].items():
+            totals[c]['size'] += v['size']
+            totals[c]['safe_size'] += v['safe_size']
+    for c, v in totals.items():
+        v['size_h'] = human(v['size'])
+        v['safe_size_h'] = human(v['safe_size'])
+
+    grand = sum(r['size'] for r in runs_out)
+    safe_total = sum(v['safe_size'] for v in totals.values())
+    return {
+        'runs': runs_out, 'n_runs': len(runs_out),
+        'components': {c: dict(COMPONENTS[c], key=c) for c in COMPONENT_ORDER},
+        'component_order': COMPONENT_ORDER,
+        'totals': totals,
+        'total_bytes': grand, 'total_h': human(grand),
+        'safe_bytes': safe_total, 'safe_bytes_h': human(safe_total),
+        'verified': bool(verify and not unverifiable),
+        'unverifiable': unverifiable,
+        'active_run': act, 'newest_run': newest,
+        'reprocess_sentinel': REPROCESS_SENTINEL,
+        'usage': disk_usage().get('data', {}),
         'scanned_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
     }
 
@@ -434,7 +928,7 @@ def delete_run(disk: str, run: str) -> dict:
     safe. Never trusts a caller verdict.
 
     Guards, in order:
-      1. disk is known; run matches ^run_\\d+$.
+      1. disk is known; run matches RUN_NAME_RE.
       2. target resolves to a real directory sitting DIRECTLY under the runs
          root (no symlinks, no traversal, no partial-name tricks).
       3. run is not the active run, not the newest run on disk, and has no
@@ -459,7 +953,7 @@ def delete_run(disk: str, run: str) -> dict:
     if rtarget.parent != root or rtarget == root:
         return {'success': False, 'message': 'path is not a run directly under the runs root'}
 
-    verdict = verify_run(disk, run)
+    verdict = verify_run(disk, run, force=True)
     verdict = _apply_local_guards(verdict, run, active_run(), newest_run())
     if not verdict['safe']:
         _log_delete(f"REFUSED {disk}/{run}: {verdict['reason']}")
@@ -494,6 +988,300 @@ def delete_runs(disk: str, runs: list) -> dict:
             'n_failed': sum(1 for r in results if not r.get('success'))}
 
 
+# --- Component delete ------------------------------------------------------
+
+def _component_path(run: str, subrun: str, comp: str):
+    """(path, root) for a component of a subrun, or (None, None) if the names
+    or the component key are not valid. The caller still has to confirm the
+    resolved path sits inside root."""
+    if comp not in COMPONENTS:
+        return None, None
+    if not RUN_NAME_RE.match(run or '') or not SUBRUN_NAME_RE.match(subrun or ''):
+        return None, None
+    spec = COMPONENTS[comp]
+    if spec['tree'] == 'dream_run':
+        root = _dream_run_root()
+        return root / run / subrun, root
+    root = _runs_root()
+    return root / run / subrun / spec['dir'], root
+
+
+def _normalize_items(items):
+    """[(run, subrun, component)] from the wire format, de-duplicated and with
+    unknown/invalid entries dropped."""
+    out, seen = [], set()
+    for it in items or []:
+        if not isinstance(it, dict):
+            continue
+        run = it.get('run')
+        subrun = it.get('subrun')
+        comp = it.get('component')
+        if comp not in COMPONENTS:
+            continue
+        if not RUN_NAME_RE.match(run or '') or not SUBRUN_NAME_RE.match(subrun or ''):
+            continue
+        key = (run, subrun, comp)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(key)
+    return out
+
+
+def _component_contents(run: str, subrun: str, comp: str) -> dict:
+    """{relpath-within-run: (size, Path)} for the files this component covers,
+    read fresh from disk (not from a cached scan). Keys line up with the EOS
+    map; the Paths are what a delete actually unlinks, so verification and
+    removal are guaranteed to be talking about the same file set."""
+    path, root = _component_path(run, subrun, comp)
+    if path is None or not path.is_dir():
+        return {}
+    spec = COMPONENTS[comp]
+    out = {}
+    for f in path.rglob('*'):
+        try:
+            if not f.is_file() or f.is_symlink():
+                continue
+            if spec['suffix'] and not f.name.lower().endswith(spec['suffix']):
+                continue
+            size = f.stat().st_size
+        except OSError:
+            continue
+        inner = f.relative_to(path).as_posix()
+        rel = (f"{subrun}/{inner}" if spec['tree'] == 'dream_run'
+               else f"{subrun}/{spec['dir']}/{inner}")
+        out[rel] = (size, f)
+    return out
+
+
+def _component_local_files(run: str, subrun: str, comp: str) -> dict:
+    """{relpath-within-run: size} — the verification view of _component_contents."""
+    return {rel: sz for rel, (sz, _) in _component_contents(run, subrun, comp).items()}
+
+
+def preflight_components(items) -> dict:
+    """Dry-run a component selection: what it would free, what is refused, and
+    which subruns the processor would reprocess afterwards.
+
+    Uses the cached EOS listing (this runs on every selection change); the real
+    delete re-verifies against a fresh one.
+    """
+    triples = _normalize_items(items)
+    act, newest = active_run(), newest_run()
+    rmap = _remote_runs_map()
+    by_run = _partition_by_run(rmap) if rmap is not None else {}
+
+    ok_items, refused = [], []
+    freed = 0
+    selected = {}                        # {(run, subrun): {components}}
+    for run, subrun, comp in triples:
+        selected.setdefault((run, subrun), set()).add(comp)
+        local = _component_local_files(run, subrun, comp)
+        entry = {'run': run, 'subrun': subrun, 'component': comp,
+                 'label': COMPONENTS[comp]['label'],
+                 'size': sum(local.values()), 'files': len(local)}
+        entry['size_h'] = human(entry['size'])
+
+        guard = _run_guard(run, act, newest)
+        if not guard and not subrun_complete(run, subrun):
+            guard = 'missing .subrun_complete (possibly mid-write)'
+        if guard:
+            entry['reason'] = guard
+            refused.append(entry)
+            continue
+        if not local:
+            entry['reason'] = 'nothing present'
+            refused.append(entry)
+            continue
+        if rmap is None:
+            entry['reason'] = 'could not list EOS (Kerberos/network?) — NOT safe'
+            refused.append(entry)
+            continue
+        v = _verify_component(comp, local, by_run.get(run, {}))
+        if not v['safe']:
+            entry['reason'] = v['reason']
+            refused.append(entry)
+            continue
+        entry['reason'] = v['reason']
+        ok_items.append(entry)
+        freed += entry['size']
+
+    # Deleting the processor's "done" marker while its input FDFs survive makes
+    # the watcher redo the whole pipeline for that subrun. Only warn when the
+    # FDFs will actually still be there afterwards.
+    warnings = []
+    for (run, subrun), comps in sorted(selected.items()):
+        if REPROCESS_SENTINEL not in comps:
+            continue
+        if not any(i['run'] == run and i['subrun'] == subrun
+                   and i['component'] == REPROCESS_SENTINEL for i in ok_items):
+            continue          # refused anyway, nothing will be removed
+        if REPROCESS_INPUT in comps:
+            continue          # FDFs go too -> nothing left to reprocess from
+        if _component_local_files(run, subrun, REPROCESS_INPUT):
+            warnings.append({'run': run, 'subrun': subrun,
+                             'message': f'{run}/{subrun}: combined hits removed while the '
+                                        f'raw FDFs stay — the processor will re-decode, '
+                                        f're-analyze and re-combine this subrun'})
+
+    return {
+        'items': ok_items, 'refused': refused,
+        'n_ok': len(ok_items), 'n_refused': len(refused),
+        'freed_bytes': freed, 'freed_h': human(freed),
+        'reprocess_warnings': warnings,
+        'unverifiable': rmap is None,
+    }
+
+
+def _delete_component(run: str, subrun: str, comp: str, remote: dict,
+                      act: str, newest: str) -> dict:
+    """Delete one component of one subrun after re-verifying it here.
+
+    Guards, in order:
+      1. component key known; run/subrun match their name regexes.
+      2. target resolves to a real directory inside the component's own root
+         (no symlinks, no traversal).
+      3. run is not active and not the newest; the subrun has .subrun_complete.
+      4. a fresh verification says SAFE for exactly the files about to go.
+    """
+    res = {'run': run, 'subrun': subrun, 'component': comp,
+           'label': COMPONENTS.get(comp, {}).get('label', comp),
+           'success': False, 'freed_bytes': 0, 'freed_h': '0 B', 'message': ''}
+
+    path, root = _component_path(run, subrun, comp)
+    if path is None:
+        res['message'] = 'invalid run/subrun/component'
+        return res
+    try:
+        rtarget = path.resolve()
+        rroot = root.resolve()
+    except OSError as e:
+        res['message'] = f'cannot resolve path: {e}'
+        return res
+    if path.is_symlink():
+        res['message'] = 'refusing to delete a symlink'
+        return res
+    if not rtarget.is_dir():
+        res['message'] = 'not present'
+        return res
+    if rroot not in rtarget.parents:
+        res['message'] = 'path escapes the managed root'
+        return res
+
+    guard = _run_guard(run, act, newest)
+    if not guard and not subrun_complete(run, subrun):
+        guard = 'missing .subrun_complete (possibly mid-write)'
+    if guard:
+        res['message'] = f'not safe: {guard}'
+        _log_delete(f"REFUSED {run}/{subrun}/{comp}: {guard}")
+        return res
+
+    contents = _component_contents(run, subrun, comp)
+    if not contents:
+        res['message'] = 'nothing present'
+        return res
+    local = {rel: sz for rel, (sz, _) in contents.items()}
+    v = _verify_component(comp, local, remote)
+    if not v['safe']:
+        res['message'] = f"not safe: {v['reason']}"
+        _log_delete(f"REFUSED {run}/{subrun}/{comp}: {v['reason']}")
+        return res
+
+    spec = COMPONENTS[comp]
+    size = sum(local.values())
+    try:
+        if spec['suffix']:
+            # File-scoped component: remove exactly the files just verified,
+            # leaving the directory and its metadata (run_time.txt, RunCtrl
+            # logs, pedestal_run.txt, *.cfg, *.prg) untouched.
+            for _, f in contents.values():
+                f.unlink()
+        else:
+            shutil.rmtree(rtarget)
+    except Exception as e:
+        _log_delete(f"ERROR deleting {run}/{subrun}/{comp}: {e}")
+        res['message'] = f'delete failed: {e}'
+        return res
+
+    res.update(success=True, freed_bytes=size, freed_h=human(size),
+               message=f'freed {human(size)}')
+    _log_delete(f"DELETED {run}/{subrun}/{comp}  freed={human(size)}  ({v['reason']})")
+    return res
+
+
+def delete_components(items, progress=None) -> dict:
+    """Delete a set of (run, subrun, component) triples. Every one is
+    independently re-verified here against a FRESH EOS listing — a caller
+    verdict, or the cached listing a preflight used, is never trusted.
+
+    One xrdfs call covers the whole batch; see the module docstring on why that
+    matters. progress(phase, done, total, msg, item) reports the opaque
+    'listing' phase and then a real byte-weighted 'delete' phase, handing back
+    each per-item result as it lands so the GUI can log it live.
+    """
+    progress = progress or _noop_progress
+    triples = _normalize_items(items)
+    if not triples:
+        return {'results': [], 'n_deleted': 0, 'n_failed': 0,
+                'freed_bytes': 0, 'freed_h': '0 B',
+                'message': 'nothing valid selected'}
+
+    act, newest = active_run(), newest_run()
+    rmap = _remote_runs_map(force=True, progress=progress)
+    if rmap is None:
+        return {'results': [], 'n_deleted': 0, 'n_failed': len(triples),
+                'freed_bytes': 0, 'freed_h': '0 B',
+                'message': 'could not list runs on EOS (Kerberos/network?) — '
+                           'refusing to delete anything'}
+    by_run = _partition_by_run(rmap)
+
+    # Weight the bar by bytes, not item count: dropping one 12 GB raw_fdf and
+    # one 200 MB combined_hits are not half the job each.
+    ordered = sorted(triples, key=lambda t: (t[0], t[1], COMPONENTS[t[2]]['order']))
+    weights = [sum(_component_local_files(*t).values()) for t in ordered]
+    total = sum(weights) or 1
+
+    results = []
+    freed = done = 0
+    for (run, subrun, comp), w in zip(ordered, weights):
+        progress('delete', done, total, f'{run}/{subrun} — {COMPONENTS[comp]["label"]}')
+        r = _delete_component(run, subrun, comp, by_run.get(run, {}), act, newest)
+        results.append(r)
+        if r['success']:
+            freed += r['freed_bytes']
+        done += w
+        progress('delete', done, total,
+                 f'{run}/{subrun} — {COMPONENTS[comp]["label"]}', item=r)
+
+    _prune_empty_dream_run_dirs({run for run, _, c in triples if c == 'dream_run'})
+    progress('delete', total, total, f'freed {human(freed)}')
+
+    return {'results': results,
+            'n_deleted': sum(1 for r in results if r['success']),
+            'n_failed': sum(1 for r in results if not r['success']),
+            'freed_bytes': freed, 'freed_h': human(freed)}
+
+
+def _prune_empty_dream_run_dirs(runs):
+    """Remove dream_run/<run> once its last subrun has gone, so the staging tree
+    does not accumulate empty shells. Only ever removes directories that
+    contain no files at all."""
+    root = _dream_run_root()
+    for run in runs:
+        if not RUN_NAME_RE.match(run or ''):
+            continue
+        d = root / run
+        try:
+            if not d.is_dir() or d.is_symlink():
+                continue
+            if any(f.is_file() for f in d.rglob('*')):
+                continue
+            shutil.rmtree(d)
+            _log_delete(f"PRUNED empty dream_run/{run}")
+        except OSError:
+            pass
+
+
 # --- Restore (EOS -> local) -------------------------------------------------
 # The inverse of delete: pull a run back from EOS onto the local data disk.
 # EOS mirrors the local layout, so restore targets the same runs root. Only
@@ -517,41 +1305,31 @@ def _xrdcp_download(eos_file: str, local_path: Path):
 
 
 def list_eos_runs():
-    """Sorted run_N names present on EOS, or None if the listing failed."""
-    _, _, url, eos_runs = _cfg()
-    try:
-        r = subprocess.run(['xrdfs', url, 'ls', eos_runs], capture_output=True, text=True)
-    except OSError:
-        return None   # xrdfs not installed / not on PATH
-    if r.returncode != 0:
+    """Sorted run names present on EOS, or None if the listing failed. Derived
+    from the shared whole-tree listing, so it costs nothing extra."""
+    rmap = _remote_runs_map()
+    if rmap is None:
         return None
-    out = []
-    for line in r.stdout.splitlines():
-        name = line.rstrip('/').rsplit('/', 1)[-1]
-        if RUN_NAME_RE.match(name):
-            out.append(name)
-    return sorted(out, key=_run_key)
+    return sorted({k.split('/')[0] for k in rmap if RUN_NAME_RE.match(k.split('/')[0])},
+                  key=_run_key)
 
 
 def scan_restore() -> dict:
     """List every run on EOS and, for each, how it compares to the local disk:
     complete (already local), partial, or missing. 'To fetch' is the bytes that
     would be pulled (files absent or size-mismatched locally)."""
-    runs = list_eos_runs()
-    if runs is None:
+    rmap = _remote_runs_map()
+    if rmap is None:
         raise RuntimeError('could not list runs on EOS (Kerberos/network?)')
+    by_run = _partition_by_run(rmap)
+    runs = sorted((r for r in by_run if RUN_NAME_RE.match(r)), key=_run_key)
     act = active_run()
-    runs_root, _, _, eos_runs = _cfg()
+    runs_root, _, _, _ = _cfg()
     results = []
     fetch_total = 0
     for run in runs:
-        remote = _remote_size_map(f"{eos_runs}/{run}")
+        remote = by_run.get(run, {})
         r = {'run': run, 'disk': 'data', 'active': run == act}
-        if remote is None:
-            r.update(status='error', restorable=False, eos_bytes=0, size_h='—',
-                     total=0, have=0, fetch_files=0, fetch_bytes=0, fetch_h='—')
-            results.append(r)
-            continue
         eos_bytes = sum(remote.values())
         total = len(remote)
         local_root = runs_root / run
@@ -594,10 +1372,11 @@ def restore_run(run: str) -> dict:
         return res
     runs_root, fs_path, _, eos_runs = _cfg()
     eos_run = f"{eos_runs}/{run}"
-    remote = _remote_size_map(eos_run)
-    if remote is None:
-        res['message'] = 'could not list run on EOS (Kerberos/network?)'
+    rmap = _remote_runs_map(force=True)
+    if rmap is None:
+        res['message'] = 'could not list runs on EOS (Kerberos/network?)'
         return res
+    remote = _partition_by_run(rmap).get(run, {})
     if not remote:
         res['message'] = 'run not found on EOS'
         return res
@@ -664,15 +1443,56 @@ def restore_runs(runs: list) -> dict:
 
 
 if __name__ == '__main__':
-    out = scan('data')
-    u = out['usage']
-    if u and not u.get('error'):
-        print(f"{out['label']}: {human(u.get('free', 0))} free of {human(u.get('total', 0))} "
-              f"({u.get('pct', 0)}% used)")
-    print(f"{'RUN':10} {'SIZE':>10}  {'SAFE':>5}  REASON")
-    print('-' * 78)
-    for r in out['runs']:
-        print(f"{r['run']:10} {r['size_h']:>10}  {'YES' if r['safe'] else 'no':>5}  {r['reason']}")
-    print('-' * 78)
-    print(f"{out['n_safe']}/{out['n_runs']} runs safe to delete — "
-          f"would free {out['safe_bytes_h']}")
+    import argparse
+    ap = argparse.ArgumentParser(description='Scan the DREAM data disk for reclaimable space')
+    ap.add_argument('--components', action='store_true',
+                    help='per-component breakdown instead of per-run verdicts')
+    ap.add_argument('--no-verify', action='store_true',
+                    help='skip EOS entirely (instant, nothing marked safe)')
+    ap.add_argument('--json', action='store_true')
+    args = ap.parse_args()
+
+    if args.components:
+        out = component_scan(verify=not args.no_verify)
+        if args.json:
+            print(json.dumps(out, indent=2))
+            raise SystemExit
+        u = out['usage']
+        if u and not u.get('error'):
+            print(f"Data disk: {human(u.get('free', 0))} free of {human(u.get('total', 0))} "
+                  f"({u.get('pct', 0)}% used)\n")
+        order = out['component_order']
+        print(f"{'RUN/SUBRUN':34}" + ''.join(f'{COMPONENTS[c]["label"][:15]:>16}' for c in order))
+        print('-' * (34 + 16 * len(order)))
+        for r in out['runs']:
+            print(f"{r['run']:34}" + ''.join(
+                f"{(r['components'][c]['size_h'] if c in r['components'] else '—'):>16}"
+                for c in order))
+            for s in r['subruns']:
+                cells = []
+                for c in order:
+                    v = s['components'].get(c)
+                    cells.append(f"{(v['size_h'] + (' ✓' if v['safe'] else '')) if v else '—':>16}")
+                print(f"  {s['subrun']:32}" + ''.join(cells))
+        print('-' * (34 + 16 * len(order)))
+        print(f"{'TOTAL':34}" + ''.join(f"{out['totals'][c]['size_h']:>16}" for c in order))
+        print(f"{'  of which safe':34}" + ''.join(
+            f"{out['totals'][c]['safe_size_h']:>16}" for c in order))
+        print(f"\n{out['total_h']} on disk, {out['safe_bytes_h']} safe to reclaim"
+              + ('' if out['verified'] else '  (NOT verified against EOS)'))
+    else:
+        out = scan('data')
+        if args.json:
+            print(json.dumps(out, indent=2))
+            raise SystemExit
+        u = out['usage']
+        if u and not u.get('error'):
+            print(f"{out['label']}: {human(u.get('free', 0))} free of {human(u.get('total', 0))} "
+                  f"({u.get('pct', 0)}% used)")
+        print(f"{'RUN':10} {'SIZE':>10}  {'SAFE':>5}  REASON")
+        print('-' * 78)
+        for r in out['runs']:
+            print(f"{r['run']:10} {r['size_h']:>10}  {'YES' if r['safe'] else 'no':>5}  {r['reason']}")
+        print('-' * 78)
+        print(f"{out['n_safe']}/{out['n_runs']} runs safe to delete — "
+              f"would free {out['safe_bytes_h']}")

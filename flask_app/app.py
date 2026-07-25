@@ -440,8 +440,11 @@ def run_builder_config():
 def run_builder_options():
     try:
         import gui_run_config as grc
-        from run_config_beam import P2_HV
-        hv_cards = sorted({card for det in P2_HV.values()
+        # DET_HV, not the old P2_HV: renamed when the 2 uRWELL references joined
+        # the 3 P2 stations, so this now also offers card 12 (uRWELL 'resist')
+        # and lists all five detectors as templates.
+        from run_config_beam import DET_HV
+        hv_cards = sorted({card for det in DET_HV.values()
                            for (card, _chan) in det.values()})
         return jsonify({
             "success": True,
@@ -450,7 +453,7 @@ def run_builder_options():
             "gas_presets": grc.GAS_PRESETS,
             "hv_cards": hv_cards,
             "n_channels_per_card": 12,
-            "detector_templates": list(P2_HV.keys()),
+            "detector_templates": list(DET_HV.keys()),
         })
     except Exception as e:
         return jsonify({"success": False, "message": str(e)}), 500

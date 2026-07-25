@@ -34,7 +34,6 @@ import run_config_beam as rcb
 #   "enabled": true,
 #   "run_name": "run_1", "operator": "", "notes": "", "gas": "Ar/Iso 95/5",
 #   "trigger_mode": "external",            # "external" | "self"
-#   "telescope_spacing_mm": 300,
 #   "detectors": [
 #     {"name":"P2_OUT","included":true,"z_mm":0,"description":"...",
 #      "hv_channels":{"mesh":[8,1],"drift":[8,0]},
@@ -450,7 +449,9 @@ def defaults_from_code():
         'notes': '',
         'gas': cfg.gas,
         'trigger_mode': rcb.TRIGGER_MODE,
-        'telescope_spacing_mm': rcb.TELESCOPE_SPACING_MM,
+        # No telescope-wide spacing scalar: the stations are not equally spaced
+        # (gaps 320/310/310/430 mm), so geometry lives per detector in 'z_mm'
+        # above, taken from rcb.DET_Z_MM via det_center_coords.
         'detectors': detectors,
         'run_type': 'mesh_scan',
         'run_types': run_types,

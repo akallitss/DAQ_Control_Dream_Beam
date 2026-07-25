@@ -258,8 +258,8 @@ SCAN_STEP_V = 5         # V — mesh and drift both step down by this per point
 SCAN_POINTS = 12        # 12 points x 5 min = 1 h of data
 SCAN_SUBRUN_MIN = 5     # minutes per scan point
 
-N_SUBRUNS = 2       # number of identical sub-runs (HV_SCAN False) — commissioning
-SUBRUN_MIN = 2      # run time per sub-run (minutes) — short, this is a check run
+N_SUBRUNS = int(os.environ.get('DAQ_N_SUBRUNS', '2'))    # identical sub-runs (commissioning plan)
+SUBRUN_MIN = int(os.environ.get('DAQ_SUBRUN_MIN', '2'))  # minutes per sub-run (env-overridable for long runs)
 POST_SUBRUN_PAUSE_MIN = 0   # optional pause AFTER each sub-run (minutes); 0 = no pause
 
 # ---------------------------------------------------------------------------
@@ -273,10 +273,10 @@ POST_SUBRUN_PAUSE_MIN = 0   # optional pause AFTER each sub-run (minutes); 0 = n
 # unsafe on P2_OUT: 440 V mesh exceeds its 420 V maximum.
 # ---------------------------------------------------------------------------
 OPERATING_HV = {
-    'P2_IN':  {'drift': 630, 'mesh': 430},   # gap = 200 V. REINSTATED 2026-07-24
-                                             # after repair + regas (alive in
-                                             # p2in_check_1). Mesh raised to its 430 V
-                                             # ceiling on Alexandra's instruction.
+    'P2_IN':  {'drift': 700, 'mesh': 450},   # gap = 250 V. 2026-07-25: uniform P2
+                                             # operating point (450/700) with MID/OUT
+                                             # for the high-stat run. Above yesterday's
+                                             # 430 mesh — watch its current.
     'P2_MID': {'drift': 700, 'mesh': 450},   # gap = 250 V; drift scanned up to 900
     'P2_OUT': {'drift': 700, 'mesh': 450},   # gap = 250 V; drift scanned up to 900
     'EIC_uRWELL_front': {'drift': 600, 'resist': 420},   # uRWELL-inter
@@ -299,7 +299,7 @@ OPERATING_HV = {
 # is a higher drift field than these detectors have run at; back a channel off if
 # it draws or trips (the monitor flags >2 uA / any trip).
 MAX_HV = {
-    'P2_IN':  {'drift': 700, 'mesh': 430},   # mesh ceiling 430 V (Alexandra 2026-07-24)
+    'P2_IN':  {'drift': 700, 'mesh': 450},   # mesh ceiling 450 V (Alexandra 2026-07-25)
     'P2_MID': {'drift': 900, 'mesh': 450},   # mesh ceiling lowered 510 -> 450 (Alexandra 2026-07-24)
     'P2_OUT': {'drift': 900, 'mesh': 450},
     'EIC_uRWELL_front': {'drift': 600, 'resist': 420},

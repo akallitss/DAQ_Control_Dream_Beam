@@ -163,6 +163,16 @@ SPS_BEAM_LOG_DIR='$SPS_BEAM_LOG_DIR'; exec $cmd >> '$HOME/sps_beam_watcher.log' 
 
     local pid=''
     if [ "${USE_SYSTEMD_RUN:-1}" = "1" ] && command -v systemd-run >/dev/null 2>&1; then
+        # Linger, or the unit dies ~10-20 s after the last session closes anyway:
+        # with Linger=no systemd stops the whole user manager at final logout and
+        # takes every transient unit with it. Measured 2026-07-25 — a probe unit
+        # logged one line at sessions=0 and was gone by the next tick.
+        #
+        # This is per-NODE state (/var/lib/systemd/linger/<user> is local), and
+        # acron lands on an arbitrary lxplus node, so it has to be (re)asserted
+        # here on whichever node is starting the watcher. Idempotent.
+        loginctl enable-linger "$(id -un)" 2>/dev/null \
+            || log "WARNING: enable-linger failed — the watcher will not outlive this session on $HOST"
         systemctl --user stop "$UNIT" 2>/dev/null
         systemctl --user reset-failed "$UNIT" 2>/dev/null
         if systemd-run --user --unit="$UNIT" --quiet /bin/bash -c "$inner" 2>>"$KEEPALIVE_LOG"; then

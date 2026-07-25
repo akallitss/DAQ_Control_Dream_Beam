@@ -117,8 +117,10 @@ def run_watcher(config: dict, config_path: Path):
     print(f"[backup] poll               : {poll_interval}s  stale_after={stale_run_days}d")
 
     state_path = config_path.parent / 'backup_state.json'
+    loose_state_path = config_path.parent / 'backup_loose_state.json'
     # (run_name, subrun_name) -> total dir size at last successful rsync
     synced_sizes: dict = _load_state(state_path)
+    loose_sigs:   dict = _load_loose_state(loose_state_path)
     # (run_name, subrun_name) -> total dir size from previous poll (stable check)
     prev_sizes: dict = {}
 
@@ -171,6 +173,29 @@ def run_watcher(config: dict, config_path: Path):
                         continue
                     if run_dir.name in exclude_runs:
                         continue
+
+                    # --- Run-level loose files (before the stale skip) ---
+                    # run_config.json & co. live directly in the run dir, so the
+                    # per-subrun path below never looks at them: _xrd_loose_files
+                    # only runs after a SUBRUN syncs, and a subrun only syncs when
+                    # its size changes. An edit made after a run ends (e.g. the
+                    # bulk uRWELL-orientation run_config.json rewrite) therefore
+                    # stayed invisible until the once-a-day reconcile. Comparing a
+                    # cheap local signature closes that 24 h window to one poll.
+                    # Deliberately ahead of the stale/checked_stale_runs skips —
+                    # a bulk config rewrite touches old runs too, and this costs
+                    # nothing (local stat only) when nothing has changed.
+                    sig = _loose_signature(run_dir)
+                    if sig and loose_sigs.get(run_dir.name) != sig:
+                        _end_idle()
+                        print(f"[backup] loose files changed in {run_dir.name} — syncing")
+                        if _xrd_loose_files(run_dir, eos_runs_dir / run_dir.name):
+                            loose_sigs[run_dir.name] = sig
+                            _save_loose_state(loose_state_path, loose_sigs)
+                        else:
+                            # Leave the signature stale so the next poll retries.
+                            print(f"[backup] loose-file sync FAILED for {run_dir.name}")
+
                     if run_dir.name in checked_stale_runs:
                         continue
 
@@ -398,7 +423,7 @@ def _xrd_sync_tree(local_dir: Path, eos_dir: Path) -> bool:
     return all_ok
 
 
-def _xrd_loose_files(run_dir: Path, eos_run_dir: Path):
+def _xrd_loose_files(run_dir: Path, eos_run_dir: Path) -> bool:
     """Copy every loose file sitting directly in run_dir (not in a subrun subdir):
     dream_daq.log, run_config.json and its backups, notes, etc.
 
@@ -406,8 +431,12 @@ def _xrd_loose_files(run_dir: Path, eos_run_dir: Path):
     edited run_config.json) are re-copied since xrdcp -f overwrites. The per-subrun
     _xrd_sync_tree only walks subrun subdirectories, so these top-level files would
     otherwise never be backed up.
+
+    Returns True if nothing failed, so the caller can avoid caching a signature
+    for a sync that did not actually land.
     """
     remote_sizes = _remote_size_map(eos_run_dir, recursive=False)
+    all_ok = True
     for f in sorted(run_dir.iterdir()):
         if not f.is_file():
             continue
@@ -417,7 +446,32 @@ def _xrd_loose_files(run_dir: Path, eos_run_dir: Path):
             continue
         if remote_sizes.get(f.name) == local_size:
             continue
-        _xrdcp_file(f, eos_run_dir / f.name)
+        if not _xrdcp_file(f, eos_run_dir / f.name):
+            all_ok = False
+    return all_ok
+
+
+def _loose_signature(run_dir: Path) -> str:
+    """name:size for every loose file directly in run_dir, as one string.
+
+    Pure local stat of a handful of files — cheap enough to evaluate for every
+    run on every poll. Comparing it against the last synced signature is what
+    lets the watcher notice run-level edits (a bulk run_config.json rewrite,
+    added notes) without waiting for a subrun to change size or for the daily
+    reconcile.
+    """
+    parts = []
+    try:
+        for f in sorted(run_dir.iterdir()):
+            if not f.is_file():
+                continue
+            try:
+                parts.append(f'{f.name}:{f.stat().st_size}')
+            except OSError:
+                pass
+    except OSError:
+        return ''
+    return '|'.join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -468,6 +522,27 @@ def _load_state(state_path: Path) -> dict:
     except Exception as e:
         print(f"[backup] Could not load state from {state_path}: {e}")
         return {}
+
+
+def _load_loose_state(path: Path) -> dict:
+    """{run_name: loose-file signature} from the last successful loose sync.
+
+    Kept in its own file rather than backup_state.json because that one is
+    keyed 'run/subrun' and _load_state() splits every key on '/'.
+    """
+    try:
+        with open(path) as f:
+            return json.load(f) or {}
+    except Exception:
+        return {}
+
+
+def _save_loose_state(path: Path, sigs: dict):
+    try:
+        with open(path, 'w') as f:
+            json.dump(sigs, f, indent=2)
+    except Exception as e:
+        print(f"[backup] Could not save loose state to {path}: {e}")
 
 
 def _save_state(state_path: Path, synced_sizes: dict):

@@ -74,3 +74,47 @@ life (~5 days); after that a manual `kinit dneff@CERN.CH` reseed is needed.
 The state file exposes `krb_valid_until`; the shift card warns when < 12 h
 remain, and the Telegram monitor's `rule_beam_watcher_dead` fires once
 queries actually start failing.
+
+## The lxplus keepalive (`lxplus_beam_watcher.sh`)
+
+Started by hand and by acron, same script:
+
+```
+*/10 * * * * lxplus /eos/.../DAQ_Control_Dream_Beam/beam_monitor/lxplus_beam_watcher.sh
+```
+
+**It decides whether the watcher is alive from the published data, not from a
+PID.** lxplus is a cluster and the acrontab host field is plain `lxplus`, so each
+tick lands on an arbitrary node while the lockfile sits on shared AFS. A PID
+recorded by one node means nothing on another — on a busy node an unrelated
+process very likely holds it, so a `kill -0` check silently succeeds and the
+keepalive exits "already running" forever. That is exactly how the 2026-07-23
+outage ran for two days: the watcher died at 11:39, nothing restarted it, and the
+GUI showed a stale beam state until someone looked.
+
+Decision order:
+
+| state on EOS | lockfile | action |
+|---|---|---|
+| newer than `MAX_STALE_S` (600 s) | — | healthy, no-op |
+| stale | started < `GRACE_S` (900 s) ago | warming up, leave alone |
+| stale | live PID **on this node** | wedged: kill, restart |
+| stale | PID on another node / legacy bare-PID / absent | restart (cannot verify a foreign PID, and never kills one) |
+
+Age comes from the payload's own `timestamp` — when the watcher last had DATA —
+falling back to the file mtime if that is missing or unparseable. `GRACE_S` is
+what stops a restart loop: the watcher needs a JVM + Spark session before it
+publishes anything, so without it a tick right after a start would see stale data
+and kill the starting watcher. Being on shared AFS, the grace timestamp also
+keeps two nodes from racing into duplicate watchers, which would both append to
+the same per-day CSV and interleave its lines.
+
+Decisions are logged to `~/sps_beam_keepalive.log` on lxplus (one line per tick,
+so a future outage is diagnosable). Lockfile is `host pid started_at`.
+
+`bash beam_monitor/test_lxplus_watcher_keepalive.sh` exercises all of the above
+off-lxplus with a stub watcher — no EOS, NXCALS or Java needed.
+
+**Restarting still needs a valid ticket**: the keepalive brings the watcher back,
+but it cannot write to EOS if Kerberos has lapsed. If the feed is stale AND
+`krb_valid_until` is in the past, reseed with `kinit` on lxplus first.

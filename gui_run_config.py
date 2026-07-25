@@ -285,8 +285,13 @@ def _iter_schedule(gui):
         dur = rt.get('subrun_min', 0) or 0
         setpoints = {}
         for d in included:
-            if _det_hv_channels(d):
-                setpoints[d['name']] = {'mesh': voltage, 'drift': voltage}
+            ch = _det_hv_channels(d)
+            if ch:
+                # EVERY wired electrode, resist included, so the uRWELL resistive
+                # layer ramps down with its drift instead of staying at its
+                # working point while drift drops to the pedestal bias. Matches
+                # run_config_pedestals.py, which ramps all of hv_channels.
+                setpoints[d['name']] = {el: voltage for el in ch}
         entries.append({'name': 'pedestals', 'run_time': dur,
                         'settle_time': PED_SETTLE_TIME, 'setpoints': setpoints})
 

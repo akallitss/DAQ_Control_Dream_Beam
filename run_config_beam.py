@@ -320,6 +320,39 @@ if P2IN_CHECK:
     OPERATING_HV['P2_MID'] = {'drift': 0, 'mesh': 0}   # not read out in the P2_IN check
     OPERATING_HV['P2_OUT'] = {'drift': 0, 'mesh': 0}
 
+# ---------------------------------------------------------------------------
+# One-off setpoint override for a single run, e.g. a short aliveness check at a
+# point that is known-good rather than at the full operating point:
+#
+#   DAQ_HV_OVERRIDE='P2_MID:drift=500,P2_OUT:drift=500'
+#
+# Deliberately applied ABOVE the MAX_HV assert below, so an override is range
+# checked exactly like a committed setpoint and a typo fails here rather than on
+# the real crate. Unset by default — the committed operating point is unchanged.
+# ---------------------------------------------------------------------------
+_HV_OVERRIDE = os.environ.get('DAQ_HV_OVERRIDE', '').strip()
+if _HV_OVERRIDE:
+    for _item in _HV_OVERRIDE.split(','):
+        _item = _item.strip()
+        if not _item:
+            continue
+        try:
+            _det_role, _val = _item.split('=')
+            _det, _role = _det_role.split(':')
+        except ValueError:
+            raise SystemExit(f"DAQ_HV_OVERRIDE item {_item!r} is not "
+                             f"'<detector>:<role>=<volts>'")
+        _det, _role = _det.strip(), _role.strip()
+        if _det not in OPERATING_HV:
+            raise SystemExit(f'DAQ_HV_OVERRIDE: unknown detector {_det!r} '
+                             f'(known: {sorted(OPERATING_HV)})')
+        if _role not in OPERATING_HV[_det]:
+            raise SystemExit(f'DAQ_HV_OVERRIDE: {_det} has no role {_role!r} '
+                             f'(known: {sorted(OPERATING_HV[_det])})')
+        _old = OPERATING_HV[_det][_role]
+        OPERATING_HV[_det][_role] = int(_val)
+        print(f'HV OVERRIDE: {_det} {_role} {_old} -> {int(_val)} V')
+
 for _det, _roles in OPERATING_HV.items():
     for _role, _v in _roles.items():
         assert _v <= MAX_HV[_det][_role], (
@@ -733,14 +766,24 @@ class Config(RunConfigBase):
                 for conn in conns for pos in ('bot', 'top')
             }
         # uRWELL x/y strips on cfg Feu 1 (Id 68): front on Dream conn 1-4, back
-        # on 5-8. Orientation: x normal; y inverted (front) / rotated (back).
-        def _urwell(feu, base, y_orient):
+        # on 5-8. All eight uRWELL Dream connectors are cabled inverted (noticed
+        # 2026-07-25); the earlier 'x normal / y inverted (front) / y rotated
+        # (back)' mix was a bookkeeping error.
+        #
+        # This field records the PLUG orientation only. It is descriptive - no
+        # analysis code reads it - and it does not say which of a view's two
+        # connectors carries the low strips. Measured on drift_mesh_scan_1, three
+        # of the four views (front x, back x, back y) have that pair order
+        # interchanged with respect to the strip map and front y does not, so a
+        # uniform 'inverted' must NOT be turned into a uniform mapping
+        # correction. See ~/dylan/urw_analysis/ORDERING.md.
+        def _urwell(feu, base):
             feus = {'x1': (feu, base), 'x2': (feu, base + 1),
                     'y1': (feu, base + 2), 'y2': (feu, base + 3)}
-            orient = {'x1': 'normal', 'x2': 'normal', 'y1': y_orient, 'y2': y_orient}
+            orient = {key: 'inverted' for key in feus}
             return feus, orient
-        _urwell_front_feus, _urwell_front_orient = _urwell(1, 1, 'inverted')
-        _urwell_back_feus,  _urwell_back_orient  = _urwell(1, 5, 'rotated')
+        _urwell_front_feus, _urwell_front_orient = _urwell(1, 1)
+        _urwell_back_feus,  _urwell_back_orient  = _urwell(1, 5)
 
         self.detectors = [
             {
@@ -748,7 +791,7 @@ class Config(RunConfigBase):
                 'description': 'EIC uRWELL front reference (z=0, first the beam '
                                'sees). FEU Id 68 (cfg Feu 1), Dream conn 1-4: '
                                'x1/x2=ch1/2, y1/y2=ch3/4.',
-                'det_type': 'uRWELL',
+                'det_type': 'urw_inter',
                 'resist_type': 'resistive',
                 'bulked_from': '',
                 'det_center_coords': {'x': 0, 'y': 0, 'z': DET_Z_MM['EIC_uRWELL_front']},
@@ -801,7 +844,7 @@ class Config(RunConfigBase):
                 'description': 'EIC uRWELL back reference (z=1370 mm, last the '
                                'beam sees). FEU Id 68 (cfg Feu 1), Dream conn 5-8: '
                                'x1/x2=ch5/6, y1/y2=ch7/8.',
-                'det_type': 'uRWELL',
+                'det_type': 'urw_strip',
                 'resist_type': 'resistive',
                 'bulked_from': '',
                 'det_center_coords': {'x': 0, 'y': 0, 'z': DET_Z_MM['EIC_uRWELL_back']},

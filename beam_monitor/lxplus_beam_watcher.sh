@@ -72,6 +72,8 @@ WATCHER_CMD="${WATCHER_CMD:-}"
 STATE_FILE="$EOS_BEAM_DIR/beam_state.json"
 HOST="$(hostname -s)"
 NOW="$(date +%s)"
+# Transient systemd unit the watcher runs in (see start_watcher).
+UNIT="${UNIT:-sps-beam-watcher}"
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$HOST] $*" | tee -a "$KEEPALIVE_LOG"; }
 
@@ -133,18 +135,51 @@ local_watcher_alive() {
     kill -0 "$LOCK_PID" 2>/dev/null
 }
 
+# lxplus runs systemd-logind with KillUserProcesses=yes, so EVERY process in a
+# login session's cgroup dies the moment that session ends. A `nohup ... &`
+# watcher therefore cannot survive the ssh/acron session that started it —
+# measured 2026-07-25: nohup and even `setsid nohup` were both reaped within
+# seconds of logout, while a systemd-run unit survived. This is the real reason
+# the feed died on 2026-07-23, and it is why the watcher must be launched into
+# its own transient unit, outside the session cgroup.
+#
+# The nohup path is kept only as a fallback for hosts without systemd-run; it
+# logs loudly, because there it will not outlive the session.
 start_watcher() {
     mkdir -p "$EOS_BEAM_DIR" 2>/dev/null
     cd "$REPO_DIR" || { log "ERROR: REPO_DIR $REPO_DIR not found"; exit 1; }
+
+    local cmd
     if [ -n "$WATCHER_CMD" ]; then
-        nohup $WATCHER_CMD >> "$HOME/sps_beam_watcher.log" 2>&1 &
+        cmd="$WATCHER_CMD"
     else
-        nohup "$NXCALS_VENV/bin/python" "$REPO_DIR/beam_watcher.py" \
-              >> "$HOME/sps_beam_watcher.log" 2>&1 &
+        cmd="'$NXCALS_VENV/bin/python' '$REPO_DIR/beam_watcher.py'"
     fi
-    local pid=$!
+    # exec, so the unit's MainPID is the watcher itself and not a wrapping shell
+    # — the kill path below and the lockfile PID both depend on that.
+    local inner="cd '$REPO_DIR' && export JAVA_HOME='$JAVA_HOME' PATH='$PATH' \
+SPARK_LOCAL_IP='$SPARK_LOCAL_IP' SPS_BEAM_STATE='$SPS_BEAM_STATE' \
+SPS_BEAM_LOG_DIR='$SPS_BEAM_LOG_DIR'; exec $cmd >> '$HOME/sps_beam_watcher.log' 2>&1"
+
+    local pid=''
+    if [ "${USE_SYSTEMD_RUN:-1}" = "1" ] && command -v systemd-run >/dev/null 2>&1; then
+        systemctl --user stop "$UNIT" 2>/dev/null
+        systemctl --user reset-failed "$UNIT" 2>/dev/null
+        if systemd-run --user --unit="$UNIT" --quiet /bin/bash -c "$inner" 2>>"$KEEPALIVE_LOG"; then
+            sleep 1
+            pid=$(systemctl --user show -p MainPID --value "$UNIT" 2>/dev/null)
+            [ "$pid" = "0" ] && pid=''
+            [ -n "$pid" ] && log "STARTED unit $UNIT (MainPID $pid) -> $STATE_FILE"
+        fi
+    fi
+
+    if [ -z "$pid" ]; then
+        nohup /bin/bash -c "$inner" >/dev/null 2>&1 &
+        pid=$!
+        log "STARTED pid $pid via nohup fallback — WILL NOT survive this session's end if logind reaps it (systemd-run unavailable?)"
+    fi
+
     echo "$HOST $pid $NOW" > "$LOCKFILE"
-    log "STARTED pid $pid -> $STATE_FILE (log: $HOME/sps_beam_watcher.log)"
 }
 
 # --- decide -------------------------------------------------------------------
@@ -166,6 +201,10 @@ fi
 
 if local_watcher_alive; then
     log "state stale (${AGE_TXT}s) and pid $LOCK_PID is alive HERE — wedged, killing it"
+    # Stop the unit first when there is one: killing MainPID alone would leave
+    # a transient unit behind in a failed state, and systemd-run refuses to
+    # reuse that name until it is reset.
+    systemctl --user stop "$UNIT" 2>/dev/null
     kill "$LOCK_PID" 2>/dev/null
     for _ in 1 2 3 4 5; do
         kill -0 "$LOCK_PID" 2>/dev/null || break

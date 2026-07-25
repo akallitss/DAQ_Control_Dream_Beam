@@ -24,6 +24,9 @@ mkstate(){ printf '{"connected": true, "timestamp": "%s", "beam_on": true}\n' \
            "$(date -d "@$1" '+%Y-%m-%dT%H:%M:%S')" > "$STATE"; }
 # Stub watcher: sleeps, so it holds a real PID we can test kill-0 against.
 export WATCHER_CMD="sleep 300"
+# Force the nohup fallback: this harness tests the DECISION logic, and a
+# transient systemd unit would not give us a plain PID to assert against.
+export USE_SYSTEMD_RUN=0
 # grep -c prints "0" AND exits 1 on no match, so `|| echo 0` would double it.
 started(){ local n=0; [ -f "$KEEPALIVE_LOG" ] && n=$(grep -c STARTED "$KEEPALIVE_LOG" 2>/dev/null); echo "${n:-0}"; }
 

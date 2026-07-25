@@ -76,6 +76,23 @@ def _write_waiting_state(msg):
         json.dump(state, f)
 
 
+def _state_age_s(path):
+    """Age in seconds of the state we just pulled, from ITS OWN timestamp.
+
+    A successful xrdcp is not evidence of live beam data: if the lxplus watcher
+    dies (or its Kerberos ticket expires) the same frozen beam_state.json keeps
+    copying down forever, and the local file's mtime keeps looking fresh. Only
+    the payload timestamp can tell. Returns None if it can't be read."""
+    try:
+        with open(path) as f:
+            state = json.load(f)
+        stamp = state.get('timestamp') or state.get('updated')
+        return (datetime.datetime.now()
+                - datetime.datetime.fromisoformat(stamp)).total_seconds()
+    except Exception:
+        return None
+
+
 def _refresh_kerberos():
     subprocess.run(['kinit', '-R'], capture_output=True)  # renew; ignore failure
 
@@ -99,8 +116,17 @@ def main():
         csv_name = f'beam_intensity_{day}.csv'
         _xrdcp(csv_name, os.path.join(BEAM_LOG_DIR, csv_name))
 
-        if got_state:
+        age = _state_age_s(BEAM_STATE_PATH) if got_state else None
+        if got_state and age is not None and age <= STALE_S:
             last_ok = now
+        elif got_state:
+            # Copy succeeded but the content is frozen (or undatable): overwrite the
+            # local copy with an explicit unknown so the GUI can't render an old BEAM ON.
+            _write_waiting_state(
+                f'lxplus watcher last published {int(age)}s ago '
+                f'— beam state unknown (watcher stopped, or its Kerberos ticket expired?)'
+                if age is not None else
+                'beam_state.json from EOS has no usable timestamp — beam state unknown')
         elif last_ok is None or now - last_ok > STALE_S:
             _write_waiting_state(
                 'no beam_state.json on EOS yet — is the lxplus NXCALS watcher running?'

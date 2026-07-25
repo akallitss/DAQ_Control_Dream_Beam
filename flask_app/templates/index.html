@@ -2464,7 +2464,20 @@ beamRenderPlot();   // initial draw (Overview is the default-active tab at load)
   }
 
   function detCardHTML(d,i){
-    const hc=d.hv_channels||{}, mesh=hc.mesh||[], drift=hc.drift||[], max=d.hv_max||{}, feus=d.dream_feus||{};
+    const hc=d.hv_channels||{}, mesh=hc.mesh||[], drift=hc.drift||[], resist=hc.resist||[], max=d.hv_max||{}, feus=d.dream_feus||{};
+    // scan defaults true, matching gui_run_config._is_scanned, so a config
+    // written before the flag existed keeps its old meaning.
+    const scanned = (d.scan!==false);
+    // Held detectors (uRWELL references): one fixed voltage per WIRED electrode,
+    // used in every sub-run of every scan.
+    const fx = d.fixed_hv||{};
+    const wired = ['mesh','drift','resist'].filter(e=>Array.isArray(hc[e]) && hc[e][0]!=null);
+    const fixedRow = scanned ? '' :
+      '<div class="row g-2 mb-1 align-items-end"><div class="col-auto"><span class="text-muted" style="font-size:0.8rem">held at</span></div>'+
+      (wired.length ? wired.map(e=>'<div class="col-auto"><label class="form-label">'+e+' V</label>'+
+        '<input type="number" step="any" class="form-control form-control-sm" style="width:6.5rem" value="'+(fx[e]!=null?fx[e]:'')+'" oninput="rbApp.setFixed('+i+',\''+e+'\',this.value)"></div>').join('')
+       : '<div class="col-auto text-muted" style="font-size:0.8rem">wire a card/ch below first</div>')+
+      '</div>';
     const feuRows = Object.entries(feus).map(([conn,pair])=>
       '<div class="row g-1 align-items-center mb-1">'+
       '<div class="col-auto"><input class="form-control form-control-sm" style="width:7rem" value="'+esc(conn)+'" onchange="rbApp.renameFeu('+i+',\''+esc(conn)+'\',this.value)"></div>'+
@@ -2476,16 +2489,21 @@ beamRenderPlot();   // initial draw (Overview is the default-active tab at load)
       '<div class="d-flex align-items-center gap-2 mb-2">'+
         '<input class="form-control form-control-sm" style="max-width:9rem" placeholder="name" value="'+esc(d.name||'')+'" onchange="rbApp.setDet('+i+',\'name\',this.value)">'+
         '<div class="form-check mb-0"><input class="form-check-input" type="checkbox" id="rb-inc-'+i+'" '+(d.included?'checked':'')+' onchange="rbApp.setDet('+i+',\'included\',this.checked)"><label class="form-check-label" for="rb-inc-'+i+'" style="font-size:0.8rem">included</label></div>'+
+        '<div class="form-check mb-0" title="Unticked = read out but HV never stepped: held at the fixed voltages below in every sub-run of every scan."><input class="form-check-input" type="checkbox" id="rb-scan-'+i+'" '+(scanned?'checked':'')+' onchange="rbApp.setScan('+i+',this.checked)"><label class="form-check-label" for="rb-scan-'+i+'" style="font-size:0.8rem">scan HV</label></div>'+
+        (scanned?'':'<span class="badge bg-secondary" style="font-size:0.7rem">held constant</span>')+
         '<button class="btn btn-outline-danger btn-sm ms-auto" onclick="rbApp.removeDet('+i+')">Remove</button>'+
       '</div>'+
       '<div class="row g-2 mb-1">'+
         '<div class="col-auto"><label class="form-label">z (mm)</label><input type="number" step="any" class="form-control form-control-sm" style="width:6rem" value="'+(d.z_mm!=null?d.z_mm:'')+'" oninput="rbApp.setDet('+i+',\'z_mm\',this.value)"></div>'+
         '<div class="col-auto"><label class="form-label">mesh card/ch</label><div class="d-flex gap-1"><input type="number" class="form-control form-control-sm" style="width:4.5rem" value="'+(mesh[0]!=null?mesh[0]:'')+'" oninput="rbApp.setChan('+i+',\'mesh\',0,this.value)"><input type="number" class="form-control form-control-sm" style="width:4.5rem" value="'+(mesh[1]!=null?mesh[1]:'')+'" oninput="rbApp.setChan('+i+',\'mesh\',1,this.value)"></div></div>'+
         '<div class="col-auto"><label class="form-label">drift card/ch</label><div class="d-flex gap-1"><input type="number" class="form-control form-control-sm" style="width:4.5rem" value="'+(drift[0]!=null?drift[0]:'')+'" oninput="rbApp.setChan('+i+',\'drift\',0,this.value)"><input type="number" class="form-control form-control-sm" style="width:4.5rem" value="'+(drift[1]!=null?drift[1]:'')+'" oninput="rbApp.setChan('+i+',\'drift\',1,this.value)"></div></div>'+
+        '<div class="col-auto"><label class="form-label">resist card/ch</label><div class="d-flex gap-1"><input type="number" class="form-control form-control-sm" style="width:4.5rem" value="'+(resist[0]!=null?resist[0]:'')+'" oninput="rbApp.setChan('+i+',\'resist\',0,this.value)"><input type="number" class="form-control form-control-sm" style="width:4.5rem" value="'+(resist[1]!=null?resist[1]:'')+'" oninput="rbApp.setChan('+i+',\'resist\',1,this.value)"></div></div>'+
         '<div class="col-auto"><label class="form-label">mesh max</label><input type="number" class="form-control form-control-sm" style="width:6rem" value="'+(max.mesh!=null?max.mesh:'')+'" oninput="rbApp.setMax('+i+',\'mesh\',this.value)"></div>'+
         '<div class="col-auto"><label class="form-label">drift max</label><input type="number" class="form-control form-control-sm" style="width:6rem" value="'+(max.drift!=null?max.drift:'')+'" oninput="rbApp.setMax('+i+',\'drift\',this.value)"></div>'+
+        '<div class="col-auto"><label class="form-label">resist max</label><input type="number" class="form-control form-control-sm" style="width:6rem" value="'+(max.resist!=null?max.resist:'')+'" oninput="rbApp.setMax('+i+',\'resist\',this.value)"></div>'+
         '<div class="col-auto"><label class="form-label">orientation</label><input class="form-control form-control-sm" style="width:11rem" value="'+esc(d.orientation||'')+'" oninput="rbApp.setDet('+i+',\'orientation\',this.value)"></div>'+
       '</div>'+
+      fixedRow+
       '<details><summary style="cursor:pointer;font-size:0.8rem;color:var(--muted)">dream_feus wiring ('+Object.keys(feus).length+' connectors)</summary>'+
       '<div class="mt-2">'+feuRows+'<button class="btn btn-outline-light btn-sm mt-1" onclick="rbApp.addFeu('+i+')">+ connector</button></div></details>';
   }
@@ -2517,7 +2535,10 @@ beamRenderPlot();   // initial draw (Overview is the default-active tab at load)
     const rt = rbGui.run_type||'mesh_scan';
     rbGui.run_types = rbGui.run_types || {};
     rbGui.run_types[rt] = rbGui.run_types[rt] || {};
-    const dets = (rbGui.detectors||[]).filter(d=>d.included && d.name);
+    // Scanned detectors only: a held detector's voltages come from its fixed_hv
+    // on its own card above, not from the run-type setpoints.
+    const dets = (rbGui.detectors||[]).filter(d=>d.included && d.name && d.scan!==false);
+    const heldNames = (rbGui.detectors||[]).filter(d=>d.included && d.name && d.scan===false).map(d=>d.name);
     let html='';
     if(rt==='mesh_scan'){
       html+=scalarInputs(rt,['subrun_min','step_v','points']);
@@ -2546,7 +2567,12 @@ beamRenderPlot();   // initial draw (Overview is the default-active tab at load)
       html+=dets.map(d=>detSetpointRow(rt,'hv',d.name,['mesh','drift'])).join('');
     } else if(rt==='pedestals'){
       html+=scalarInputs(rt,['voltage','subrun_min']);
-      html+='<div class="text-muted mt-2" style="font-size:0.8rem">All included detectors\' mesh+drift channels ramp to the voltage above; single sub-run.</div>';
+      html+='<div class="text-muted mt-2" style="font-size:0.8rem">All included detectors\' mesh+drift channels ramp to the voltage above; single sub-run. '+
+        'Held detectors are ramped too — pedestals deliberately takes everything to one low voltage.</div>';
+    }
+    if(heldNames.length && rt!=='pedestals'){
+      html+='<div class="text-muted mt-2" style="font-size:0.8rem">Held at constant HV for every sub-run (scan HV unticked): <strong>'+
+        heldNames.map(esc).join(', ')+'</strong> — voltages on each detector\'s card above.</div>';
     }
     $('rb-params').innerHTML = html;
   }
@@ -2608,7 +2634,11 @@ beamRenderPlot();   // initial draw (Overview is the default-active tab at load)
       arr[idx]=num(v); d.hv_channels[e]=arr; schedulePreview();
     },
     setMax(i,e,v){ const d=rbGui.detectors[i]; d.hv_max=d.hv_max||{}; d.hv_max[e]=num(v); schedulePreview(); },
-    addDet(){ (rbGui.detectors=rbGui.detectors||[]).push({name:'',included:true,z_mm:0,description:'',hv_channels:{mesh:[null,null],drift:[null,null]},hv_max:{mesh:700,drift:700},dream_feus:{},orientation:'rotated_inverted'}); renderDetectors(); renderParams(); schedulePreview(); },
+    // Re-render: toggling scan shows/hides the fixed-HV row, and the run-type
+    // panel only lists scanned detectors' setpoints.
+    setScan(i,v){ rbGui.detectors[i].scan=!!v; renderDetectors(); renderParams(); schedulePreview(); },
+    setFixed(i,e,v){ const d=rbGui.detectors[i]; d.fixed_hv=d.fixed_hv||{}; d.fixed_hv[e]=num(v); schedulePreview(); },
+    addDet(){ (rbGui.detectors=rbGui.detectors||[]).push({name:'',included:true,scan:true,z_mm:0,description:'',hv_channels:{mesh:[null,null],drift:[null,null]},hv_max:{mesh:700,drift:700},fixed_hv:{},dream_feus:{},orientation:'rotated_inverted'}); renderDetectors(); renderParams(); schedulePreview(); },
     removeDet(i){ rbGui.detectors.splice(i,1); renderDetectors(); renderParams(); schedulePreview(); },
     renameFeu(i,oldC,newC){ if(!newC||newC===oldC) return; const fe=rbGui.detectors[i].dream_feus; const out={}; for(const k in fe){ out[k===oldC?newC:k]=fe[k]; } rbGui.detectors[i].dream_feus=out; renderDetectors(); schedulePreview(); },
     setFeuVal(i,conn,idx,v){ const fe=rbGui.detectors[i].dream_feus; let arr=fe[conn]; if(!Array.isArray(arr)) arr=[null,null]; arr[idx]=num(v); fe[conn]=arr; schedulePreview(); },

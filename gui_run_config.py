@@ -67,6 +67,11 @@ GUI_CONFIG_PATH = os.path.join(_HERE, 'config', 'gui_run_config.json')
 RUN_TYPES = ['mesh_scan', 'drift_scan', 'drift_mesh_2d', 'long_run', 'pedestals']
 DRIFT_MODES = ['follow_mesh', 'absolute']
 TRIGGER_MODES = ['external', 'self']
+
+# Electrodes a detector can have. P2 stations are mesh + drift; the uRWELL
+# references are drift + resist. 'resist' must be here or their resistive layer
+# (card 12) is invisible to every GUI-built schedule.
+ELECTRODES = ('mesh', 'drift', 'resist')
 GAS_PRESETS = ['Ar/Iso 95/5', 'Ar/CO2/Iso 93/5/2', 'Ar/CF4 90/10']
 
 # Seconds to settle after the HV ramp before a pedestal DAQ start (mirrors
@@ -125,14 +130,37 @@ def _channel(pair):
 
 
 def _det_hv_channels(det):
-    """{'mesh':(card,chan), 'drift':(card,chan)} for the electrodes present."""
+    """{electrode: (card, chan)} for the electrodes present.
+
+    'resist' is included: the uRWELL references are drift + resist, not
+    mesh + drift, and leaving it out of this map meant their resistive layer
+    (card 12) was never commanded by a GUI-built schedule at all.
+    """
     out = {}
     hc = det.get('hv_channels') or {}
-    for electrode in ('mesh', 'drift'):
+    for electrode in ELECTRODES:
         ch = _channel(hc.get(electrode))
         if ch is not None:
             out[electrode] = ch
     return out
+
+
+def _is_scanned(det):
+    """True if this detector's HV moves during a scan.
+
+    Default True, so a hand-written config from before 'scan' existed keeps its
+    old meaning. The uRWELL references seed to False: they are the tracking
+    telescope and are held at a constant working point through every scan.
+    """
+    return bool(det.get('scan', True))
+
+
+def _fixed_setpoints(det):
+    """{electrode: V} a held detector is pinned at, restricted to the electrodes
+    it actually has wired."""
+    hv = det.get('fixed_hv') or {}
+    ch = _det_hv_channels(det)
+    return {el: hv[el] for el in ch if hv.get(el) is not None}
 
 
 def _included_dets(gui):
@@ -157,6 +185,10 @@ def _run_type_cfg(gui):
 def _iter_schedule(gui):
     rt_name, rt = _run_type_cfg(gui)
     included = _included_dets(gui)
+    # Only detectors marked scan=true ever have their HV stepped. The rest are
+    # read out at a constant working point, injected into every entry at the end
+    # of this function.
+    scanned_dets = [d for d in included if _is_scanned(d)]
     entries = []
 
     if rt_name == 'mesh_scan':
@@ -164,7 +196,7 @@ def _iter_schedule(gui):
         step = rt.get('step_v', 0) or 0
         dur = rt.get('subrun_min', 0) or 0
         start = rt.get('start', {}) or {}
-        dets = [d for d in included if d['name'] in start]
+        dets = [d for d in scanned_dets if d['name'] in start]
         for i in range(points):
             off = i * step
             setpoints, bits = {}, []
@@ -184,7 +216,7 @@ def _iter_schedule(gui):
         dur = rt.get('subrun_min', 0) or 0
         mesh_fixed = rt.get('mesh_fixed', {}) or {}
         drift_start = rt.get('drift_start', {}) or {}
-        dets = [d for d in included
+        dets = [d for d in scanned_dets
                 if d['name'] in mesh_fixed and d['name'] in drift_start]
         for i in range(points):
             off = i * step
@@ -210,7 +242,7 @@ def _iter_schedule(gui):
         dur = rt.get('subrun_min', 0) or 0
         follow = rt.get('drift_mode', 'follow_mesh') != 'absolute'
         start = rt.get('start', {}) or {}
-        dets = [d for d in included if d['name'] in start]
+        dets = [d for d in scanned_dets if d['name'] in start]
         for k in range(d_points):
             for j in range(m_points):
                 setpoints, bits = {}, []
@@ -236,7 +268,7 @@ def _iter_schedule(gui):
         n = int(rt.get('n_subruns', 0) or 0)
         dur = rt.get('subrun_min', 0) or 0
         hv = rt.get('hv', {}) or {}
-        dets = [d for d in included if d['name'] in hv]
+        dets = [d for d in scanned_dets if d['name'] in hv]
         for i in range(n):
             setpoints, bits = {}, []
             for d in dets:
@@ -257,6 +289,25 @@ def _iter_schedule(gui):
                 setpoints[d['name']] = {'mesh': voltage, 'drift': voltage}
         entries.append({'name': 'pedestals', 'run_time': dur,
                         'settle_time': PED_SETTLE_TIME, 'setpoints': setpoints})
+
+    # Held detectors (scan=false) — the uRWELL references — are written into
+    # EVERY sub-run at their fixed working point, for every scan type. Two
+    # reasons this is an explicit setpoint rather than an omission:
+    #   * omitted channels are never commanded, so they would sit at whatever the
+    #     previous run left on the crate rather than at a known voltage;
+    #   * it mirrors run_config_beam.py's own scans, which write the non-scanned
+    #     detectors at OPERATING_HV in every sub-run.
+    # Written last and unconditionally, so it also overrides any stale scan
+    # setpoint for a detector that has since been switched to held.
+    # 'pedestals' is excluded on purpose: it deliberately ramps every included
+    # detector to its single low voltage, held ones included.
+    if rt_name != 'pedestals':
+        held = [(d['name'], _fixed_setpoints(d))
+                for d in included if not _is_scanned(d)]
+        for e in entries:
+            for name, sp in held:
+                if sp:
+                    e['setpoints'][name] = dict(sp)
 
     return entries
 
@@ -309,7 +360,7 @@ def build_sub_runs(gui):
         hvs = {}
         for det_name, sp in e['setpoints'].items():
             ch = channels.get(det_name, {})
-            for electrode in ('mesh', 'drift'):
+            for electrode in ELECTRODES:
                 if electrode in ch and sp.get(electrode) is not None:
                     card, chan = ch[electrode]
                     hvs.setdefault(str(card), {})[str(chan)] = sp[electrode]
@@ -353,8 +404,19 @@ def validate(gui):
     for d in included:
         name = d.get('name', '?')
         ch = _det_hv_channels(d)
-        if 'mesh' not in ch or 'drift' not in ch:
-            errors.append(f'{name}: needs both mesh and drift HV channels (card, chan)')
+        if _is_scanned(d):
+            # A scanned detector is stepped in mesh and drift, so it needs both.
+            if 'mesh' not in ch or 'drift' not in ch:
+                errors.append(f'{name}: needs both mesh and drift HV channels (card, chan)')
+        else:
+            # A held detector only has to be wired and pinned. This is what lets
+            # the uRWELL references (drift + resist, no mesh) be included at all.
+            if not ch:
+                errors.append(f'{name}: needs at least one HV channel (card, chan)')
+            missing = [el for el in ch if (d.get('fixed_hv') or {}).get(el) is None]
+            if missing:
+                errors.append(f'{name}: held at fixed HV but fixed_hv is missing '
+                              f'{", ".join(missing)}')
         dream_feus = d.get('dream_feus') or {}
         if not dream_feus:
             errors.append(f'{name}: needs at least one dream_feus connector')
@@ -362,21 +424,25 @@ def validate(gui):
             if _channel(pair) is None:
                 errors.append(f'{name}: dream_feus[{conn}] must be [feu, dreamconn] integers')
 
-    # Per-run-type: each included detector must have its setpoints defined.
+    # Per-run-type: each SCANNED detector must have its setpoints defined. Held
+    # detectors are covered by the fixed_hv check above and need no scan
+    # setpoints — requiring them is what previously made the uRWELL references
+    # unincludable in a GUI run.
+    scanned = [d for d in included if _is_scanned(d)]
     if rt_name == 'mesh_scan':
         start = rt.get('start', {}) or {}
-        for d in included:
+        for d in scanned:
             if d['name'] not in start:
                 errors.append(f'{d["name"]}: no mesh_scan start setpoint defined')
     elif rt_name == 'drift_scan':
         mesh_fixed = rt.get('mesh_fixed', {}) or {}
         drift_start = rt.get('drift_start', {}) or {}
-        for d in included:
+        for d in scanned:
             if d['name'] not in mesh_fixed or d['name'] not in drift_start:
                 errors.append(f'{d["name"]}: no drift_scan mesh_fixed/drift_start setpoint defined')
     elif rt_name == 'drift_mesh_2d':
         start = rt.get('start', {}) or {}
-        for d in included:
+        for d in scanned:
             if d['name'] not in start:
                 errors.append(f'{d["name"]}: no drift_mesh_2d start setpoint defined')
         mode = rt.get('drift_mode', 'follow_mesh')
@@ -389,7 +455,7 @@ def validate(gui):
                 errors.append(f'{key} must be at least 1')
     elif rt_name == 'long_run':
         hv = rt.get('hv', {}) or {}
-        for d in included:
+        for d in scanned:
             if d['name'] not in hv:
                 errors.append(f'{d["name"]}: no long_run HV setpoint defined')
 
@@ -419,7 +485,10 @@ def preview(gui):
     for e in _iter_schedule(gui):
         row = {'name': e['name'], 'run_time': e['run_time'], 'detectors': {}}
         for det_name, sp in e['setpoints'].items():
-            row['detectors'][det_name] = {'mesh': sp.get('mesh'), 'drift': sp.get('drift')}
+            # All electrodes, so the preview shows the uRWELLs' resist layer and
+            # the operator can see the held detectors sitting still.
+            row['detectors'][det_name] = {el: sp.get(el) for el in ELECTRODES
+                                          if sp.get(el) is not None}
         sub_runs.append(row)
         total_min += (e['run_time'] or 0)
     return {
@@ -444,14 +513,24 @@ def defaults_from_code():
     finally:
         _suppress_override = False
 
-    scan_start = rcb.SCAN_START
+    _op = rcb.OPERATING_HV
+    # Which detectors a scan is allowed to move. Seeded from the code's own scan
+    # detector set, so the GUI defaults match what RUN_PLAN would do: the P2
+    # stations that set is built from are scanned, and everything else — the two
+    # uRWELL references (tracking telescope) and P2_IN (its 700 V drift ceiling
+    # is below the drift axis's top) — is held at a constant working point.
+    # One flag per detector, so it applies to every run type; the code side can
+    # differ per scan (BEAM_SCAN_DETS includes P2_IN, the drift/2D sets do not),
+    # so this is the safe intersection. Tick a detector's "scan" box in Run Setup
+    # and give it a start setpoint to scan it in a mesh-only run.
+    _scan_dets = set(rcb.BEAM_2D_SCAN_DETS)
 
     detectors = []
     for det in cfg.detectors:
         name = det['name']
         hc = det.get('hv_channels') or {}
         hv_channels = {}
-        for electrode in ('mesh', 'drift'):
+        for electrode in ELECTRODES:
             ch = _channel(hc.get(electrode))
             if ch is not None:
                 hv_channels[electrode] = [ch[0], ch[1]]
@@ -462,7 +541,14 @@ def defaults_from_code():
                 dream_feus[conn] = [ch[0], ch[1]]
         orient_map = det.get('dream_feu_orientation') or {}
         orientation = next(iter(orient_map.values()), 'rotated_inverted')
-        hv_max = dict(scan_start.get(name, {'mesh': 700, 'drift': 700}))
+        # Ceiling from MAX_HV, the authoritative per-channel limit this file's
+        # own assert enforces — NOT from SCAN_START, which is where the Fe55
+        # self-trigger scan STARTS. Those disagree: SCAN_START has P2_MID mesh at
+        # 510 V, above the 450 V ceiling MAX_HV sets, so seeding hv_max from it
+        # let a GUI schedule ask for 60 V over the limit and still validate.
+        hv_max = {el: v for el, v in (rcb.MAX_HV.get(name) or {}).items()
+                  if el in ELECTRODES}
+        scanned = name in _scan_dets
         detectors.append({
             'name': name,
             'included': name in cfg.included_detectors,
@@ -470,16 +556,30 @@ def defaults_from_code():
             'description': det.get('description', ''),
             'hv_channels': hv_channels,
             'hv_max': hv_max,
+            'scan': scanned,
+            # Constant working point for a held detector, straight from the
+            # operating point the code-side scans hold it at. Only meaningful when
+            # scan is false, but seeded either way so ticking the box in the GUI
+            # does not need a voltage typed in as well.
+            'fixed_hv': {el: v for el, v in (_op.get(name) or {}).items()
+                         if el in hv_channels},
             'dream_feus': dream_feus,
             'orientation': orientation,
         })
 
-    # Per-run-type defaults, seeded from the code constants where they exist.
-    mesh_start = {name: dict(sp) for name, sp in scan_start.items()}
-    mesh_fixed = {name: sp['mesh'] for name, sp in scan_start.items()}
-    drift_start = {name: sp['drift'] for name, sp in scan_start.items()}
-    long_hv = {name: {'mesh': sp['mesh'], 'drift': sp['drift']}
-               for name, sp in scan_start.items()}
+    # Per-run-type defaults for the SCANNED detectors, seeded from OPERATING_HV —
+    # the beam operating point the code-side scans step down from — in
+    # OPERATING_HV's own order so the seed is deterministic. Previously these came
+    # from SCAN_START (the Fe55 scan's start), which is why the GUI opened on
+    # P2_MID mesh 510 V while the beam was running it at 450 V.
+    _scan_names = [n for n in _op if n in _scan_dets]
+    _mesh_names = [n for n in _scan_names if 'mesh' in _op[n]]
+    mesh_start = {n: {'mesh': _op[n]['mesh'], 'drift': _op[n]['drift']}
+                  for n in _mesh_names}
+    mesh_fixed = {n: _op[n]['mesh'] for n in _mesh_names}
+    drift_start = {n: _op[n]['drift'] for n in _mesh_names}
+    long_hv = {n: {'mesh': _op[n]['mesh'], 'drift': _op[n]['drift']}
+               for n in _mesh_names}
 
     run_types = {
         'mesh_scan': {
@@ -508,7 +608,7 @@ def defaults_from_code():
             'drift_mode': rcb.BEAM_2D_DRIFT_MODE,
             # Distinct copy, not the mesh_scan dict: sharing it would alias the
             # two run types' start setpoints for any in-memory caller.
-            'start': {name: dict(sp) for name, sp in scan_start.items()},
+            'start': {n: dict(sp) for n, sp in mesh_start.items()},
         },
         'long_run': {
             'subrun_min': rcb.SUBRUN_MIN,

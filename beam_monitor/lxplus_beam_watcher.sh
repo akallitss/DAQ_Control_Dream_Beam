@@ -112,6 +112,11 @@ log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$HOST] $*" | tee -a "$KEEPALIVE_LO
 kinit_from_keytab() {
     [ -r "$KEYTAB" ] || return 1
     if KRB5CCNAME="FILE:$WATCHER_CCACHE" kinit -kt "$KEYTAB" "$PRINCIPAL" 2>>"$KEEPALIVE_LOG"; then
+        # A Kerberos ticket is not an AFS token. $HOME (script, logs, keytab) is
+        # AFS, so without aklog a keytab-only refresh still loses access to them
+        # once the login session's token expires.
+        command -v aklog >/dev/null 2>&1 && \
+            KRB5CCNAME="FILE:$WATCHER_CCACHE" aklog 2>>"$KEEPALIVE_LOG"
         return 0
     fi
     log "WARNING: kinit -kt from $KEYTAB failed for $PRINCIPAL"

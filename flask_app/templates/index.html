@@ -2408,7 +2408,7 @@ beamRenderPlot();   // initial draw (Overview is the default-active tab at load)
       ]);
       if (!cfgR.success) throw cfgR.message || 'config load failed';
       rbGui = cfgR.config;
-      rbOptions = optR.success ? optR : {run_types:['mesh_scan','drift_scan','long_run','pedestals'],
+      rbOptions = optR.success ? optR : {run_types:['mesh_scan','drift_scan','drift_mesh_2d','long_run','pedestals'],
                                          trigger_modes:['external','self'], gas_presets:[]};
       wireStaticInputs();
       renderAll();
@@ -2434,7 +2434,7 @@ beamRenderPlot();   // initial draw (Overview is the default-active tab at load)
 
   function renderAll(){
     $('rb-gas-presets').innerHTML = (rbOptions.gas_presets||[]).map(g=>'<option value="'+esc(g)+'">').join('');
-    $('rb-run-type').innerHTML = (rbOptions.run_types||[]).map(rt=>'<option value="'+rt+'">'+rt.replace('_',' ')+'</option>').join('');
+    $('rb-run-type').innerHTML = (rbOptions.run_types||[]).map(rt=>'<option value="'+rt+'">'+rt.replace(/_/g,' ')+'</option>').join('');
     $('rb-enabled').checked = !!rbGui.enabled;
     $('rb-run-name').value = rbGui.run_name||'';
     $('rb-operator').value = rbGui.operator||'';
@@ -2527,6 +2527,19 @@ beamRenderPlot();   // initial draw (Overview is the default-active tab at load)
       html+=scalarInputs(rt,['subrun_min','step_v','points']);
       html+='<div class="group-label mt-2">Mesh fixed, drift steps DOWN (varies drift gap)</div>';
       html+=dets.map(d=>driftRow(rt,d.name)).join('');
+    } else if(rt==='drift_mesh_2d'){
+      html+=scalarInputs(rt,['subrun_min','drift_points','drift_step_v','mesh_points','mesh_step_v']);
+      const mode=((rbGui.run_types[rt]||{}).drift_mode)||'follow_mesh';
+      html+='<div class="row g-2 mt-1"><div class="col-auto"><label class="form-label">drift during inner mesh scan</label>'+
+        '<select class="form-select form-select-sm" style="width:22rem" onchange="rbApp.setParamStr(\''+rt+'\',\'drift_mode\',this.value)">'+
+        '<option value="follow_mesh"'+(mode==='follow_mesh'?' selected':'')+'>follow_mesh — drift tracks mesh, gap constant (orthogonal axes)</option>'+
+        '<option value="absolute"'+(mode==='absolute'?' selected':'')+'>absolute — drift fixed per drift point, gap grows (skewed axes)</option>'+
+        '</select></div></div>';
+      html+='<div class="text-muted mt-2" style="font-size:0.8rem">2D map: a full mesh scan at EVERY drift point. '+
+        'Sub-runs = drift_points &times; mesh_points, named dm_&lt;drift&gt;_&lt;mesh&gt;_… so <code>dm_03_*</code> globs one drift point. '+
+        'Check the Live Preview total below &mdash; the product gets long quickly.</div>';
+      html+='<div class="group-label mt-2">Start setpoints — outer loop steps drift DOWN, inner loop steps mesh DOWN (negative step goes up)</div>';
+      html+=dets.map(d=>detSetpointRow(rt,'start',d.name,['mesh','drift'])).join('');
     } else if(rt==='long_run'){
       html+=scalarInputs(rt,['subrun_min','n_subruns']);
       html+='<div class="group-label mt-2">Fixed HV per detector</div>';
@@ -2602,6 +2615,9 @@ beamRenderPlot();   // initial draw (Overview is the default-active tab at load)
     addFeu(i){ const fe=rbGui.detectors[i].dream_feus; let n=1; while(fe['c_'+n]!==undefined) n++; fe['c_'+n]=[null,null]; renderDetectors(); schedulePreview(); },
     removeFeu(i,conn){ delete rbGui.detectors[i].dream_feus[conn]; renderDetectors(); schedulePreview(); },
     setParam(rt,keys,v){ let o=rbGui.run_types[rt]; for(let k=0;k<keys.length-1;k++){ o[keys[k]]=o[keys[k]]||{}; o=o[keys[k]]; } o[keys[keys.length-1]]=num(v); schedulePreview(); },
+    // String-valued param (drift_mode): setParam coerces through num(), which
+    // would turn the mode into NaN. Re-render so the preview reflects the mode.
+    setParamStr(rt,key,v){ rbGui.run_types[rt]=rbGui.run_types[rt]||{}; rbGui.run_types[rt][key]=v; schedulePreview(); },
     setDetParam(rt,sub,name,e,v){ const o=rbGui.run_types[rt]; o[sub]=o[sub]||{}; o[sub][name]=o[sub][name]||{}; o[sub][name][e]=num(v); schedulePreview(); },
     setDetScalar(rt,sub,name,v){ const o=rbGui.run_types[rt]; o[sub]=o[sub]||{}; o[sub][name]=num(v); schedulePreview(); }
   };

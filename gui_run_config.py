@@ -41,14 +41,31 @@ import run_config_beam as rcb
 #      "dream_feus":{"c_4_bot":[3,1], ...},
 #      "orientation":"rotated_inverted"}, ...
 #   ],
-#   "run_type": "mesh_scan",               # mesh_scan | drift_scan | long_run | pedestals
+#   "run_type": "mesh_scan",               # mesh_scan | drift_scan | drift_mesh_2d
+#                                          # | long_run | pedestals
 #   "run_types": { ... per-type parameters ... }
 # }
+#
+# drift_mesh_2d is the 2D map — a full mesh scan AT EVERY drift point (the outer
+# product, not mesh_scan followed by drift_scan). Its parameters:
+#   {"subrun_min": 10, "drift_points": 5, "drift_step_v": 50,
+#    "mesh_points": 4, "mesh_step_v": 10, "drift_mode": "follow_mesh",
+#    "start": {"P2_MID": {"mesh": 450, "drift": 700}, ...}}
+# Both axes step DOWN from "start" (a negative step goes up), as the 1D scans do.
+# drift_mode decides what drift does DURING an inner mesh scan:
+#   "follow_mesh" : drift steps down with mesh, so this outer point's drift gap
+#                   (drift - mesh) is constant across the inner scan. Each row is
+#                   then a pure gain scan at one drift field — orthogonal axes.
+#   "absolute"    : drift held at the outer point's value, so the gap and hence
+#                   the drift field GROW along the inner scan (skewed axes).
+# Sub-run count is drift_points * mesh_points, so the Live Preview total is the
+# number to check before starting.
 # ---------------------------------------------------------------------------
 _HERE = os.path.dirname(os.path.abspath(__file__))
 GUI_CONFIG_PATH = os.path.join(_HERE, 'config', 'gui_run_config.json')
 
-RUN_TYPES = ['mesh_scan', 'drift_scan', 'long_run', 'pedestals']
+RUN_TYPES = ['mesh_scan', 'drift_scan', 'drift_mesh_2d', 'long_run', 'pedestals']
+DRIFT_MODES = ['follow_mesh', 'absolute']
 TRIGGER_MODES = ['external', 'self']
 GAS_PRESETS = ['Ar/Iso 95/5', 'Ar/CO2/Iso 93/5/2', 'Ar/CF4 90/10']
 
@@ -180,6 +197,40 @@ def _iter_schedule(gui):
             entries.append({'name': f'drift_{i:02d}_' + '_'.join(bits),
                             'run_time': dur, 'post_pause_s': 0,
                             'setpoints': setpoints})
+
+    elif rt_name == 'drift_mesh_2d':
+        # 2D map: outer loop steps drift, inner loop steps mesh, so each outer
+        # point carries a complete mesh scan. Names are dm_<k>_<j>_... with k the
+        # drift index and j the mesh index, so 'dm_03_*' globs one drift point's
+        # whole mesh scan (the analysis side selects with --subruns-glob).
+        d_points = int(rt.get('drift_points', 0) or 0)
+        d_step = rt.get('drift_step_v', 0) or 0
+        m_points = int(rt.get('mesh_points', 0) or 0)
+        m_step = rt.get('mesh_step_v', 0) or 0
+        dur = rt.get('subrun_min', 0) or 0
+        follow = rt.get('drift_mode', 'follow_mesh') != 'absolute'
+        start = rt.get('start', {}) or {}
+        dets = [d for d in included if d['name'] in start]
+        for k in range(d_points):
+            for j in range(m_points):
+                setpoints, bits = {}, []
+                for d in dets:
+                    s = start[d['name']]
+                    mesh_v = s.get('mesh', 0) - j * m_step
+                    # follow_mesh: drift tracks mesh down, holding this outer
+                    # point's gap constant across the inner scan. absolute:
+                    # drift stays put, so the gap grows as mesh drops.
+                    drift_v = s.get('drift', 0) - k * d_step
+                    if follow:
+                        drift_v -= j * m_step
+                    setpoints[d['name']] = {'mesh': mesh_v, 'drift': drift_v}
+                    # Both values in the name: drift is the outer axis, so a
+                    # mesh-only name (as the 1D mesh scan uses) would repeat
+                    # across drift points and hide what changed.
+                    bits.append(f'{_suffix(d["name"])}{mesh_v}d{drift_v}')
+                entries.append({'name': f'dm_{k:02d}_{j:02d}_' + '_'.join(bits),
+                                'run_time': dur, 'post_pause_s': 0,
+                                'setpoints': setpoints})
 
     elif rt_name == 'long_run':
         n = int(rt.get('n_subruns', 0) or 0)
@@ -323,6 +374,19 @@ def validate(gui):
         for d in included:
             if d['name'] not in mesh_fixed or d['name'] not in drift_start:
                 errors.append(f'{d["name"]}: no drift_scan mesh_fixed/drift_start setpoint defined')
+    elif rt_name == 'drift_mesh_2d':
+        start = rt.get('start', {}) or {}
+        for d in included:
+            if d['name'] not in start:
+                errors.append(f'{d["name"]}: no drift_mesh_2d start setpoint defined')
+        mode = rt.get('drift_mode', 'follow_mesh')
+        if mode not in DRIFT_MODES:
+            errors.append(f'drift_mode must be one of {DRIFT_MODES}, got {mode!r}')
+        # Both counts must be >= 1: the schedule is their product, so a zero
+        # silently yields an empty run rather than a short one.
+        for key in ('drift_points', 'mesh_points'):
+            if int(rt.get(key, 0) or 0) < 1:
+                errors.append(f'{key} must be at least 1')
     elif rt_name == 'long_run':
         hv = rt.get('hv', {}) or {}
         for d in included:
@@ -430,6 +494,21 @@ def defaults_from_code():
             'points': rcb.SCAN_POINTS,
             'mesh_fixed': mesh_fixed,
             'drift_start': drift_start,
+        },
+        # Seeded from the code's BEAM_2D_* constants so the GUI opens on the same
+        # grid a RUN_PLAN='drift_mesh_2d' run would take. 'start' reuses the mesh
+        # scan's start setpoints: mesh is the inner axis's top and drift the outer
+        # axis's, both stepping DOWN from there.
+        'drift_mesh_2d': {
+            'subrun_min': rcb.BEAM_2D_SUBRUN_MIN,
+            'drift_points': rcb.BEAM_2D_DRIFT_POINTS,
+            'drift_step_v': rcb.BEAM_2D_DRIFT_STEP_V,
+            'mesh_points': rcb.BEAM_2D_MESH_POINTS,
+            'mesh_step_v': rcb.BEAM_2D_MESH_STEP_V,
+            'drift_mode': rcb.BEAM_2D_DRIFT_MODE,
+            # Distinct copy, not the mesh_scan dict: sharing it would alias the
+            # two run types' start setpoints for any in-memory caller.
+            'start': {name: dict(sp) for name, sp in scan_start.items()},
         },
         'long_run': {
             'subrun_min': rcb.SUBRUN_MIN,

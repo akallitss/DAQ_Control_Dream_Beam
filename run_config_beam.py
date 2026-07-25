@@ -126,9 +126,14 @@ DREAM_CFG_TEMPLATE = _SITE_CFG.get(
 #   'drift_then_mesh' : the full overnight plan as ONE run — every drift point,
 #                       then every mesh point. This is what overnight_scans.sh
 #                       did as two separate daq_control invocations.
+#   'drift_mesh_2d'   : 2D map — a full mesh scan AT EVERY drift point (the outer
+#                       product, not the concatenation). See the BEAM_2D_SCAN
+#                       block below; sub-run count is the product of the two
+#                       point counts, so check the printed total before starting.
 # ---------------------------------------------------------------------------
 RUN_PLAN = os.environ.get('DAQ_RUN_PLAN', 'drift_then_mesh')
-_RUN_PLANS = ('commissioning', 'drift_scan', 'mesh_scan', 'drift_then_mesh')
+_RUN_PLANS = ('commissioning', 'drift_scan', 'mesh_scan', 'drift_then_mesh',
+              'drift_mesh_2d')
 assert RUN_PLAN in _RUN_PLANS, f'RUN_PLAN {RUN_PLAN!r} not one of {_RUN_PLANS}'
 
 # Mesh-scan shape for the plan-driven (GUI) runs: the 5 V / 12 point / 10 min
@@ -234,6 +239,55 @@ BEAM_DRIFT_SCAN_START_V = int(os.environ.get('DAQ_DRIFT_START_V', '450'))  # fir
 BEAM_DRIFT_SCAN_STEP_V  = int(os.environ.get('DAQ_DRIFT_STEP_V',  '50'))   # V per point, stepping UP
 BEAM_DRIFT_SCAN_POINTS  = int(os.environ.get('DAQ_DRIFT_POINTS',  '10'))   # default 450, 500, ... 900 inclusive
 BEAM_DRIFT_SCAN_SUBRUN_MIN = int(os.environ.get('DAQ_DRIFT_SUBRUN_MIN', '10'))  # minutes per point
+
+# ---------------------------------------------------------------------------
+# Beam 2D DRIFT x MESH scan — the outer product of the two scans above: at every
+# drift point, a full mesh scan. 'drift_then_mesh' runs the two 1D scans back to
+# back and so only ever measures gain at ONE drift field and field at ONE gain;
+# this maps the plane, which is what is needed if efficiency does not factorise
+# into (gain) x (field).
+#
+# Enabled with DAQ_BEAM_2D_SCAN=1 or RUN_PLAN='drift_mesh_2d'. Takes precedence
+# over every other scan (checked first in the sub-run builder below).
+#
+# Axes, both mirroring the 1D conventions above:
+#   outer k: drift = BEAM_2D_DRIFT_START_V + k*BEAM_2D_DRIFT_STEP_V  (stepping UP)
+#   inner j: mesh  = OPERATING_HV[det]['mesh'] - j*BEAM_2D_MESH_STEP_V (DOWN)
+#
+# BEAM_2D_DRIFT_MODE decides what drift does DURING an inner mesh scan, and it
+# changes the physics of the resulting map:
+#
+#   'follow_mesh' (default) : drift steps down with mesh, so the drift GAP
+#       (drift - mesh) is constant across the inner scan. Each inner scan is a
+#       pure gain scan at one drift field, exactly like the 1D mesh scan, which
+#       steps both together for this reason. The two axes come out orthogonal:
+#       k indexes drift field, j indexes gain.
+#   'absolute' : drift is held at the outer point's value while mesh steps down,
+#       so the gap — and therefore the drift field — GROWS along the inner scan.
+#       Literally 'a drift scan, and at each point a mesh scan', but the axes are
+#       then skewed: no row of the map is at constant field.
+#
+# The default samples a 5 x 4 grid = 20 sub-runs x 10 min = 3 h 20 min. Sub-run
+# count is the product, so raising both point counts gets expensive fast —
+# run_config_beam.py prints the grid and the total before anything ramps.
+# ---------------------------------------------------------------------------
+BEAM_2D_SCAN = (os.environ.get('DAQ_BEAM_2D_SCAN', '0') == '1'
+                or RUN_PLAN == 'drift_mesh_2d')
+# Same detectors as the 1D drift scan, and for the same reason: P2_IN's drift
+# ceiling (700 V) is below the drift axis's top, and it is parked off in the
+# checks, so it is held at its operating point as a fixed plane. Both axes move
+# only these detectors; the uRWELL references stay fixed as the telescope.
+BEAM_2D_SCAN_DETS = BEAM_DRIFT_SCAN_DETS
+BEAM_2D_DRIFT_START_V = int(os.environ.get('DAQ_2D_DRIFT_START_V', '450'))  # first drift point (450 = drift-mesh, zero field)
+BEAM_2D_DRIFT_STEP_V  = int(os.environ.get('DAQ_2D_DRIFT_STEP_V',  '50'))   # V per outer point, stepping UP
+BEAM_2D_DRIFT_POINTS  = int(os.environ.get('DAQ_2D_DRIFT_POINTS',  '5'))    # default 450, 500, 550, 600, 650
+BEAM_2D_MESH_STEP_V   = int(os.environ.get('DAQ_2D_MESH_STEP_V',   '10'))   # V per inner point, stepping DOWN
+BEAM_2D_MESH_POINTS   = int(os.environ.get('DAQ_2D_MESH_POINTS',   '4'))    # default mesh 450, 440, 430, 420
+BEAM_2D_SUBRUN_MIN    = int(os.environ.get('DAQ_2D_SUBRUN_MIN',    '10'))   # minutes per grid point
+BEAM_2D_DRIFT_MODE    = os.environ.get('DAQ_2D_DRIFT_MODE', 'follow_mesh')
+_2D_DRIFT_MODES = ('follow_mesh', 'absolute')
+assert BEAM_2D_DRIFT_MODE in _2D_DRIFT_MODES, (
+    f'BEAM_2D_DRIFT_MODE {BEAM_2D_DRIFT_MODE!r} not one of {_2D_DRIFT_MODES}')
 
 LATENCY_SCAN = os.environ.get('DAQ_LATENCY_SCAN', '0') == '1'
 # Centred on the reference's 32, +/- 8 in steps of 4. Widen the step first if
@@ -409,6 +463,7 @@ class Config(RunConfigBase):
             'drift_then_mesh': 'drift_mesh_scan_1',
             'drift_scan':      'drift_scan_1',
             'mesh_scan':       'mesh_scan_1',
+            'drift_mesh_2d':   'drift_mesh_2d_1',
         }.get(RUN_PLAN, 'run_1')
         self.run_name = os.environ.get('DAQ_RUN_NAME') or _plan_run_name
         self.base_out_dir = BASE_DATA_DIR
@@ -630,6 +685,63 @@ class Config(RunConfigBase):
                     hvs.setdefault(str(card), {})[str(chan)] = volts
             return hvs
 
+        def _2d_scan_hvs(mesh_v, drift_v):
+            """{card: {channel: V}} with every BEAM_2D_SCAN_DETS detector's mesh
+            set to mesh_v and drift to drift_v. Every other detector is held at
+            its operating point: the uRWELL references (fixed tracking telescope)
+            and P2_IN (drift-limited / parked off, so not scanned).
+
+            Absolute values, not offsets: the 2D grid is defined on the (mesh,
+            drift) plane, and the caller has already resolved the drift mode.
+            """
+            hvs = {}
+            for det_name, det_hv in DET_HV.items():
+                roles = OPERATING_HV[det_name]
+                scanned = det_name in BEAM_2D_SCAN_DETS
+                for role, (card, chan) in det_hv.items():
+                    if scanned and role == 'mesh':
+                        volts = mesh_v
+                    elif scanned and role == 'drift':
+                        volts = drift_v
+                    else:
+                        volts = roles[role]
+                    assert 0 <= volts <= MAX_HV[det_name][role], (
+                        f'{det_name} {role} 2D scan point {volts} V out of range '
+                        f'(max {MAX_HV[det_name][role]} V)')
+                    hvs.setdefault(str(card), {})[str(chan)] = volts
+            return hvs
+
+        def _2d_scan_sub_runs():
+            """2D drift x mesh map: at each drift point, a full mesh scan.
+
+            Sub-run names are dm_<k>_<j>_m<mesh>_d<drift>, with k the drift
+            (outer) index and j the mesh (inner) index, so 'dm_03_*' globs one
+            drift point's whole mesh scan — the analysis side selects sub-runs
+            with --subruns-glob. mesh/drift in the name are the scanned
+            detectors' values (identical across BEAM_2D_SCAN_DETS).
+            """
+            out = []
+            # Reference mesh for the inner axis: the scanned detectors share an
+            # operating mesh, so take the first one's.
+            mesh_0 = OPERATING_HV[BEAM_2D_SCAN_DETS[0]]['mesh']
+            for k in range(BEAM_2D_DRIFT_POINTS):
+                drift_k = BEAM_2D_DRIFT_START_V + k * BEAM_2D_DRIFT_STEP_V
+                for j in range(BEAM_2D_MESH_POINTS):
+                    mesh_off = j * BEAM_2D_MESH_STEP_V
+                    mesh_v = mesh_0 - mesh_off
+                    # follow_mesh: drift tracks mesh down, holding this outer
+                    # point's gap (drift - mesh) constant across the inner scan.
+                    # absolute: drift stays put, so the gap grows as mesh drops.
+                    drift_v = (drift_k - mesh_off
+                               if BEAM_2D_DRIFT_MODE == 'follow_mesh' else drift_k)
+                    out.append({
+                        'sub_run_name': f'dm_{k:02d}_{j:02d}_m{mesh_v}_d{drift_v}',
+                        'run_time': BEAM_2D_SUBRUN_MIN,
+                        'post_pause_s': int(round(POST_SUBRUN_PAUSE_MIN * 60)),
+                        'hvs': _2d_scan_hvs(mesh_v, drift_v),
+                    })
+            return out
+
         def _drift_scan_sub_runs():
             """Drift scan: mesh fixed, drift stepped UP over BEAM_DRIFT_SCAN_DETS."""
             out = []
@@ -673,6 +785,11 @@ class Config(RunConfigBase):
                 'post_pause_s': 0,
                 'hvs': _operating_hvs(),
             })
+        elif BEAM_2D_SCAN:
+            # Checked before the 1D scans: RUN_PLAN='drift_mesh_2d' leaves
+            # BEAM_HV_SCAN/BEAM_DRIFT_SCAN False, but DAQ_BEAM_2D_SCAN=1 layered
+            # on top of an exported DAQ_BEAM_*_SCAN=1 must still give the 2D map.
+            self.sub_runs = _2d_scan_sub_runs()
         elif BEAM_DRIFT_SCAN and BEAM_HV_SCAN:
             # Full overnight plan in ONE run: every drift point, then every mesh
             # point. The two halves use disjoint sub-run names (drift_* vs
@@ -973,12 +1090,31 @@ if __name__ == '__main__':
     print(f'Dream template: {DREAM_CFG_TEMPLATE}')
     print(f'Gas: {config.gas}')
     print(f'Trigger: {config.trigger}')
-    if BEAM_HV_SCAN or BEAM_DRIFT_SCAN:
+    if BEAM_HV_SCAN or BEAM_DRIFT_SCAN or BEAM_2D_SCAN:
         inv = {}
         for d, m in DET_HV.items():
             for role, (cd, ch) in m.items():
                 inv[(str(cd), str(ch))] = (d, role)
         print(f'RUN PLAN: {RUN_PLAN}')
+        if BEAM_2D_SCAN:
+            _last_drift = (BEAM_2D_DRIFT_START_V
+                           + (BEAM_2D_DRIFT_POINTS - 1) * BEAM_2D_DRIFT_STEP_V)
+            _mesh_0 = OPERATING_HV[BEAM_2D_SCAN_DETS[0]]['mesh']
+            _last_mesh = _mesh_0 - (BEAM_2D_MESH_POINTS - 1) * BEAM_2D_MESH_STEP_V
+            print(f'BEAM 2D DRIFT x MESH SCAN: '
+                  f'{BEAM_2D_DRIFT_POINTS} drift x {BEAM_2D_MESH_POINTS} mesh = '
+                  f'{BEAM_2D_DRIFT_POINTS * BEAM_2D_MESH_POINTS} points on '
+                  f'{BEAM_2D_SCAN_DETS}, {BEAM_2D_SUBRUN_MIN} min each')
+            print(f'  drift (outer): {BEAM_2D_DRIFT_START_V}->{_last_drift} V '
+                  f'x +{BEAM_2D_DRIFT_STEP_V} V')
+            print(f'  mesh  (inner): {_mesh_0}->{_last_mesh} V '
+                  f'x -{BEAM_2D_MESH_STEP_V} V')
+            print(f'  drift mode: {BEAM_2D_DRIFT_MODE} — '
+                  + ('drift follows mesh down, so the drift gap is CONSTANT '
+                     'along each inner scan (axes orthogonal)'
+                     if BEAM_2D_DRIFT_MODE == 'follow_mesh' else
+                     'drift held per outer point, so the gap GROWS along each '
+                     'inner scan (axes skewed)'))
         if BEAM_DRIFT_SCAN:
             last_drift = (BEAM_DRIFT_SCAN_START_V
                           + (BEAM_DRIFT_SCAN_POINTS - 1) * BEAM_DRIFT_SCAN_STEP_V)

@@ -218,3 +218,18 @@ config/processor_config.json
 config/qa_config.json
 config/gui_run_config.json
 config/json_run_configs/
+
+# Runtime state written by the GUI / watchers — machine-specific, never shared
+config/*_state.json
+config/processor_config_nov25.json
+beam_monitor/logs/
+
+# Accidental nested copies from path mistakes (flask_app/local/home/...)
+flask_app/local/
+
+# Timestamped backups made before edits
+*.bak
+*.bak_*
+
+# Claude Code per-machine settings (config/ is shared, .local.json is not)
+.claude/settings.local.json

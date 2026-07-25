@@ -1,22 +1,30 @@
 #!/bin/bash
 
-# Source the venv
+# Source the venv (keeps `python` right for anything run in THIS shell; the
+# tmux panes below get the absolute interpreter instead — a pane re-sources
+# .bashrc and reorders PATH, which drops the venv).
 source .venv/bin/activate
+
+# The one interpreter every DAQ process runs on: the repo venv (3.12).
+PY=/local/home/banco/DAQ_Control_Dream_Beam/.venv/bin/python
 
 # Interactive shells on banco export LD_LIBRARY_PATH/PYTHONPATH for unrelated
 # lab software (ISEG SDK etc.), which shadows the ROOT libraries the
 # reconstruction binaries were built against ("symbol lookup error" from
 # decode under the watcher). Scrub them for every session we start.
+# As of 2026-07-25 .bashrc no longer exports either variable, so this is now
+# belt-and-braces rather than load-bearing — keep it: it also protects against
+# whatever environment the person running this script happens to have.
 ENVCLEAN="env -u LD_LIBRARY_PATH -u PYTHONPATH"
 
 # Start sessions. 3rd arg = tmux scrollback cap in LINES (memory-saving).
 # hv_control is very chatty (HV monitor every monitor_interval seconds), so
 # keep it short. The others keep a longer buffer for debugging.
-bash_scripts/start_tmux.sh hv_control "$ENVCLEAN python hv_control.py" 500
-bash_scripts/start_tmux.sh dream_daq "$ENVCLEAN python dream_daq_control.py" 20000
-bash_scripts/start_tmux.sh processor_watcher "$ENVCLEAN python processor_watcher.py config/processor_config.json" 20000
+bash_scripts/start_tmux.sh hv_control "$ENVCLEAN $PY hv_control.py" 500
+bash_scripts/start_tmux.sh dream_daq "$ENVCLEAN $PY dream_daq_control.py" 20000
+bash_scripts/start_tmux.sh processor_watcher "$ENVCLEAN $PY processor_watcher.py config/processor_config.json" 20000
 bash_scripts/start_tmux.sh daq_control "echo 'Daq control session started'" 20000
 bash_scripts/start_tmux.sh flask_server "$ENVCLEAN flask_app/start_flask.sh" 5000
 # Memory guardian: kills a runaway compute job (reconstruction / QA) before the
 # machine runs out of memory and thrashes — never touches the live DAQ.
-bash_scripts/start_tmux.sh mem_guardian "$ENVCLEAN python mem_guardian.py" 2000
+bash_scripts/start_tmux.sh mem_guardian "$ENVCLEAN $PY mem_guardian.py" 2000

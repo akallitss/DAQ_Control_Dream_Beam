@@ -39,6 +39,13 @@ from beam_monitor.beam_intensity_controller import (BEAM_LOG_DIR, BEAM_STATE_PAT
 
 # Repo root (parent of flask_app/) — no per-machine edit needed.
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# Absolute venv interpreter for every python we spawn. NOT bare "python":
+# subprocess.Popen has no shell, so the interactive `alias python='python3'`
+# does not apply and bare "python" resolves to /usr/bin/python (3.8) while the
+# rest of the DAQ runs on the venv's 3.12. Absolute rather than PATH-relative
+# because tmux panes re-source .bashrc and reorder PATH (2026-07-25).
+VENV_PYTHON = f"{BASE_DIR}/.venv/bin/python"
 CONFIG_TEMPLATE_DIR = f"{BASE_DIR}/config/json_templates"
 CONFIG_RUN_DIR = f"{BASE_DIR}/config/json_run_configs"
 CONFIG_PY_PATH = f"{BASE_DIR}/run_config_beam.py"
@@ -364,7 +371,7 @@ def restart_all():
 @app.route("/update_run_config_py", methods=['POST'])
 def update_run_config_py():
     try:
-        subprocess.Popen(["python", f"{BASE_DIR}/iterate_run_num.py"])
+        subprocess.Popen([VENV_PYTHON, f"{BASE_DIR}/iterate_run_num.py"])
         time.sleep(0.2)  # Give it a moment to complete
 
         return jsonify({"success": True, "message": f"Run number iterated"})
@@ -375,7 +382,7 @@ def update_run_config_py():
 @app.route("/run_config_py", methods=['POST'])
 def run_config_py():
     try:
-        subprocess.Popen(["python", f"{BASE_DIR}/run_config_beam.py"])
+        subprocess.Popen([VENV_PYTHON, f"{BASE_DIR}/run_config_beam.py"])
         time.sleep(1)
         config_path = os.path.join(CONFIG_RUN_DIR, 'run_config_beam.json')
         if not os.path.exists(config_path):
@@ -479,7 +486,7 @@ def run_builder_save():
         # Regenerate config/json_run_configs/run_config_beam.json so Start Run
         # picks up the new schedule (same as /run_config_py does before starting).
         result = subprocess.run(
-            ["python", f"{BASE_DIR}/run_config_beam.py"],
+            [VENV_PYTHON, f"{BASE_DIR}/run_config_beam.py"],
             cwd=BASE_DIR, capture_output=True, text=True
         )
         if result.returncode != 0:
@@ -1051,7 +1058,7 @@ def get_config_py():
     try:
         # Call get_config function from run_config_beam.py
         result = subprocess.run(
-            ["python", f"{BASE_DIR}/get_config_py.py"],
+            [VENV_PYTHON, f"{BASE_DIR}/get_config_py.py"],
             capture_output=True,
             text=True
         )

@@ -6,7 +6,10 @@
 # make_dream_ped_cfg.py is implemented to generate that pedestal cfg.
 # python make_dream_ped_cfg.py
 
-python run_config_pedestals.py
+# Absolute venv interpreter (3.12). app.py launches this script with
+# subprocess.Popen (no shell), so bare `python` resolved to /usr/bin/python 3.8
+# while the rest of the DAQ ran on the venv (2026-07-25).
+/local/home/banco/DAQ_Control_Dream_Beam/.venv/bin/python run_config_pedestals.py
 
 CONFIG_PATH="run_config_pedestals.json"
 

@@ -195,6 +195,18 @@ def main():
                         print(f'[pause] Post-sub-run pause: waiting {post_pause_s}s after {sub_run_name}...')
                         _sleep_unless_stop(post_pause_s)
                         print('[pause] Post-sub-run pause: done')
+                else:
+                    # 'HV Ramp Failed …' from hv_control, or '' from a dead socket.
+                    # Stop the monitor here — otherwise the next sub-run's 'Begin
+                    # Monitoring' stacks a second monitor thread on the same stop
+                    # event and both write CSVs forever. Sub-run is skipped, not
+                    # marked complete, so a resume run retakes it.
+                    print(f'[hv] HV NOT ramped for {sub_run_name} '
+                          f'({res or "connection lost"}) — skipping this sub-run.')
+                    if config.hv_info['hv_monitoring']:
+                        hv.send('End Monitoring')
+                        hv.receive()  # Stopping monitoring
+                        hv.receive()  # Finished monitoring
         except KeyboardInterrupt as e:
             print(f'Run stoppping.')
 
@@ -208,13 +220,27 @@ def main():
             _remove_flag(STOP_SUBRUN_FLAG)
         print('Run complete, closing down subsystems')
         if config.power_off_hv_at_end:
-            hv.send('Power Off')
-            hv.receive()  # Starting power off
-            hv.receive()  # Finished power off
-        hv.send('Finished')
-        dream_daq.send('Finished')
-        if config.process_on_fly:
-            processor.send('Finished')
+            # 'Sent: Power Off' proves nothing — sendall into a half-dead socket
+            # succeeds. On 2026-07-25 the hv server had restarted after a ramp
+            # timeout, this send landed in the dead connection, and every
+            # un-tripped channel stayed at voltage overnight. Only the crate's
+            # 'HV Powered Off' reply counts as confirmation.
+            try:
+                hv.send('Power Off')
+                hv.receive()  # HV ready to power off
+                res = hv.receive()  # HV Powered Off
+                if 'Powered Off' not in res:
+                    raise RuntimeError(f'unexpected reply {res!r}')
+            except Exception as e:
+                print(f'!!! HV POWER OFF NOT CONFIRMED ({e}) — '
+                      f'channels may still be at voltage, check the crate !!!')
+        # One dead link must not stop the Finished handshakes to the others.
+        for name, client in [('hv_control', hv), ('dream_daq', dream_daq)] + \
+                            ([('processor', processor)] if config.process_on_fly else []):
+            try:
+                client.send('Finished')
+            except Exception as e:
+                print(f'Could not send Finished to {name}: {e}')
     print('donzo')
 
 

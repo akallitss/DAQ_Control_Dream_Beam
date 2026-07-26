@@ -51,9 +51,23 @@ def main():
                             monitor_print_event.clear()
                             server.send('HV ready to start')
                             sub_run = server.receive_json()
-                            set_hvs(hv_info, sub_run['hvs'], caen_hv, caen_lock)
-                            server.send(f'HV Set {sub_run["sub_run_name"]}')
-                            monitor_print_event.set()
+                            try:
+                                set_hvs(hv_info, sub_run['hvs'], caen_hv, caen_lock)
+                            except RuntimeError as e:
+                                # Ramp timeout. Until 2026-07-26 this propagated out of
+                                # the loop and restarted the server, closing the CAEN
+                                # session AND daq_control's socket — daq_control then
+                                # talked to a dead connection for the rest of the run,
+                                # so its final 'Power Off' never reached the crate
+                                # (drift_mesh_2d_1, 2026-07-25: all un-tripped channels
+                                # stayed at voltage overnight). Report and keep serving;
+                                # HV stays where it is — the client decides.
+                                print(f'Error: {e}')
+                                server.send(f'HV Ramp Failed {sub_run["sub_run_name"]}: {e}')
+                                monitor_print_event.set()
+                            else:
+                                server.send(f'HV Set {sub_run["sub_run_name"]}')
+                                monitor_print_event.set()
                         elif 'Power Off' in res:
                             server.send('HV ready to power off')
                             power_off_hvs(hv_info, caen_hv, caen_lock)

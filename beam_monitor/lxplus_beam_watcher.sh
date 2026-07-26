@@ -135,13 +135,20 @@ kinit_from_keytab() {
 # until the keytab is regenerated (cern-get-keytab --user, needs the account
 # password).
 #
-# Deliberately NO kinit -R here: a renewed ticket comes from a TGS exchange, so
-# it loses the INITIAL flag, and Hadoop rejects a non-initial TGT with the same
-# KrbException 101 a forwarded ticket gets (measured 2026-07-26 10:40 — the
-# renewed-away push failed exactly like the forwarded one). A pushed ticket
-# therefore lives only its ~25 h ticket life, never its renewable life: the
-# price of keeping it NXCALS-grade. Renew nothing; replace the push, or fix the
-# keytab.
+# Deliberately NO kinit -R here: a renewed ticket comes from a TGS exchange and
+# loses the INITIAL flag, and the comment above blames exactly that flag for
+# KrbException 101. Honest status of that theory (2026-07-26): a pushed
+# never-renewed INITIAL ticket (flags FRIA, aes256 session key, readable by the
+# unit) ALSO failed with the same 101 at SparkContext init — so initial-ness
+# alone is NOT sufficient, and no credential flavor has yet been PROVEN to work
+# under this systemd unit. The only historically working setup was an
+# interactive password kinit on lxplus itself (07-22/23, default cache). Next
+# discriminating test, needs the account password on lxplus945:
+#     KRB5CCNAME=FILE:/tmp/krb5cc_sps_beam_$(id -u) kinit akallits@CERN.CH
+#     systemctl --user restart sps-beam-keepalive.service
+# If THAT also 101s, the breakage is environmental/service-side, not the
+# ticket. Keeping no-renew regardless: it is the conservative choice (renewal
+# can only ever strip a property, never add one).
 private_cache_usable() {
     [ -f "$WATCHER_CCACHE" ] || return 1
     KRB5CCNAME="FILE:$WATCHER_CCACHE" klist -s 2>/dev/null || return 1

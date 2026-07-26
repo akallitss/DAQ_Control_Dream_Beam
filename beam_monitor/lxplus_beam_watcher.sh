@@ -123,6 +123,23 @@ kinit_from_keytab() {
     return 1
 }
 
+# Fallback when the keytab is absent or broken: a still-valid ticket already in
+# the private cache is just as good as one freshly minted from the keytab. This
+# is the recovery seam for a keytab with wrong keys ("Preauthentication failed",
+# seen 2026-07-26: the keytab written on 07-25 carried kvno 1) — an INITIAL
+# ticket pushed into $WATCHER_CCACHE from another machine keeps the feed alive
+# until the keytab is regenerated (cern-get-keytab --user, needs the account
+# password). kinit -R first, so a pushed ticket lives out its full renewable
+# life instead of its 25 h ticket life.
+private_cache_usable() {
+    [ -f "$WATCHER_CCACHE" ] || return 1
+    KRB5CCNAME="FILE:$WATCHER_CCACHE" kinit -R 2>>"$KEEPALIVE_LOG" || true
+    KRB5CCNAME="FILE:$WATCHER_CCACHE" klist -s 2>/dev/null || return 1
+    command -v aklog >/dev/null 2>&1 && \
+        KRB5CCNAME="FILE:$WATCHER_CCACHE" aklog 2>>"$KEEPALIVE_LOG"
+    return 0
+}
+
 # NXCALS/Spark needs Java 11 and a bound local IP on lxplus.
 export JAVA_HOME="${JAVA_HOME:-/usr/lib/jvm/java-11-openjdk-11.0.25.0.9-7.el9.x86_64}"
 export PATH="$JAVA_HOME/bin:$PATH"
@@ -218,6 +235,9 @@ start_watcher() {
     if kinit_from_keytab; then
         ccname="export KRB5CCNAME='FILE:$WATCHER_CCACHE'; "
         log "kinit -kt OK -> $WATCHER_CCACHE ($PRINCIPAL)"
+    elif private_cache_usable; then
+        ccname="export KRB5CCNAME='FILE:$WATCHER_CCACHE'; "
+        log "keytab unusable, but $WATCHER_CCACHE holds a valid ticket — using it"
     else
         log "NOTE: no usable keytab at $KEYTAB — watcher will use the default cache, which expires and is shared with login sessions"
     fi
@@ -266,7 +286,7 @@ if [ -n "$AGE" ] && [ "$AGE" -lt "$MAX_STALE_S" ] && [ "$CONNECTED" != "false" ]
     # Publishing normally. Silent on the happy path so acron does not mail every
     # 10 minutes; the log line is enough of a heartbeat. Top up the ticket while
     # we are here — cheap, and it keeps the watcher from ever reaching expiry.
-    kinit_from_keytab >/dev/null 2>&1
+    kinit_from_keytab >/dev/null 2>&1 || private_cache_usable >/dev/null 2>&1
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$HOST] OK: state ${AGE}s old connected=${CONNECTED:-?}" >> "$KEEPALIVE_LOG"
     exit 0
 fi

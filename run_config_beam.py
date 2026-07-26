@@ -229,9 +229,11 @@ BEAM_SCAN_SUBRUN_MIN = int(os.environ.get('DAQ_MESH_SUBRUN_MIN', '20'))     # mi
 BEAM_DRIFT_SCAN = (os.environ.get('DAQ_BEAM_DRIFT_SCAN', '0') == '1'
                    or RUN_PLAN in ('drift_scan', 'drift_then_mesh'))
 BEAM_DRIFT_SCAN_DETS = ('P2_MID', 'P2_OUT')  # detectors whose drift is scanned. P2_IN is
-                                             # EXCLUDED: its drift max is 700 V, below the
-                                             # scan's 900 V top, so it is held at its
-                                             # operating point (a fixed plane) during the scan.
+                                             # excluded here only to keep this 1D scan
+                                             # comparable with the 2026-07-24/25 runs that
+                                             # defined it — the 700 V ceiling that originally
+                                             # forced the exclusion was retired on 2026-07-25
+                                             # (MAX_HV), and the 2D scan does move P2_IN.
 # The scan window is env-overridable so a continuation run (e.g. the top points
 # after a beam stop) needs no code edit — the committed default stays the full
 # 450..900. e.g. DAQ_DRIFT_START_V=800 DAQ_DRIFT_POINTS=3 does 800/850/900.
@@ -273,11 +275,13 @@ BEAM_DRIFT_SCAN_SUBRUN_MIN = int(os.environ.get('DAQ_DRIFT_SUBRUN_MIN', '10'))  
 # ---------------------------------------------------------------------------
 BEAM_2D_SCAN = (os.environ.get('DAQ_BEAM_2D_SCAN', '0') == '1'
                 or RUN_PLAN == 'drift_mesh_2d')
-# Same detectors as the 1D drift scan, and for the same reason: P2_IN's drift
-# ceiling (700 V) is below the drift axis's top, and it is parked off in the
-# checks, so it is held at its operating point as a fixed plane. Both axes move
-# only these detectors; the uRWELL references stay fixed as the telescope.
-BEAM_2D_SCAN_DETS = BEAM_DRIFT_SCAN_DETS
+# All three P2 stations. P2_IN used to be excluded because its drift ceiling was
+# 700 V, below the drift axis's top; that limit was retired on 2026-07-25 (see
+# MAX_HV) and it now takes the same axis as MID/OUT. Deliberately NOT tied to
+# BEAM_DRIFT_SCAN_DETS any more — the 1D drift scan keeps its own committed set.
+# Both axes move only these detectors; the uRWELL references stay fixed at
+# 600/420 as the tracking telescope.
+BEAM_2D_SCAN_DETS = ('P2_IN', 'P2_MID', 'P2_OUT')
 BEAM_2D_DRIFT_START_V = int(os.environ.get('DAQ_2D_DRIFT_START_V', '450'))  # first drift point (450 = drift-mesh, zero field)
 BEAM_2D_DRIFT_STEP_V  = int(os.environ.get('DAQ_2D_DRIFT_STEP_V',  '50'))   # V per outer point, stepping UP
 BEAM_2D_DRIFT_POINTS  = int(os.environ.get('DAQ_2D_DRIFT_POINTS',  '5'))    # default 450, 500, 550, 600, 650
@@ -352,8 +356,14 @@ OPERATING_HV = {
 # unchanged. Watch drift current on every up-step — 900 V drift over a 450 V gap
 # is a higher drift field than these detectors have run at; back a channel off if
 # it draws or trips (the monitor flags >2 uA / any trip).
+# P2_IN drift ceiling raised 700 -> 900 V on 2026-07-25 (Alexandra): the 700 V
+# figure was an old limit, not a property of the chamber, and it was the only
+# reason P2_IN sat out the drift scans. It now matches MID/OUT, so all three P2
+# stations take the same drift axis in the 2D scan. P2_IN has never run above
+# 700 V drift — watch its current on the up-steps of the first few grid rows.
 MAX_HV = {
-    'P2_IN':  {'drift': 700, 'mesh': 450},   # mesh ceiling 450 V (Alexandra 2026-07-25)
+    'P2_IN':  {'drift': 900, 'mesh': 450},   # mesh ceiling 450 V (Alexandra 2026-07-25);
+                                             # drift 700 -> 900 (Alexandra 2026-07-25)
     'P2_MID': {'drift': 900, 'mesh': 450},   # mesh ceiling lowered 510 -> 450 (Alexandra 2026-07-24)
     'P2_OUT': {'drift': 900, 'mesh': 450},
     'EIC_uRWELL_front': {'drift': 600, 'resist': 420},
@@ -483,7 +493,13 @@ class Config(RunConfigBase):
         # Power off all CAEN HV at the end of the run. Env-overridable (DAQ_POWER_OFF=0)
         # so chained runs keep HV up between them and only the last one powers off.
         self.power_off_hv_at_end = os.environ.get('DAQ_POWER_OFF', '1') == '1'
-        self.resume = False  # True to resume an existing run: skip sub-runs already marked .subrun_complete.
+        # True to resume an existing run: sub-runs already marked .subrun_complete
+        # are skipped, so only the missing ones are taken and they land in the
+        # original run_out_dir. Env-overridable (DAQ_RESUME=1) so a series cut
+        # short can be finished without editing this file — as on 2026-07-25,
+        # when Stop Run ended highstat_eff_1 four seconds before sub-run 04's
+        # natural end and beam_commissioning_05 was never taken.
+        self.resume = os.environ.get('DAQ_RESUME', '0') == '1'
         self.write_all_detectors_to_json = True  # Only when making run config json template. Maybe do always?
         self.gas = 'Ar/Iso 95/5'  # Gas type for run
         # self.gas = 'Ar/CO2/Iso 93/5/2'

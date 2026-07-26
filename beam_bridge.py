@@ -37,9 +37,14 @@ os.environ['PATH'] = os.path.expanduser('~/bin') + os.pathsep + os.environ.get('
 sys.path.insert(0, _REPO_DIR)
 from beam_monitor.beam_intensity_controller import BEAM_STATE_PATH, BEAM_LOG_DIR, BEAM_UNIT
 
-EOS_URL = os.environ.get('SPS_BEAM_EOS_URL', 'root://eosproject.cern.ch')
+# User EOS, not the salsachip project space: the project quota filled up on
+# 2026-07-25 (runs backup + epic_tests ~= the whole 1 TB) and blocked even the
+# 9 KB beam_state.json, freezing the feed. The user space has its own 2 TB
+# quota, so the beam feed no longer shares fate with the run backups. Must
+# match EOS_BEAM_DIR in beam_monitor/lxplus_beam_watcher.sh (the publisher).
+EOS_URL = os.environ.get('SPS_BEAM_EOS_URL', 'root://eosuser.cern.ch')
 EOS_DIR = os.environ.get('SPS_BEAM_EOS_DIR',
-                         '/eos/project/s/salsachip/Data/T2_tests/beam_monitor')
+                         '/eos/user/a/akallits/beam_monitor')
 POLL_S = float(os.environ.get('SPS_BEAM_POLL_S', 20))
 STALE_S = float(os.environ.get('SPS_BEAM_STALE_S', 180))
 KINIT_INTERVAL = 3600

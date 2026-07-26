@@ -54,7 +54,11 @@ set -u
 # --- config (override via env before calling) ---
 NXCALS_VENV="${NXCALS_VENV:-/eos/user/a/akallits/nxcals_venv}"
 REPO_DIR="${REPO_DIR:-$HOME/p2_beam_monitor}"          # where beam_watcher.py + beam_monitor/ live on lxplus
-EOS_BEAM_DIR="${EOS_BEAM_DIR:-/eos/project/s/salsachip/Data/T2_tests/beam_monitor}"
+# User EOS, not the salsachip project space: the project quota filled up on
+# 2026-07-25 and "Disk quota exceeded" froze beam_state.json mid-outage — the
+# feed must not share a quota with the run backups. Must match EOS_URL/EOS_DIR
+# in beam_bridge.py on banco (the consumer).
+EOS_BEAM_DIR="${EOS_BEAM_DIR:-/eos/user/a/akallits/beam_monitor}"
 LOCKFILE="${LOCKFILE:-$HOME/.sps_beam_watcher.pid}"
 KEEPALIVE_LOG="${KEEPALIVE_LOG:-$HOME/sps_beam_keepalive.log}"
 
@@ -129,11 +133,17 @@ kinit_from_keytab() {
 # seen 2026-07-26: the keytab written on 07-25 carried kvno 1) — an INITIAL
 # ticket pushed into $WATCHER_CCACHE from another machine keeps the feed alive
 # until the keytab is regenerated (cern-get-keytab --user, needs the account
-# password). kinit -R first, so a pushed ticket lives out its full renewable
-# life instead of its 25 h ticket life.
+# password).
+#
+# Deliberately NO kinit -R here: a renewed ticket comes from a TGS exchange, so
+# it loses the INITIAL flag, and Hadoop rejects a non-initial TGT with the same
+# KrbException 101 a forwarded ticket gets (measured 2026-07-26 10:40 — the
+# renewed-away push failed exactly like the forwarded one). A pushed ticket
+# therefore lives only its ~25 h ticket life, never its renewable life: the
+# price of keeping it NXCALS-grade. Renew nothing; replace the push, or fix the
+# keytab.
 private_cache_usable() {
     [ -f "$WATCHER_CCACHE" ] || return 1
-    KRB5CCNAME="FILE:$WATCHER_CCACHE" kinit -R 2>>"$KEEPALIVE_LOG" || true
     KRB5CCNAME="FILE:$WATCHER_CCACHE" klist -s 2>/dev/null || return 1
     command -v aklog >/dev/null 2>&1 && \
         KRB5CCNAME="FILE:$WATCHER_CCACHE" aklog 2>>"$KEEPALIVE_LOG"

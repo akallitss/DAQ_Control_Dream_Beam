@@ -259,7 +259,12 @@ start_watcher() {
         log "NOTE: no usable keytab at $KEYTAB — watcher will use the default cache, which expires and is shared with login sessions"
     fi
 
+    # JAVA_TOOL_OPTIONS: the JVM must read krb5_jvm.conf, not /etc/krb5.conf —
+    # the system config's proxiable=true makes the JDK throw the client-side
+    # KrbException 101 on any TGT without the P flag (i.e. every ticket minted
+    # on banco). See the header of krb5_jvm.conf.
     local inner="cd '$REPO_DIR' && ${ccname}export JAVA_HOME='$JAVA_HOME' PATH='$PATH' \
+JAVA_TOOL_OPTIONS='-Djava.security.krb5.conf=$REPO_DIR/krb5_jvm.conf' \
 SPARK_LOCAL_IP='$SPARK_LOCAL_IP' SPS_BEAM_STATE='$SPS_BEAM_STATE' \
 SPS_BEAM_LOG_DIR='$SPS_BEAM_LOG_DIR'; exec $cmd >> '$HOME/sps_beam_watcher.log' 2>&1"
 

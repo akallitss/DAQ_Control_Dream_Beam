@@ -2511,7 +2511,11 @@ beamRenderPlot();   // initial draw (Overview is the default-active tab at load)
   // highlighted area IS the deletion set.
   function compCell(v, comp) {
     if (!v) return `<td class="ds-cc none">—</td>`;
-    const sel = compSel.has(comp) ? " sel" : "";
+    // Staged-and-safe is red (it really will be deleted); staged-but-✗ is amber
+    // (the server will refuse it, so those bytes are NOT going anywhere). Only
+    // meaningful once verified — before that there is no ✓/✗ to disagree with.
+    const unsafe = pruneData.verified && !v.safe;
+    const sel = compSel.has(comp) ? (unsafe ? " sel unsafe" : " sel") : "";
     const mark = pruneData.verified ? (v.safe ? " ✓" : ' <span class="u">✗</span>') : "";
     return `<td class="ds-cc${sel}" title="${esc(v.reason || "")}">${v.size_h}${mark}</td>`;
   }

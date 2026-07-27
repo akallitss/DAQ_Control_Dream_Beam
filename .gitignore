@@ -213,6 +213,10 @@ __marimo__/
 hv_creds.txt
 .idea/
 config/backup_config.json
+config/backup_config_post_run.json
+# Persisted EOS listing behind the Disk Space tab's "good as of X ago" — a
+# regenerable cache of what is on EOS, not configuration.
+config/space_remote_cache.json
 config/pedestal_qa_config.json
 config/processor_config.json
 config/qa_config.json

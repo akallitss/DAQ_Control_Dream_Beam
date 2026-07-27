@@ -95,6 +95,18 @@ def run_watcher(config: dict, config_path: Path):
     poll_interval       = config.get('poll_interval',         30)
     stale_run_days      = config.get('stale_run_days',        10)
     reconcile_interval  = config.get('reconcile_interval',  86400)
+    # Backlog sub-runs synced per poll before the live run is re-checked. 1
+    # gives ~2-4 GB of granularity (one sub-run) without throttling the
+    # backlog meaningfully — at ~30 MB/s that is still ~80 GB/h.
+    backlog_per_poll    = max(1, int(config.get('backlog_subruns_per_poll', 1)))
+    # Files the ancillary (non-runs) dirs may copy per poll. 40 * ~7 s ≈ 5 min
+    # of work before the loop checks the runs again — small enough that a live
+    # sub-run is never far behind, large enough to drain 637 pedestal files in
+    # a handful of idle polls.
+    extra_files_per_poll = max(1, int(config.get('extra_sync_files_per_poll', 40)))
+
+    # GUI's last-seen-run tracker, used only to decide sync ORDER.
+    current_run_state = config_path.parent / 'current_run_state.json'
 
     include_runs = set(config['include_runs']) if config.get('include_runs') else None
     exclude_runs = set(config['exclude_runs']) if config.get('exclude_runs') else set()
@@ -166,7 +178,28 @@ def run_watcher(config: dict, config_path: Path):
         else:
             # --- Smart per-subrun sync for runs_subdir ---
             if runs_dir.exists():
-                for run_dir in sorted(runs_dir.iterdir()):
+                # The live run goes FIRST, always. Plain sorted() order put a
+                # 137 GB backlog ahead of the run being acquired on 2026-07-27:
+                # the live sub-runs then went un-backed-up for hours, which in
+                # turn starved prune_active_run (it only deletes what it can
+                # verify on EOS) and nearly filled the disk mid-run. Ordering
+                # alone is not enough — see backlog_budget below.
+                priority = _priority_run(runs_dir, current_run_state)
+                run_dirs = [d for d in sorted(runs_dir.iterdir()) if d.is_dir()]
+                if priority:
+                    run_dirs.sort(key=lambda d: (d.name != priority, d.name))
+
+                # ...because one iteration of this sweep can spend an hour
+                # inside a single 82 GB backlog run before it ever loops back
+                # to the live one. So only a bounded number of BACKLOG sub-runs
+                # are synced per poll; then we break out, re-read the live run,
+                # and come back. The live run itself is never budgeted.
+                backlog_budget = backlog_per_poll
+                stop_sweep = False
+
+                for run_dir in run_dirs:
+                    if stop_sweep:
+                        break
                     if not run_dir.is_dir():
                         continue
                     if include_runs is not None and run_dir.name not in include_runs:
@@ -230,15 +263,48 @@ def run_watcher(config: dict, config_path: Path):
                         else:
                             print(f"[backup] sync FAILED for {run_dir.name}/{subrun_dir.name}")
 
+                        # Spend the backlog budget, then hand the loop back to
+                        # the live run. Counted on the attempt, not on success,
+                        # so a run that fails every time cannot monopolise the
+                        # sweep either.
+                        if priority and run_dir.name != priority:
+                            backlog_budget -= 1
+                            if backlog_budget <= 0:
+                                _end_idle()
+                                print(f"[backup] backlog budget spent — "
+                                      f"rechecking {priority} first")
+                                stop_sweep = True
+                                break
+
                     if is_stale:
                         checked_stale_runs.add(run_dir.name)
                         _end_idle()
                         print(f"[backup] Marked stale (will skip): {run_dir.name}")
 
-            # --- Periodic full sync for all other subdirs ---
-            if now - last_extra_sync >= extra_sync_interval:
+            # --- Periodic full sync for all other subdirs (LOWEST priority) ---
+            # These are ancillary trees (config/, dream_config/, merged/,
+            # pedestals/) — none of it is run data, and none of it is what the
+            # prune loop waits on. Two rules keep them out of the way:
+            #
+            #   1. They only run when the runs sweep moved nothing this poll.
+            #      Run data — live first, then backlog — always goes first.
+            #   2. Even then they are capped at extra_sync_files_per_poll. One
+            #      xrdcp per file costs 5-10 s of connect + Kerberos whatever
+            #      the file size, so pedestals alone (637 files, median 36.6 KB)
+            #      blocks a single poll iteration for ~an hour. The cap makes
+            #      it resumable — already-copied files are skipped next pass —
+            #      so a new sub-run never waits an hour behind a pile of 36 KB
+            #      PNGs.
+            #
+            # Cost of the rules: ancillary dirs lag during heavy acquisition.
+            # That is the intended trade — they are the least urgent thing here.
+            if (not found_new
+                    and now - last_extra_sync >= extra_sync_interval):
                 last_extra_sync = now
+                budget = extra_files_per_poll
                 for subdir in sorted(source_dir.iterdir()):
+                    if budget <= 0:
+                        break
                     if not subdir.is_dir():
                         continue
                     if subdir.name == runs_subdir:
@@ -247,10 +313,17 @@ def run_watcher(config: dict, config_path: Path):
                         continue
                     _end_idle()
                     print(f"[backup] extra sync: {subdir.name}/")
-                    if _xrd_sync_tree(subdir, eos_dir / subdir.name):
-                        print(f"[backup] extra sync done: {subdir.name}/")
-                    else:
+                    ok = _xrd_sync_tree(subdir, eos_dir / subdir.name,
+                                        max_files=budget)
+                    budget -= _SYNC_COPIED     # the cap is per POLL, not per dir
+                    if not ok:
                         print(f"[backup] extra sync FAILED: {subdir.name}/")
+                    elif _SYNC_TRUNCATED:
+                        budget = 0
+                        print(f"[backup] extra sync paused: {subdir.name}/ "
+                              f"— yielding to the runs sweep, resumes next poll")
+                    else:
+                        print(f"[backup] extra sync done: {subdir.name}/")
 
             # --- Full-reconcile sweep (idle-only backstop) ---
             # Re-verifies EVERY run against EOS and re-copies any missing or
@@ -259,12 +332,31 @@ def run_watcher(config: dict, config_path: Path):
             # run_config.json rewrite) and loose files to old/stale runs, which
             # the fast per-subrun path never revisits. Only runs while idle so it
             # never competes with live data transfer.
-            if not found_new and runs_dir.exists() and now - last_reconcile >= reconcile_interval:
+            #
+            # "Idle" must mean NO DATA IS BEING TAKEN, not merely "this poll
+            # synced nothing". This pass is one uninterruptible walk of every
+            # run — with a 330 GB backlog that is hours — and it holds off the
+            # fast sweep for the whole time, so sub-runs written meanwhile go
+            # unbacked and prune_active_run stalls waiting for them. That is
+            # the exact starvation the priority ordering exists to prevent, so
+            # while the priority run is still receiving data the reconcile is
+            # deferred; the fast sweep covers the backlog in the meantime,
+            # budgeted, and the reconcile runs once acquisition stops.
+            if (not found_new and runs_dir.exists()
+                    and now - last_reconcile >= reconcile_interval
+                    and not _run_is_receiving(runs_dir, _priority_run(runs_dir, current_run_state))):
                 last_reconcile = now
                 _end_idle()
                 print(f"[backup] full reconcile: verifying all runs against EOS")
                 n_runs = n_gap_runs = 0
-                for run_dir in sorted(runs_dir.iterdir()):
+                # Same priority rule as the fast sweep: with a backlog in play
+                # this pass can run for hours, so the live run is verified and
+                # closed out first rather than last.
+                _prio = _priority_run(runs_dir, current_run_state)
+                _rdirs = [d for d in sorted(runs_dir.iterdir()) if d.is_dir()]
+                if _prio:
+                    _rdirs.sort(key=lambda d: (d.name != _prio, d.name))
+                for run_dir in _rdirs:
                     if not run_dir.is_dir():
                         continue
                     if include_runs is not None and run_dir.name not in include_runs:
@@ -344,6 +436,11 @@ def _refresh_kerberos(principal: str, gpg_pass_file: Path) -> tuple:
 _XROOTD_URL  = None   # e.g. 'root://eospublic.cern.ch' — set by run_watcher()
 _XRDCP_EXTRA = []     # extra xrdcp args from config — set by run_watcher()
 
+# Outcome of the last _xrd_sync_tree() call, for callers that budget their work:
+# whether it stopped on max_files rather than finishing, and how many it copied.
+_SYNC_TRUNCATED = False
+_SYNC_COPIED    = 0
+
 
 def _xrd_url(eos_path: Path) -> str:
     """Native xrootd URL for an absolute EOS path: root://host//eos/..."""
@@ -394,13 +491,28 @@ def _xrdcp_file(local: Path, eos_path: Path) -> bool:
     return False
 
 
-def _xrd_sync_tree(local_dir: Path, eos_dir: Path) -> bool:
+def _xrd_sync_tree(local_dir: Path, eos_dir: Path, max_files: int = None) -> bool:
     """Copy every file under local_dir into eos_dir on EOS, skipping files already
     there at the same size (data is write-once). Returns True if nothing failed.
 
     Incomplete trees self-heal: absent files copy, size-matched files skip, and a
     partial file (size mismatch) is re-copied — native xrdcp -f can overwrite it.
+
+    max_files caps how many files one call will copy. Every xrdcp invocation
+    pays a fresh connect + Kerberos handshake — measured 5-10 s against
+    eospublic, regardless of file size — so a directory of small files costs
+    minutes-to-hours of wall clock with almost no bytes moving (pedestals:
+    637 files, median 36.6 KB, 2.2 GB total, ~60 min). Left uncapped that runs
+    inside ONE poll iteration and the loop cannot return to the runs sweep
+    meanwhile. Capping makes the pass resumable: the skip-existing check above
+    means the next call simply carries on where this one stopped.
+
+    Sets _SYNC_TRUNCATED when it stopped on the cap rather than finishing, so
+    the caller can tell "done" from "more to do".
     """
+    global _SYNC_TRUNCATED, _SYNC_COPIED
+    _SYNC_TRUNCATED = False
+    _SYNC_COPIED = 0
     remote_sizes = _remote_size_map(eos_dir)
     all_ok, copied, skipped = True, 0, 0
     for f in sorted(local_dir.rglob('*')):
@@ -414,12 +526,17 @@ def _xrd_sync_tree(local_dir: Path, eos_dir: Path) -> bool:
         if remote_sizes.get(rel) == local_size:
             skipped += 1
             continue
+        if max_files is not None and copied >= max_files:
+            _SYNC_TRUNCATED = True
+            break
         if _xrdcp_file(f, eos_dir / rel):
             copied += 1
         else:
             all_ok = False
+    _SYNC_COPIED = copied
     if copied:
-        print(f"[backup] xrdcp -> {eos_dir}: {copied} new, {skipped} already there")
+        tail = ' (capped, will resume)' if _SYNC_TRUNCATED else ''
+        print(f"[backup] xrdcp -> {eos_dir}: {copied} new, {skipped} already there{tail}")
     return all_ok
 
 
@@ -490,6 +607,56 @@ def _dir_size(path: Path) -> int:
     except OSError:
         pass
     return total
+
+
+def _priority_run(runs_dir: Path, state_path: Path):
+    """Name of the run that must be backed up before any backlog, or None.
+
+    Read from the GUI's current_run_state.json, which is a LAST-SEEN tracker —
+    it is not cleared when a run ends. That is fine here and deliberately not
+    gated on the DAQ actually running: prioritising a run that just finished
+    costs nothing (it has no new sub-runs, so the sweep falls straight through
+    to the backlog), whereas failing to prioritise a live one is what caused
+    the 2026-07-27 near-miss. Falls back to the most recently modified run dir
+    so the priority rule still holds if the state file is missing or stale.
+    """
+    try:
+        with open(state_path) as f:
+            name = (json.load(f).get('run_name') or '').strip()
+        if name and (runs_dir / name).is_dir():
+            return name
+    except Exception:
+        pass
+    try:
+        dirs = [d for d in runs_dir.iterdir() if d.is_dir()]
+        return max(dirs, key=lambda d: d.stat().st_mtime).name if dirs else None
+    except OSError:
+        return None
+
+
+def _run_is_receiving(runs_dir: Path, run_name, window_s: float = 900) -> bool:
+    """True if `run_name` has had a file written in the last window_s — i.e.
+    data is still coming in. Used to keep the long full-reconcile pass out of
+    the way of an active run. Deliberately mtime-based rather than asking the
+    DAQ: this watcher is standalone by design, and a stale-by-15-minutes answer
+    only costs one deferred reconcile cycle.
+    """
+    if not run_name:
+        return False
+    run_dir = runs_dir / run_name
+    if not run_dir.is_dir():
+        return False
+    cutoff = time.time() - window_s
+    try:
+        for f in run_dir.rglob('*'):
+            try:
+                if f.is_file() and f.stat().st_mtime >= cutoff:
+                    return True
+            except OSError:
+                continue
+    except OSError:
+        return False
+    return False
 
 
 def _run_is_stale(run_dir: Path, stale_days: float) -> bool:

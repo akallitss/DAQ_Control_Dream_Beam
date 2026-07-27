@@ -182,7 +182,13 @@ REPROCESS_INPUT    = 'raw_fdf'
 
 def _cfg():
     """(runs_root, fs_path, xrootd_url, eos_runs_dir) from the backup watcher's
-    config — the one source of truth for what is backed up where."""
+    config — the one source of truth for what is backed up where.
+
+    NOTE this returns only the PRIMARY (write) destination. For the question
+    "is this local file safe to delete?" use _verify_locations() instead: data
+    written before a destination change still lives at the old path and is just
+    as safe, but is invisible here.
+    """
     with open(BACKUP_CONFIG_PATH) as f:
         cfg = json.load(f)
     source_dir = Path(cfg['source_dir'])
@@ -190,6 +196,45 @@ def _cfg():
     url = cfg.get('xrootd_url', 'root://eospublic.cern.ch').rstrip('/')
     eos_runs = str(Path(cfg['eos_dir']) / cfg.get('runs_subdir', 'runs'))
     return runs_root, str(source_dir), url, eos_runs
+
+
+def _verify_locations() -> list:
+    """Every EOS location that counts as a backup, primary (write) first.
+
+    A run campaign outlives any single destination — quota fills, allocations
+    move — and data pushed to the old path is still perfectly good. Verifying
+    against the current eos_dir alone therefore reports historical runs as
+    "not backed up" and permanently blocks their local disk from being
+    reclaimed. That is what happened on 2026-07-27: the move to nTOF stranded
+    ~66 GB on salsachip and the drift_mesh_2d_2 remnant on user EOS.
+
+    Extra locations come from the optional 'verify_eos_locations' key in
+    backup_config.py — a list of {'xrootd_url': ..., 'eos_dir': ...}. They are
+    READ-ONLY: nothing is ever written or deleted there, they only answer
+    "does a copy of this file already exist?". Absent key == old behaviour.
+
+    Returns [{'url':…, 'eos_runs':…, 'label':…}], primary at index 0.
+    """
+    with open(BACKUP_CONFIG_PATH) as f:
+        cfg = json.load(f)
+    subdir = cfg.get('runs_subdir', 'runs')
+
+    def _loc(url, eos_dir):
+        url = (url or 'root://eospublic.cern.ch').rstrip('/')
+        eos_runs = str(Path(eos_dir) / subdir)
+        return {'url': url, 'eos_runs': eos_runs, 'label': f'{url}/{eos_runs}'}
+
+    locs = [_loc(cfg.get('xrootd_url'), cfg['eos_dir'])]
+    seen = {locs[0]['label']}
+    for extra in cfg.get('verify_eos_locations') or []:
+        try:
+            loc = _loc(extra.get('xrootd_url'), extra['eos_dir'])
+        except (KeyError, TypeError):
+            continue          # a malformed entry must never break verification
+        if loc['label'] not in seen:
+            seen.add(loc['label'])
+            locs.append(loc)
+    return locs
 
 
 def _runs_root() -> Path:
@@ -216,17 +261,19 @@ def _local_size_map(root: Path) -> dict:
     return out
 
 
-def _remote_size_map(eos_dir: str):
+def _remote_size_map(eos_dir: str, url: str = None):
     """{relpath: size} for every file under eos_dir on EOS via native xrdfs,
     or None on a listing error (so the caller can treat 'could not verify' as
-    NOT safe).
+    NOT safe). `url` defaults to the primary endpoint; pass it explicitly to
+    list one of the extra _verify_locations() on another EOS instance.
 
     An absent directory lists cleanly as empty ({}), which correctly reads as
     'nothing backed up'. A genuine xrdfs failure (auth, network) returns None.
     Parses `xrdfs <url> ls -l -R` lines the same way backup_watcher does:
     '<flags> <owner> <group> <size> <date> <time> <path>'.
     """
-    _, _, url, _ = _cfg()
+    if url is None:
+        _, _, url, _ = _cfg()
     try:
         result = subprocess.run(
             ['xrdfs', url, 'ls', '-l', '-R', eos_dir],
@@ -261,7 +308,85 @@ def _remote_size_map(eos_dir: str):
 # the scan -> preflight -> confirm click path does not pay for it three times;
 # every delete re-lists with force=True and never trusts the cache.
 _REMOTE_TTL = 90.0
-_remote_cache = {'t': 0.0, 'map': None}
+
+# Past this, a replayed check is shown as stale and the page nudges for a fresh
+# one. 30 min: long enough that reloading the tab never re-lists, short enough
+# that a verdict predating a run's worth of new backups is not presented as
+# current.
+STALE_CHECK_S = 1800.0
+# 'src' records, for files NOT found at the primary location, which entry of
+# _verify_locations() they came from — so a restore knows where to pull from.
+_remote_cache = {'t': 0.0, 'map': None, 'src': {}}
+
+# The same listing, persisted, so it survives a page reload AND a Flask
+# restart. A verification now costs ~32 s (one xrdfs ls -R per verify
+# location), which is far too long to repeat every time someone opens the tab —
+# and repeating it tells you nothing new, because the answer only changes when
+# the backup watcher pushes something. So the tab reports the last result with
+# its age ("good as of 2 minutes ago") and leaves re-checking to a deliberate
+# click. Deletion never trusts this: delete_components() always re-lists with
+# force=True and re-verifies every item.
+_REMOTE_CACHE_FILE = os.path.join(REPO_DIR, 'config', 'space_remote_cache.json')
+
+
+def _age_h(seconds) -> str:
+    """'2 minutes', '35 seconds', '3 hours' — for 'good as of X ago'."""
+    if seconds is None:
+        return 'never'
+    s = int(max(0, seconds))
+    if s < 60:
+        return f'{s} second{"" if s == 1 else "s"}'
+    if s < 3600:
+        m = s // 60
+        return f'{m} minute{"" if m == 1 else "s"}'
+    if s < 86400:
+        h = s // 3600
+        return f'{h} hour{"" if h == 1 else "s"}'
+    d = s // 86400
+    return f'{d} day{"" if d == 1 else "s"}'
+
+
+def _save_remote_cache(m: dict, src: dict, t: float):
+    tmp = _REMOTE_CACHE_FILE + '.tmp'
+    try:
+        with open(tmp, 'w') as f:
+            json.dump({'t': t, 'map': m, 'src': src}, f)
+        os.replace(tmp, _REMOTE_CACHE_FILE)   # atomic: never a half-written cache
+    except OSError:
+        pass                                   # cache is an optimisation, never required
+
+
+def _load_remote_cache():
+    """(map, src, t) from the persisted listing, or (None, {}, 0.0)."""
+    try:
+        with open(_REMOTE_CACHE_FILE) as f:
+            d = json.load(f)
+        m = d.get('map')
+        if not isinstance(m, dict):
+            return None, {}, 0.0
+        return m, (d.get('src') or {}), float(d.get('t') or 0.0)
+    except (OSError, ValueError, TypeError):
+        return None, {}, 0.0
+
+
+def _has_cached_listing() -> bool:
+    """Is there any listing — in memory or persisted — to replay?"""
+    if _remote_cache['map'] is not None:
+        return True
+    m, _, _ = _load_remote_cache()
+    return m is not None
+
+
+def last_check() -> dict:
+    """When the EOS listing currently available was taken.
+    {'at': epoch|None, 'age_s': float|None, 'at_h': 'HH:MM:SS'|''}."""
+    t = _remote_cache['t'] if _remote_cache['map'] is not None else 0.0
+    if not t:
+        _, _, t = _load_remote_cache()
+    if not t:
+        return {'at': None, 'age_s': None, 'at_h': ''}
+    return {'at': t, 'age_s': max(0.0, time.time() - t),
+            'at_h': time.strftime('%H:%M:%S', time.localtime(t))}
 
 # How long the last EOS listing took, and how many entries it returned. Used
 # ONLY to drive the progress estimate in the GUI. `xrdfs ls -R` cannot be
@@ -306,28 +431,91 @@ def _noop_progress(phase, done, total, msg, item=None):
     pass
 
 
-def _remote_runs_map(force: bool = False, progress=None):
+def _remote_runs_map(force: bool = False, progress=None, allow_stale: bool = False):
     """{'<run>/<subrun>/<component>/<file>': size} for the entire EOS runs tree,
-    or None if the listing failed. Failures are never cached."""
+    or None if the listing failed. Failures are never cached.
+
+    allow_stale=True answers from the persisted listing regardless of age and
+    never contacts EOS — for read-only views that would rather show a dated
+    answer with its age than block. force=True always overrides it.
+    """
     progress = progress or _noop_progress
     now = time.time()
     if (not force and _remote_cache['map'] is not None
             and now - _remote_cache['t'] < _REMOTE_TTL):
         progress('listing', 1, 1, f"{len(_remote_cache['map'])} files (cached)")
         return _remote_cache['map']
-    _, _, _, eos_runs = _cfg()
-    progress('listing', 0, None, 'contacting EOS (xrdfs)…')
+
+    # allow_stale: answer from the persisted listing at ANY age rather than
+    # contacting EOS. This is what a page reload uses — it wants "what did the
+    # last check say, and how old is it", not a fresh 32 s listing.
+    if allow_stale and not force:
+        m, src, t = _load_remote_cache()
+        if m is not None:
+            _remote_cache.update(map=m, src=src, t=t)
+            age = max(0.0, time.time() - t)
+            progress('listing', 1, 1, f'{len(m)} files from the check {_age_h(age)} ago')
+            return m
+
+    # One listing per verify location, merged. A file is backed up if a copy
+    # exists in ANY of them — the union is sound for the only question this
+    # map answers ("is deleting the local copy safe?"), because each file is
+    # judged on its own copy, not on where its siblings happen to live.
+    #
+    # Merge rule is FIRST WINS, primary first. If two locations disagree about
+    # a file's size (one holds a truncated copy) the primary's size is the one
+    # compared against local, so a bad primary copy reports mismatch -> not
+    # safe -> nothing is deleted. That is pessimistic, never permissive, which
+    # is the only direction an error here may take.
+    locs = _verify_locations()
+    progress('listing', 0, None, f'contacting EOS (xrdfs) — {len(locs)} location(s)…')
     t0 = time.time()
-    m = _remote_size_map(eos_runs)
+    merged, src, failed = {}, {}, []
+    for i, loc in enumerate(locs):
+        m = _remote_size_map(loc['eos_runs'], url=loc['url'])
+        if m is None:
+            failed.append(loc['label'])
+            continue
+        for rel, sz in m.items():
+            if rel not in merged:
+                merged[rel] = sz
+                if i:
+                    src[rel] = i     # primary is index 0 == the default
     dt = time.time() - t0
-    if m is not None:
-        _remote_cache['map'] = m
-        _remote_cache['t'] = time.time()
-        _write_hint(listing_s=round(dt, 2), entries=len(m))
-        progress('listing', 1, 1, f'{len(m)} files listed on EOS in {dt:.1f}s')
-    else:
-        progress('listing', 1, 1, 'EOS listing FAILED')
-    return m
+
+    # Only a total failure is unverifiable. A single location that fails can
+    # merely shrink the map, i.e. make data look LESS backed up than it is —
+    # safe. Returning None on a partial failure would instead freeze pruning
+    # whenever a secondary instance is down, which is the bug this replaces.
+    if len(failed) == len(locs):
+        progress('listing', 1, 1, 'EOS listing FAILED (all locations)')
+        return None
+
+    _remote_cache['map'] = merged
+    _remote_cache['src'] = src
+    _remote_cache['t'] = time.time()
+    # Only a listing that reached every location is worth persisting: a partial
+    # one would be replayed later as "good as of X" while quietly understating
+    # what is backed up.
+    if not failed:
+        _save_remote_cache(merged, src, _remote_cache['t'])
+    _write_hint(listing_s=round(dt, 2), entries=len(merged))
+    msg = f'{len(merged)} files listed across {len(locs) - len(failed)}/{len(locs)} location(s) in {dt:.1f}s'
+    if failed:
+        msg += f' — UNREACHABLE: {", ".join(failed)}'
+    progress('listing', 1, 1, msg)
+    return merged
+
+
+def _remote_source(rel: str):
+    """(xrootd_url, eos_runs_dir) the merged listing found `rel` in, so a
+    restore pulls from wherever the file actually is. Anything not recorded
+    came from the primary."""
+    locs = _verify_locations()
+    i = _remote_cache['src'].get(rel, 0)
+    if i >= len(locs):
+        i = 0
+    return locs[i]['url'], locs[i]['eos_runs']
 
 
 def _partition_by_run(rmap: dict) -> dict:
@@ -342,6 +530,7 @@ def _partition_by_run(rmap: dict) -> dict:
 
 def invalidate_remote_cache():
     _remote_cache['map'] = None
+    _remote_cache['src'] = {}
     _remote_cache['t'] = 0.0
 
 
@@ -563,9 +752,18 @@ def disk_usage() -> dict:
     for key, d in DISKS.items():
         try:
             u = shutil.disk_usage(fs_path)
+            # ext4 reserves ~5% for root (47.7 GB of this 937 GB filesystem).
+            # The DAQ writes as `banco`, so those bytes are NOT headroom, and
+            # measuring against the raw total reported 87.7% while df and the
+            # Overview tab both said 93% — the tab understated fullness by ~48
+            # GB, in the one direction that can get a run killed. Percentages
+            # are therefore taken against what is actually writable, which is
+            # what df -h and psutil.disk_usage().percent report.
+            usable = u.used + u.free
             out[key] = {'label': d['label'], 'fs': fs_path,
                         'total': u.total, 'used': u.used, 'free': u.free,
-                        'pct': round(100.0 * u.used / u.total, 1) if u.total else 0.0}
+                        'usable': usable, 'reserved': u.total - usable,
+                        'pct': round(100.0 * u.used / usable, 1) if usable else 0.0}
         except OSError as e:
             out[key] = {'label': d['label'], 'fs': fs_path, 'error': str(e)}
     return out
@@ -792,13 +990,21 @@ def scan(disk: str, runs=None, force: bool = True, progress=None) -> dict:
     }
 
 
-def component_scan(verify: bool = True, force: bool = False, progress=None) -> dict:
+def component_scan(verify: bool = True, force: bool = False, progress=None,
+                   allow_stale: bool = False) -> dict:
     """The run -> subrun -> component tree with a delete verdict on every
     component.
 
     verify=False skips EOS entirely (instant, works offline): sizes and local
     guards are filled in but nothing is marked safe. verify=True issues ONE
     recursive EOS listing and verifies every component from it.
+
+    allow_stale=True verifies against the LAST listing however old it is,
+    without contacting EOS, and reports its age in 'checked_age_h'. That is
+    what a page reload wants: re-running a 32 s check on every load costs real
+    time and changes nothing, since the verdict only moves when the backup
+    watcher pushes. The result is advisory — delete_components() re-lists with
+    force=True and re-verifies every item before removing anything.
 
     progress(phase, done, total, msg) is called through the three phases —
     'scan' (local walk), 'listing' (the opaque EOS call) and 'verify' (per run,
@@ -811,9 +1017,18 @@ def component_scan(verify: bool = True, force: bool = False, progress=None) -> d
     tree = _local_tree()
     progress('scan', 1, 1, f'{len(tree)} run(s) on disk')
 
-    rmap = _remote_runs_map(force=force, progress=progress) if verify else None
+    # A replay with nothing to replay must not silently become a live 32 s
+    # listing — that is the page-load block this whole path exists to avoid.
+    # Fall back to the unverified view; the user clicks "Run safety check".
+    if allow_stale and not force and not _has_cached_listing():
+        verify = False
+
+    rmap = (_remote_runs_map(force=force, progress=progress, allow_stale=allow_stale)
+            if verify else None)
     unverifiable = verify and rmap is None
     by_run = _partition_by_run(rmap) if rmap is not None else {}
+
+    chk = last_check() if verify and not unverifiable else {}
 
     runs_out = []
     names = sorted(tree, key=_run_key)
@@ -909,6 +1124,13 @@ def component_scan(verify: bool = True, force: bool = False, progress=None) -> d
         'reprocess_sentinel': REPROCESS_SENTINEL,
         'usage': disk_usage().get('data', {}),
         'scanned_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        # When the EOS data behind these verdicts was taken, so the page can
+        # say "good as of 2 minutes ago" instead of implying it just checked.
+        'checked_at': chk.get('at_h', ''),
+        'checked_age_s': chk.get('age_s'),
+        'checked_age_h': _age_h(chk.get('age_s')),
+        'checked_stale': bool(chk.get('age_s') is not None
+                              and chk['age_s'] > STALE_CHECK_S),
     }
 
 
@@ -1064,11 +1286,13 @@ def preflight_components(items) -> dict:
     which subruns the processor would reprocess afterwards.
 
     Uses the cached EOS listing (this runs on every selection change); the real
-    delete re-verifies against a fresh one.
+    delete re-verifies against a fresh one. allow_stale so that a selection
+    click can never stall on a 32 s listing just because the 90 s memory TTL
+    happened to lapse — being advisory is the whole point of a preflight.
     """
     triples = _normalize_items(items)
     act, newest = active_run(), newest_run()
-    rmap = _remote_runs_map()
+    rmap = _remote_runs_map(allow_stale=True)
     by_run = _partition_by_run(rmap) if rmap is not None else {}
 
     ok_items, refused = [], []
@@ -1288,9 +1512,12 @@ def _prune_empty_dream_run_dirs(runs):
 # files missing or size-mismatched locally are fetched (xrdcp -f), so it is
 # idempotent and cheap to re-run — exactly the reverse of the backup sync.
 
-def _xrdcp_download(eos_file: str, local_path: Path):
-    """Copy one file EOS -> local via native xrdcp. Returns (ok, stderr)."""
-    _, _, url, _ = _cfg()
+def _xrdcp_download(eos_file: str, local_path: Path, url: str = None):
+    """Copy one file EOS -> local via native xrdcp. Returns (ok, stderr).
+    `url` defaults to the primary endpoint; restore passes the endpoint the
+    file was actually listed at, which may be an older destination."""
+    if url is None:
+        _, _, url, _ = _cfg()
     try:
         local_path.parent.mkdir(parents=True, exist_ok=True)
     except OSError as e:
@@ -1370,8 +1597,7 @@ def restore_run(run: str) -> dict:
     if run == active_run():
         res['message'] = f'{run} is the active run — refusing'
         return res
-    runs_root, fs_path, _, eos_runs = _cfg()
-    eos_run = f"{eos_runs}/{run}"
+    runs_root, fs_path, _, _ = _cfg()
     rmap = _remote_runs_map(force=True)
     if rmap is None:
         res['message'] = 'could not list runs on EOS (Kerberos/network?)'
@@ -1410,7 +1636,11 @@ def restore_run(run: str) -> dict:
     fetched = nfiles = 0
     failed = []
     for rel, sz in to_fetch:
-        ok, err = _xrdcp_download(f"{eos_run}/{rel}", local_root / rel)
+        # Per file, not per run: after a destination change a run can be split
+        # across locations, so each file is pulled from where it was listed.
+        src_url, src_runs = _remote_source(f'{run}/{rel}')
+        ok, err = _xrdcp_download(f"{src_runs}/{run}/{rel}", local_root / rel,
+                                  url=src_url)
         if ok:
             fetched += sz
             nfiles += 1

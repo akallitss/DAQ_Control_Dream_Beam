@@ -524,10 +524,52 @@ def run_builder_save():
         return jsonify({"success": False, "message": str(e)}), 500
 
 
+# Pedestal launches are serialised and debounced (2026-07-27). run_pedestals.sh
+# regenerates the pedestal config and then start_run.sh does `tmux send-keys` into
+# the daq_control pane. send-keys TYPES the command, it does not execute it, so a
+# second launch while the first is still running does not fail loudly — it sits in
+# that shell's input buffer and runs the instant the first one exits.
+#
+# Two guards, because neither alone is sufficient:
+#   - busy: refuse while daq_control is doing anything. This is the one that stops
+#     "take pedestals in the middle of a beam run".
+#   - cooldown: on 2026-07-27 seven clicks landed inside a single second and queued
+#     seven pedestal runs (14:14 -> 14:27, five pedestal sets into one run dir).
+#     daq_control still read "Run Complete" from the previous run for all seven, so
+#     the busy check alone would have passed every one of them. The cooldown covers
+#     the gap between send-keys and the pane reflecting the new process.
+#
+# Neither guard can be replaced by a "stop" afterwards: daq_control clears
+# .stop_run on startup, so Stop Run cannot drain a queue that has already formed.
+PEDESTAL_IDLE_STATES = ("WAITING", "Run Complete", "ERROR")
+PEDESTAL_COOLDOWN_S = 60
+_pedestal_launch_lock = threading.Lock()
+_last_pedestal_launch = float("-inf")
+
+
 @app.route("/take_pedestals", methods=["POST"])
 def take_pedestals():
+    global _last_pedestal_launch
     try:
-        subprocess.Popen([f"{BASH_DIR}/run_pedestals.sh"])
+        with _pedestal_launch_lock:
+            waited = time.monotonic() - _last_pedestal_launch
+            if waited < PEDESTAL_COOLDOWN_S:
+                return jsonify({
+                    "success": False,
+                    "message": f"Pedestals already launching — ignoring duplicate "
+                               f"click ({int(PEDESTAL_COOLDOWN_S - waited)}s to go)."
+                }), 409
+
+            daq_state = get_daq_control_status().get("status", "UNKNOWN STATE")
+            if daq_state not in PEDESTAL_IDLE_STATES:
+                return jsonify({
+                    "success": False,
+                    "message": f"daq_control is busy ({daq_state}) — stop the run "
+                               f"before taking pedestals."
+                }), 409
+
+            subprocess.Popen([f"{BASH_DIR}/run_pedestals.sh"])
+            _last_pedestal_launch = time.monotonic()
         return jsonify({"success": True, "message": "Taking pedestals"})
     except Exception as e:
         return jsonify({"success": False, "message": str(e)}), 500
@@ -1675,11 +1717,21 @@ def space_components():
     verify=0 skips EOS entirely (instant, works offline) so the tab can paint
     the breakdown immediately; verify=1 issues ONE recursive EOS listing for
     the whole tree and marks each component safe/unsafe from it.
+
+    verify=cached is what a page reload uses: it replays the LAST listing at
+    whatever age it has, without touching EOS, and returns checked_age_h so the
+    tab can say "good as of 2 minutes ago". A fresh listing now costs ~32 s
+    (one xrdfs per verify location) and the verdicts only move when the backup
+    watcher pushes, so paying that on every reload buys nothing. Deletion is
+    unaffected — it always re-lists and re-verifies.
     """
-    verify = request.args.get("verify", "1") not in ("0", "false", "no")
+    v = request.args.get("verify", "1")
+    allow_stale = v in ("cached", "stale")
+    verify = allow_stale or v not in ("0", "false", "no")
     force = request.args.get("force", "0") in ("1", "true", "yes")
     try:
-        return jsonify(space_manager.component_scan(verify=verify, force=force))
+        return jsonify(space_manager.component_scan(
+            verify=verify, force=force, allow_stale=allow_stale))
     except Exception as e:
         return jsonify({"success": False, "message": str(e)}), 500
 

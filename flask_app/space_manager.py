@@ -13,6 +13,10 @@ space in the local run store, plus a *restore* that pulls runs back from EOS:
 Deletion works at three granularities, all sharing one safety model:
 
   * whole run        delete_run() / delete_runs()
+  * whole subrun     delete_subrun() / delete_subruns(). The useful granularity
+                     for a long run: whole-run deletion can never touch the run
+                     being acquired, but its FINISHED subruns are fair game and
+                     are what actually fill the disk.
   * component        delete_components() over (run, subrun, component) triples,
                      e.g. "drop the decoded waveforms from every subrun of
                      highstat_eff_1 but keep the combined hits"
@@ -48,15 +52,25 @@ Extra guards beyond x17's:
   * the NEWEST run on disk (by mtime) is never deletable — between runs the
     state file may already point at the next run while this one still has
     files in flight;
-  * a subrun missing its .subrun_complete marker is never deletable (possibly
-    still being written / crashed mid-subrun). At run granularity ANY
-    incomplete subrun blocks the whole run; at component granularity only the
-    offending subrun is blocked.
+  * a subrun that is MID-WRITE is never deletable: no .subrun_complete marker
+    AND a file written within INCOMPLETE_GRACE_S (see mid_write_subrun). At run
+    granularity any such subrun blocks the whole run; at subrun and component
+    granularity only the offending subrun is blocked.
+
+    The recency half of that test matters in both directions. Without it, an
+    unmarked subrun left behind by a DAQ stopped mid-acquisition pins its entire
+    run against reclaim forever. And it is deliberately judged on FILE mtimes,
+    never directory mtimes: unlinking a file restamps its parent directory, so a
+    directory-based test reads OUR OWN pruning as a live write and locks out the
+    next prune.
 
 Nothing here trusts a caller-supplied verdict: every delete entry point
 re-runs the full verification itself, against a FRESH EOS listing, immediately
 before it removes anything, and refuses any path that does not resolve inside
-the expected root.
+the expected root. A BATCH delete takes one fresh listing for the batch rather
+than one per item (see _batch_listing) — staleness there is fail-safe, because
+nothing ever removes files from EOS, so the error can only read as
+not-yet-backed-up and refuse.
 
 Performance — every xrdfs invocation costs ~5-10 s of connect + Kerberos
 handshake against eosproject, regardless of how much it lists (a
@@ -638,6 +652,81 @@ def _run_key(name: str):
     return (m.group(1), int(m.group(2))) if m else (name, -1)
 
 
+# How long an unmarked subrun keeps counting as possibly-live. The DAQ writes
+# .subrun_complete the moment a subrun finishes, so an unmarked subrun that has
+# not been written to for two hours was abandoned (the DAQ was stopped mid-subrun)
+# rather than being written right now. Without this cutoff a single abandoned
+# subrun pins its entire run against reclaim forever.
+INCOMPLETE_GRACE_S = 2 * 3600
+
+
+def _newest_file_mtime(path: Path) -> float:
+    """Newest mtime of any FILE under path (-1 if it does not exist), falling
+    back to path's own mtime when it holds no files at all.
+
+    File mtimes, never directory mtimes: unlinking a file re-stamps its parent
+    directory, so any dir-based "was this touched recently?" test reports OUR OWN
+    deletions as fresh writes. That is what made fully-backed-up runs read as
+    "possibly mid-write" the moment a component prune ran inside one of their
+    unmarked subruns — the prune created the very evidence that then blocked the
+    next prune.
+    """
+    t = -1.0
+    try:
+        for f in path.rglob('*'):
+            try:
+                if f.is_file() and not f.is_symlink():
+                    t = max(t, f.stat().st_mtime)
+            except OSError:
+                pass
+    except OSError:
+        return -1.0
+    if t < 0:
+        try:
+            return path.stat().st_mtime
+        except OSError:
+            return -1.0
+    return t
+
+
+def _run_mtime(run: str) -> float:
+    """When a run was last WRITTEN, across the runs and dream_run trees (-1 if
+    absent). This is what "newest run on disk" has to mean.
+
+    Directory mtimes are useless for it: removing anything re-stamps its parent,
+    so pruning a run would make it look freshly written and could push the run we
+    have just been reclaiming to the "newest" end — where it becomes undeletable.
+    Preference order per subrun, each immune to our own deletions:
+      1. its .subrun_complete marker — written when the DAQ finished it;
+      2. the newest FILE it still contains (deleting siblings does not restamp
+         the survivors);
+      3. the subrun directory, for a subrun that holds no files at all.
+    """
+    t = -1.0
+    for root in (_runs_root() / run, _dream_run_root() / run):
+        try:
+            subs = list(root.iterdir())
+        except OSError:
+            continue
+        best = -1.0
+        for sub in subs:
+            marker = sub / '.subrun_complete'
+            try:
+                if marker.is_file():
+                    best = max(best, marker.stat().st_mtime)
+                    continue
+            except OSError:
+                pass
+            best = max(best, _newest_file_mtime(sub))
+        if best < 0:
+            try:
+                best = root.stat().st_mtime
+            except OSError:
+                continue
+        t = max(t, best)
+    return t
+
+
 # Line markers in daq_control's tmux pane (same source flask_app/daq_status.py
 # scrapes). Scanned newest-first: the first marker hit decides. Anything not
 # matching either list (e.g. periodic [status] lines) keeps scanning.
@@ -685,17 +774,18 @@ def active_run() -> str:
 
 
 def newest_run() -> str:
-    """Name of the run dir with the most recent mtime (never deletable — it may
-    still be receiving files even if the state file already points elsewhere),
-    or ''."""
+    """Name of the most recently WRITTEN run (never deletable — it may still be
+    receiving files even if the state file already points elsewhere), or ''.
+
+    Judged by _run_mtime, not the run directory's own mtime: a directory mtime is
+    restamped by our own pruning, which would nominate a run we have just
+    reclaimed as the newest one and lock it.
+    """
     newest, newest_t = '', -1.0
     try:
         for p in _runs_root().iterdir():
             if p.is_dir() and RUN_NAME_RE.match(p.name):
-                try:
-                    t = p.stat().st_mtime
-                except OSError:
-                    continue
+                t = _run_mtime(p.name)
                 if t > newest_t:
                     newest, newest_t = p.name, t
     except OSError:
@@ -708,15 +798,44 @@ def subrun_complete(run: str, subrun: str) -> bool:
     return (_runs_root() / run / subrun / '.subrun_complete').is_file()
 
 
-def incomplete_subruns(run_root: Path) -> list:
-    """Subrun dirs under run_root missing their .subrun_complete marker
-    (daq_control writes it when a subrun finishes cleanly). A run with any
-    incomplete subrun may still be mid-write — never deletable."""
+def mid_write_subrun(run: str, subrun: str) -> bool:
+    """True when a subrun has no .subrun_complete marker AND still holds a file
+    written within INCOMPLETE_GRACE_S on either tree — i.e. it may be being
+    written right now.
+
+    Judged on FILE mtimes (see _newest_file_mtime): a deletion inside the subrun
+    restamps its directories, so a directory-based test flags our own pruning as
+    a live write and locks the run out of any further deletion. An unmarked but
+    long-quiet subrun is NOT mid-write — it is judged on its EOS verdict like any
+    other.
+    """
+    if subrun_complete(run, subrun):
+        return False
+    now = time.time()
+    for root in (_runs_root(), _dream_run_root()):
+        t = _newest_file_mtime(root / run / subrun)
+        if t > 0 and now - t < INCOMPLETE_GRACE_S:
+            return True
+    return False
+
+
+def incomplete_subruns(run: str, recent_only: bool = False) -> list:
+    """Subruns of a run missing their .subrun_complete marker (daq_control writes
+    it when a subrun finishes cleanly).
+
+    With recent_only=True, only the ones that may still be mid-write — those are
+    what block deleting the run as a whole. A run whose only unmarked subrun was
+    abandoned hours ago is still reclaimable, which is the difference between this
+    and blocking on the bare absence of the marker.
+    """
     out = []
     try:
-        for sub in sorted(run_root.iterdir()):
-            if sub.is_dir() and not (sub / '.subrun_complete').is_file():
-                out.append(sub.name)
+        for sub in sorted((_runs_root() / run).iterdir()):
+            if not sub.is_dir() or (sub / '.subrun_complete').is_file():
+                continue
+            if recent_only and not mid_write_subrun(run, sub.name):
+                continue
+            out.append(sub.name)
     except OSError:
         pass
     return out
@@ -871,6 +990,89 @@ def verify_run(disk: str, run: str, force: bool = False) -> dict:
     return res
 
 
+# --- Subrun verification ---------------------------------------------------
+# A subrun is a self-contained directory mirrored to EOS, so the run-level safety
+# model applies unchanged, one directory deeper. It is the useful granularity for
+# a long run: whole-run deletion cannot touch the run being acquired, and
+# component deletion makes you pick pieces, but "this subrun is finished and fully
+# on EOS" is the common case.
+#
+# A subrun spans BOTH local trees — runs/<run>/<subrun> (processed, backed up) and
+# dream_run/<run>/<subrun> (raw staging, never uploaded). Both are verified, the
+# staging side through the same raw_daq_data mapping _verify_component uses, and
+# the subrun is only safe when both sides are.
+
+def verify_subrun(disk: str, run: str, subrun: str, force: bool = False) -> dict:
+    """Compare one subrun — across the runs tree AND the dream_run staging tree —
+    against its EOS mirror. Sources the single whole-tree EOS listing.
+
+    `.subrun_complete` is reported but does NOT decide safety here: it is mirrored
+    to EOS like any other file, and an abandoned unmarked subrun is judged on its
+    EOS verdict. What blocks a subrun is mid_write_subrun() — see scan_subruns.
+    """
+    res = {'run': run, 'subrun': subrun, 'disk': disk, 'size': 0, 'files': 0,
+           'ok': 0, 'missing': 0, 'mismatch': 0,
+           'safe': False, 'reason': '', 'unverifiable': False,
+           'staging_files': 0, 'staging_size': 0,
+           'complete': subrun_complete(run, subrun)}
+
+    proc_root = _runs_root() / run / subrun
+    stage_root = _dream_run_root() / run / subrun
+    if not proc_root.is_dir() and not stage_root.is_dir():
+        res['reason'] = 'subrun directory not found'
+        return res
+
+    # Keyed relative to the RUN root, so both sets line up with the
+    # _partition_by_run() keys the EOS comparison uses.
+    proc = {f'{subrun}/{rel}': sz
+            for rel, sz in _local_size_map(proc_root).items()} if proc_root.is_dir() else {}
+    stage = {f'{subrun}/{rel}': sz
+             for rel, sz in _local_size_map(stage_root).items()} if stage_root.is_dir() else {}
+    res['files'] = len(proc) + len(stage)
+    res['size'] = sum(proc.values()) + sum(stage.values())
+    res['staging_files'] = len(stage)
+    res['staging_size'] = sum(stage.values())
+
+    rmap = _remote_runs_map(force=force)
+    if rmap is None:
+        res['unverifiable'] = True
+        res['reason'] = 'could not list runs on EOS (Kerberos/network?) — NOT safe'
+        return res
+    remote = _partition_by_run(rmap).get(run, {})
+
+    if not proc and not stage:
+        res['reason'] = 'subrun directory is empty'
+        return res
+
+    reasons = []
+    safe = True
+    if proc:
+        counts = _verify_files(proc, remote)
+        res.update(counts)
+        if counts['missing'] or counts['mismatch']:
+            safe = False
+            reasons.append(f"{counts['missing']} missing + {counts['mismatch']} "
+                           f"size-mismatched on EOS")
+        else:
+            reasons.append(f"all {counts['ok']} files verified on EOS")
+    if stage:
+        # Reuse the component verdict so the staging rule (only .fdf blocks, the
+        # rest is reproducible) stays defined in exactly one place.
+        sv = _verify_component('dream_run', stage, remote)
+        if not sv['safe']:
+            safe = False
+        reasons.append(f"staging: {sv['reason']}")
+        res['ok'] += sv['ok']
+        res['missing'] += sv['missing']
+        res['mismatch'] += sv['mismatch']
+
+    res['safe'] = safe
+    res['reason'] = ' · '.join(reasons)
+    return res
+
+
+# --- Local guards ----------------------------------------------------------
+
 def _apply_local_guards(v: dict, run: str, act: str, newest: str) -> dict:
     """Downgrade a verify verdict for runs that must never be deleted no matter
     what EOS says: the active run, the newest run on disk, and runs with
@@ -886,10 +1088,10 @@ def _apply_local_guards(v: dict, run: str, act: str, newest: str) -> dict:
     elif v['newest']:
         guard = 'newest run on disk (possibly still being written) — refusing'
     else:
-        inc = incomplete_subruns(_runs_root() / run)
+        inc = incomplete_subruns(run, recent_only=True)
         if inc:
-            guard = (f'{len(inc)} subrun(s) missing .subrun_complete '
-                     f'(possibly mid-write) — refusing')
+            guard = (f'{len(inc)} unmarked subrun(s) touched in the last '
+                     f'{INCOMPLETE_GRACE_S / 3600:.0f} h (possibly mid-write) — refusing')
     if guard:
         v['safe'] = False
         v['reason'] = f"{v['reason']} · {guard}" if v.get('reason') else guard
@@ -917,6 +1119,32 @@ def list_runs(disk: str) -> list:
     return sorted(runs, key=_run_key)
 
 
+def _subrun_key(name: str):
+    """Sort subruns by their trailing _<NNN> acquisition index when present (so
+    beam_commissioning_09 orders before _10, not lexically), name otherwise."""
+    m = re.search(r'_(\d+)$', name)
+    return (0, int(m.group(1))) if m else (1, name)
+
+
+def list_subruns(disk: str, run: str) -> list:
+    """Subrun directory names of a run, acquisition-order-sorted, across BOTH the
+    runs tree and the dream_run staging tree — a subrun can exist in staging
+    before it has been processed, and in runs/ after its staging copy was pruned.
+
+    Only real directories whose name passes SUBRUN_NAME_RE: loose run-level files
+    (run_config.json, dream_daq.log) and symlinks are ignored.
+    """
+    subs = set()
+    for root in (_runs_root() / run, _dream_run_root() / run):
+        try:
+            for p in root.iterdir():
+                if p.is_dir() and not p.is_symlink() and SUBRUN_NAME_RE.match(p.name):
+                    subs.add(p.name)
+        except OSError:
+            continue
+    return sorted(subs, key=_subrun_key)
+
+
 def local_scan(disk: str) -> dict:
     """What is on the disk right now — local stat() only, no EOS access, so it
     is instant and works even when Kerberos/network is down. Reports each run's
@@ -931,7 +1159,7 @@ def local_scan(disk: str) -> dict:
     for run in list_runs(disk):
         rroot = root / run
         local = _local_size_map(rroot)
-        inc = incomplete_subruns(rroot)
+        inc = incomplete_subruns(run, recent_only=True)
         r = {'run': run, 'disk': disk,
              'size': sum(local.values()), 'files': len(local),
              'active': run == act, 'newest': run == newest,
@@ -942,7 +1170,7 @@ def local_scan(disk: str) -> dict:
         elif r['newest']:
             r['note'] = 'newest run on disk — never deletable'
         elif inc:
-            r['note'] = f'{len(inc)} subrun(s) missing .subrun_complete'
+            r['note'] = f'{len(inc)} unmarked subrun(s) recently touched'
         else:
             r['note'] = 'not yet verified against EOS'
         results.append(r)
@@ -986,6 +1214,48 @@ def scan(disk: str, runs=None, force: bool = True, progress=None) -> dict:
         'safe_bytes': safe_bytes, 'safe_bytes_h': human(safe_bytes),
         'active_run': act,
         'usage': disk_usage().get(disk, {}),
+        'scanned_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+    }
+
+
+def scan_subruns(disk: str, run: str, force: bool = False) -> dict:
+    """Per-subrun verdicts for one run — the finer-grained sibling of scan().
+
+    Every subrun is verified independently against the shared EOS listing. A
+    subrun that may still be being written (unmarked AND recently touched) is
+    never a candidate even if the verification happens to pass mid-write.
+    Completed subruns of the ACQUIRING run ARE eligible — that is the whole point:
+    a long run can be pruned while it is still being taken, which whole-run
+    deletion can never do.
+    """
+    if disk not in DISKS:
+        raise ValueError(f'unknown disk {disk!r}')
+    if not RUN_NAME_RE.match(run or ''):
+        raise ValueError(f'invalid run name {run!r}')
+    act = active_run()
+    newest = newest_run()
+    is_active_run = (run == act)
+    _remote_runs_map(force=force)                        # one shared listing
+    results = []
+    for sub in list_subruns(disk, run):
+        v = verify_subrun(disk, run, sub, force=False)
+        v['active_run'] = is_active_run
+        v['held_active'] = mid_write_subrun(run, sub)
+        if v['held_active'] and v['safe']:
+            v['safe'] = False
+            v['reason'] = 'unmarked and recently written — never deletable yet'
+        v['size_h'] = human(v.get('size', 0))
+        results.append(v)
+    safe_bytes = sum(r['size'] for r in results if r['safe'])
+    total_bytes = sum(r['size'] for r in results)
+    return {
+        'disk': disk, 'run': run, 'active': is_active_run,
+        'subruns': results,
+        'n_subruns': len(results),
+        'n_safe': sum(1 for r in results if r['safe']),
+        'safe_bytes': safe_bytes, 'safe_bytes_h': human(safe_bytes),
+        'total_bytes': total_bytes, 'total_bytes_h': human(total_bytes),
+        'active_run': act, 'newest_run': newest,
         'scanned_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
     }
 
@@ -1044,8 +1314,8 @@ def component_scan(verify: bool = True, force: bool = False, progress=None,
         for subrun in sorted(rentry['subruns']):
             sentry = rentry['subruns'][subrun]
             complete = subrun_complete(run, subrun)
-            sub_guard = guard or ('' if complete else
-                                  'missing .subrun_complete (possibly mid-write) — refusing')
+            sub_guard = guard or ('unmarked and recently written (possibly mid-write) — refusing'
+                                  if mid_write_subrun(run, subrun) else '')
 
             comps_out = {}
             for comp in COMPONENT_ORDER:
@@ -1145,7 +1415,24 @@ def _log_delete(msg: str):
         pass
 
 
-def delete_run(disk: str, run: str) -> dict:
+def _batch_listing():
+    """Take ONE fresh whole-tree EOS listing to verify a batch of deletes against.
+
+    A listing costs a full xrdfs round trip per verify location (~9 s each here),
+    so re-taking it per run turns a 30-run freeing pass into minutes of almost
+    pure waiting. Reusing one listing across the batch is safe because staleness
+    here is FAIL-SAFE in one direction only: nothing we run ever removes files
+    from EOS (backup_watcher is push-only), so a file listed as present is still
+    present, while a file backed up *since* the listing merely reads as
+    not-yet-safe and its delete is refused. The local side — which is the side
+    that changes under us — is always re-read from disk immediately before
+    unlinking.
+    """
+    invalidate_remote_cache()
+    _remote_runs_map(force=True)
+
+
+def delete_run(disk: str, run: str, force: bool = True) -> dict:
     """Delete one run directory, but ONLY after re-verifying, here, that it is
     safe. Never trusts a caller verdict.
 
@@ -1154,8 +1441,12 @@ def delete_run(disk: str, run: str) -> dict:
       2. target resolves to a real directory sitting DIRECTLY under the runs
          root (no symlinks, no traversal, no partial-name tricks).
       3. run is not the active run, not the newest run on disk, and has no
-         subrun missing its .subrun_complete marker.
+         unmarked subrun that was written to recently.
       4. a fresh verify_run() says SAFE (every file on EOS at matching size).
+
+    force=False reuses the cached EOS listing instead of paying a fresh
+    whole-tree xrdfs per run — see _batch_listing() for why that staleness is
+    fail-safe. The LOCAL side is always re-read from disk regardless.
     """
     if disk not in DISKS:
         return {'success': False, 'message': f'unknown disk {disk!r}'}
@@ -1175,7 +1466,7 @@ def delete_run(disk: str, run: str) -> dict:
     if rtarget.parent != root or rtarget == root:
         return {'success': False, 'message': 'path is not a run directly under the runs root'}
 
-    verdict = verify_run(disk, run, force=True)
+    verdict = verify_run(disk, run, force=force)
     verdict = _apply_local_guards(verdict, run, active_run(), newest_run())
     if not verdict['safe']:
         _log_delete(f"REFUSED {disk}/{run}: {verdict['reason']}")
@@ -1196,15 +1487,124 @@ def delete_run(disk: str, run: str) -> dict:
 
 
 def delete_runs(disk: str, runs: list) -> dict:
-    """Delete several runs; each is independently re-verified. Stops nothing on
-    a single failure — reports per-run outcomes."""
+    """Delete several runs; each is independently re-verified against ONE fresh
+    listing taken for the whole batch. Stops nothing on a single failure —
+    reports per-run outcomes."""
+    _batch_listing()
     results = []
     freed = 0
     for run in runs:
-        r = delete_run(disk, run)
+        r = delete_run(disk, run, force=False)
         results.append(r)
         if r.get('success'):
             freed += r.get('freed_bytes', 0)
+    return {'results': results, 'freed_bytes': freed, 'freed_h': human(freed),
+            'n_deleted': sum(1 for r in results if r.get('success')),
+            'n_failed': sum(1 for r in results if not r.get('success'))}
+
+
+# --- Subrun delete ---------------------------------------------------------
+
+def _subrun_targets(run: str, subrun: str):
+    """[(path, root)] for the subrun's directory in each tree it exists in, or
+    None if any candidate path fails its guards.
+
+    Both trees are checked with the same rule: the target must be a real
+    directory, reached through no symlinks, sitting DIRECTLY under a run
+    directory that itself sits DIRECTLY under that tree's root. Returning None
+    (rather than skipping the bad one) means a suspicious path refuses the whole
+    delete instead of half-doing it.
+    """
+    out = []
+    for root in (_runs_root(), _dream_run_root()):
+        run_dir = root / run
+        target = run_dir / subrun
+        if not target.exists():
+            continue
+        try:
+            rroot = root.resolve()
+            rrun = run_dir.resolve()
+            rtarget = target.resolve()
+        except OSError:
+            return None
+        if run_dir.is_symlink() or target.is_symlink():
+            return None
+        if not rtarget.is_dir():
+            return None
+        if rrun.parent != rroot or rrun == rroot:
+            return None
+        if rtarget.parent != rrun or rtarget == rrun:
+            return None
+        out.append((rtarget, rroot))
+    return out
+
+
+def delete_subrun(disk: str, run: str, subrun: str, force: bool = True) -> dict:
+    """Delete one subrun — its runs-tree directory and its dream_run staging
+    directory — only after re-verifying, here, that it is safe. Same
+    never-trust-the-caller model as delete_run, one level deeper.
+
+    Guards, in order:
+      1. disk is known; run and subrun match their name regexes.
+      2. every target resolves to a real directory directly under a real run
+         directory directly under its tree root (see _subrun_targets).
+      3. the subrun is not unmarked-and-recently-written.
+      4. a fresh verify_subrun() says SAFE.
+
+    Deliberately NOT guarded by active/newest run: pruning the COMPLETED subruns
+    of the run currently being taken is exactly what keeps a long run from filling
+    the disk, and guard 3 is what protects the one being written.
+    """
+    if disk not in DISKS:
+        return {'success': False, 'message': f'unknown disk {disk!r}'}
+    if not RUN_NAME_RE.match(run or ''):
+        return {'success': False, 'message': f'invalid run name {run!r}'}
+    if not SUBRUN_NAME_RE.match(subrun or ''):
+        return {'success': False, 'message': f'invalid subrun name {subrun!r}'}
+
+    targets = _subrun_targets(run, subrun)
+    if targets is None:
+        return {'success': False, 'message': 'refusing: subrun path failed its safety checks'}
+    if not targets:
+        return {'success': False, 'message': f'{run}/{subrun} is not a directory'}
+
+    if mid_write_subrun(run, subrun):
+        _log_delete(f"REFUSED {run}/{subrun}: unmarked and recently written")
+        return {'success': False,
+                'message': f'{run}/{subrun} is unmarked and recently written — refusing'}
+
+    verdict = verify_subrun(disk, run, subrun, force=force)
+    if not verdict['safe']:
+        _log_delete(f"REFUSED {run}/{subrun}: {verdict['reason']}")
+        return {'success': False, 'message': f"not safe to delete: {verdict['reason']}",
+                'verdict': verdict}
+
+    size = sum(_dir_size(t) for t, _ in targets)
+    for target, _ in targets:
+        try:
+            shutil.rmtree(target)
+        except Exception as e:
+            _log_delete(f"ERROR deleting {target}: {e}")
+            return {'success': False, 'message': f'delete failed: {e}'}
+
+    _log_delete(f"DELETED {run}/{subrun}  freed={human(size)}  ({verdict['reason']})")
+    return {'success': True, 'run': run, 'subrun': subrun, 'disk': disk,
+            'freed_bytes': size, 'freed_h': human(size),
+            'message': f'Deleted {run}/{subrun}, freed {human(size)}'}
+
+
+def delete_subruns(disk: str, run: str, subruns: list) -> dict:
+    """Delete several subruns of one run; each independently re-verified against
+    ONE fresh listing taken for the whole batch."""
+    _batch_listing()
+    results = []
+    freed = 0
+    for sub in subruns:
+        r = delete_subrun(disk, run, sub, force=False)
+        results.append(r)
+        if r.get('success'):
+            freed += r.get('freed_bytes', 0)
+    _prune_empty_dream_run_dirs([run])
     return {'results': results, 'freed_bytes': freed, 'freed_h': human(freed),
             'n_deleted': sum(1 for r in results if r.get('success')),
             'n_failed': sum(1 for r in results if not r.get('success'))}
@@ -1307,8 +1707,8 @@ def preflight_components(items) -> dict:
         entry['size_h'] = human(entry['size'])
 
         guard = _run_guard(run, act, newest)
-        if not guard and not subrun_complete(run, subrun):
-            guard = 'missing .subrun_complete (possibly mid-write)'
+        if not guard and mid_write_subrun(run, subrun):
+            guard = 'unmarked and recently written (possibly mid-write)'
         if guard:
             entry['reason'] = guard
             refused.append(entry)
@@ -1393,8 +1793,8 @@ def _delete_component(run: str, subrun: str, comp: str, remote: dict,
         return res
 
     guard = _run_guard(run, act, newest)
-    if not guard and not subrun_complete(run, subrun):
-        guard = 'missing .subrun_complete (possibly mid-write)'
+    if not guard and mid_write_subrun(run, subrun):
+        guard = 'unmarked and recently written (possibly mid-write)'
     if guard:
         res['message'] = f'not safe: {guard}'
         _log_delete(f"REFUSED {run}/{subrun}/{comp}: {guard}")

@@ -541,7 +541,16 @@ def run_builder_save():
 #
 # Neither guard can be replaced by a "stop" afterwards: daq_control clears
 # .stop_run on startup, so Stop Run cannot drain a queue that has already formed.
+#
+# UNKNOWN STATE is a third case, neither idle nor busy: get_daq_control_status()
+# reports it when the last 50 lines of the daq_control pane match none of its
+# status rules — a scrolled or stale pane (someone ran `ls` in it), which usually
+# means nothing is running at all. Refusing outright would leave no way to take
+# pedestals from the GUI; allowing it silently would hide a live run the GUI can't
+# see. So it is overridable, but only behind a second confirmation: the client
+# re-POSTs with confirm_unknown=1. Genuinely busy states are never overridable.
 PEDESTAL_IDLE_STATES = ("WAITING", "Run Complete", "ERROR")
+PEDESTAL_UNKNOWN_STATE = "UNKNOWN STATE"
 PEDESTAL_COOLDOWN_S = 60
 _pedestal_launch_lock = threading.Lock()
 _last_pedestal_launch = float("-inf")
@@ -560,8 +569,19 @@ def take_pedestals():
                                f"click ({int(PEDESTAL_COOLDOWN_S - waited)}s to go)."
                 }), 409
 
-            daq_state = get_daq_control_status().get("status", "UNKNOWN STATE")
-            if daq_state not in PEDESTAL_IDLE_STATES:
+            daq_state = get_daq_control_status().get("status", PEDESTAL_UNKNOWN_STATE)
+            if daq_state == PEDESTAL_UNKNOWN_STATE:
+                # Not a refusal — an "are you sure". needs_confirm tells the client
+                # to ask a second time and re-POST with confirm_unknown=1.
+                if request.args.get("confirm_unknown") != "1":
+                    return jsonify({
+                        "success": False,
+                        "needs_confirm": True,
+                        "daq_state": daq_state,
+                        "message": f"daq_control state could not be read "
+                                   f"({daq_state}) — confirm before launching."
+                    }), 409
+            elif daq_state not in PEDESTAL_IDLE_STATES:
                 return jsonify({
                     "success": False,
                     "message": f"daq_control is busy ({daq_state}) — stop the run "

@@ -54,7 +54,7 @@ import json
 import time
 import datetime
 import subprocess
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 # The DAQ machine (banco) has no CERN realm in its system krb5.conf — point
 # kinit/xrdcp at the repo's minimal CERN config unless the caller already set
@@ -99,11 +99,13 @@ def run_watcher(config: dict, config_path: Path):
     # gives ~2-4 GB of granularity (one sub-run) without throttling the
     # backlog meaningfully — at ~30 MB/s that is still ~80 GB/h.
     backlog_per_poll    = max(1, int(config.get('backlog_subruns_per_poll', 1)))
-    # Files the ancillary (non-runs) dirs may copy per poll. 40 * ~7 s ≈ 5 min
-    # of work before the loop checks the runs again — small enough that a live
-    # sub-run is never far behind, large enough to drain 637 pedestal files in
-    # a handful of idle polls.
-    extra_files_per_poll = max(1, int(config.get('extra_sync_files_per_poll', 40)))
+    # Files the ancillary (non-runs) dirs may copy per poll. Sized in TIME, not
+    # file count: with _XRDCP_BATCH multi-source copies a batch of 40 costs
+    # ~11 s, not the ~5 min it cost when every file paid its own handshake, so
+    # 200 is about a minute of work before the loop rechecks the runs. Anything
+    # much smaller leaves 637 pedestal files trickling out 40 per idle poll,
+    # which during acquisition means never.
+    extra_files_per_poll = max(1, int(config.get('extra_sync_files_per_poll', 200)))
 
     # GUI's last-seen-run tracker, used only to decide sync ORDER.
     current_run_state = config_path.parent / 'current_run_state.json'
@@ -441,6 +443,12 @@ _XRDCP_EXTRA = []     # extra xrdcp args from config — set by run_watcher()
 _SYNC_TRUNCATED = False
 _SYNC_COPIED    = 0
 
+# Sources per xrdcp invocation. 40 measured 11.3 s against eospublic vs ~360 s
+# for the same files one at a time. Kept well below the ~2 MB argv limit (40
+# paths is a few kB) and small enough that a batch failure re-tries a modest
+# number of files individually.
+_XRDCP_BATCH = 40
+
 
 def _xrd_url(eos_path: Path) -> str:
     """Native xrootd URL for an absolute EOS path: root://host//eos/..."""
@@ -491,6 +499,38 @@ def _xrdcp_file(local: Path, eos_path: Path) -> bool:
     return False
 
 
+def _xrdcp_batch(locals_: list, eos_dir: Path) -> int:
+    """Copy several local files into ONE EOS directory with a single xrdcp.
+    Returns how many landed.
+
+    xrdcp takes multiple sources when the destination is a directory URL, and
+    the expensive part of a transfer here is per-INVOCATION, not per-byte: a
+    fresh connect + Kerberos handshake against eospublic costs 5-10 s whatever
+    the file size. Measured on this link:
+        1 small file  -> 5-10 s        40 small files, 1 invocation -> 11.3 s
+    i.e. ~32x on directories of small files (pedestals: 637 files, median
+    36.6 KB, previously ~60 min). `--parallel 4` measured 10.35 s for the same
+    40 — inside the noise, so it is not worth the extra moving part.
+
+    A failed batch falls back to copying its files one by one, so a single bad
+    file cannot silently take its 49 healthy neighbours down with it, and the
+    per-file error reporting is preserved.
+    """
+    if not locals_:
+        return 0
+    dest = _xrd_url(eos_dir).rstrip('/') + '/'    # trailing / => "this is a directory"
+    result = subprocess.run(
+        ['xrdcp', '-f', '-p', '--nopbar', *_XRDCP_EXTRA,
+         *[str(f) for f in locals_], dest],
+        capture_output=True, text=True,
+    )
+    if result.returncode == 0:
+        return len(locals_)
+    print(f"[backup] xrdcp batch FAILED (exit {result.returncode}) for {eos_dir} — "
+          f"retrying individually: {result.stderr.strip()[:160]}")
+    return sum(1 for f in locals_ if _xrdcp_file(f, eos_dir / f.name))
+
+
 def _xrd_sync_tree(local_dir: Path, eos_dir: Path, max_files: int = None) -> bool:
     """Copy every file under local_dir into eos_dir on EOS, skipping files already
     there at the same size (data is write-once). Returns True if nothing failed.
@@ -515,6 +555,11 @@ def _xrd_sync_tree(local_dir: Path, eos_dir: Path, max_files: int = None) -> boo
     _SYNC_COPIED = 0
     remote_sizes = _remote_size_map(eos_dir)
     all_ok, copied, skipped = True, 0, 0
+
+    # Decide what to send first, then send it grouped by destination directory:
+    # one xrdcp invocation can take many sources but only ONE destination dir.
+    pending = {}          # {relative parent dir: [local Path, ...]}
+    n_pending = 0
     for f in sorted(local_dir.rglob('*')):
         if not f.is_file():
             continue
@@ -526,13 +571,20 @@ def _xrd_sync_tree(local_dir: Path, eos_dir: Path, max_files: int = None) -> boo
         if remote_sizes.get(rel) == local_size:
             skipped += 1
             continue
-        if max_files is not None and copied >= max_files:
+        if max_files is not None and n_pending >= max_files:
             _SYNC_TRUNCATED = True
             break
-        if _xrdcp_file(f, eos_dir / rel):
-            copied += 1
-        else:
-            all_ok = False
+        pending.setdefault(PurePosixPath(rel).parent.as_posix(), []).append(f)
+        n_pending += 1
+
+    for sub, files in sorted(pending.items()):
+        dest_dir = eos_dir if sub == '.' else eos_dir / sub
+        for i in range(0, len(files), _XRDCP_BATCH):
+            chunk = files[i:i + _XRDCP_BATCH]
+            n = _xrdcp_batch(chunk, dest_dir)
+            copied += n
+            if n < len(chunk):
+                all_ok = False
     _SYNC_COPIED = copied
     if copied:
         tail = ' (capped, will resume)' if _SYNC_TRUNCATED else ''

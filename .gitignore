@@ -240,3 +240,6 @@ flask_app/local/
 
 # Claude Code per-machine settings (config/ is shared, .local.json is not)
 .claude/settings.local.json
+
+# Runtime state: P2_IN mesh operating point, written by quick_scripts/chain_p2in_drift.py
+.p2in_mesh_op

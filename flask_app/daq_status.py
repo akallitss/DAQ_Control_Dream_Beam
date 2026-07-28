@@ -387,12 +387,16 @@ def get_beam_watcher_status():
         return small("No NXCALS", "warning")   # session up but queries failing
 
     # NXCALS polls every ~30 s (plus ~1 min Spark restart after a blip), so the
-    # staleness cutoff is much looser than the hardware watchers'.
+    # staleness cutoff is much looser than the hardware watchers'. Looser again
+    # since the Beam2 spill poll started sharing the watcher's thread: it adds
+    # ~80 s to whichever cycle it runs on. Keep in step with BEAM_STALE_S in
+    # app.py — two different cutoffs would have the tab and the status row
+    # disagreeing about whether the same file is stale.
     try:
         age = (datetime.now() - datetime.fromisoformat(st["timestamp"])).total_seconds()
     except Exception:
         age = None
-    if age is not None and age > 180:
+    if age is not None and age > float(os.environ.get("SPS_BEAM_STALE_S", 300)):
         return small("Stale", "warning")
     return small("Logging", "success")
 

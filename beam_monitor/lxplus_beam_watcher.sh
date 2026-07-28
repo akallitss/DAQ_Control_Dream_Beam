@@ -165,6 +165,12 @@ export SPARK_LOCAL_IP="${SPARK_LOCAL_IP:-127.0.0.1}"
 # Publish straight to EOS (read by the banco bridge).
 export SPS_BEAM_STATE="$STATE_FILE"
 export SPS_BEAM_LOG_DIR="$EOS_BEAM_DIR"
+# Same for the SPS spill / H4 monitor that rides along inside the watcher
+# (sps_monitor/). Without these it would fall back to its repo-local defaults
+# and write the spill state into AFS, where the banco bridge cannot see it —
+# the Beam2 tab would then sit at "no data" with everything apparently healthy.
+export SPS_SPILL_STATE="$EOS_BEAM_DIR/sps_state.json"
+export SPS_SPILL_LOG_DIR="$EOS_BEAM_DIR"
 
 # --- how old is the published state? ------------------------------------------
 # Prefer the payload's own timestamp: that is when the watcher last had DATA. A
@@ -266,7 +272,8 @@ start_watcher() {
     local inner="cd '$REPO_DIR' && ${ccname}export JAVA_HOME='$JAVA_HOME' PATH='$PATH' \
 JAVA_TOOL_OPTIONS='-Djava.security.krb5.conf=$REPO_DIR/krb5_jvm.conf' \
 SPARK_LOCAL_IP='$SPARK_LOCAL_IP' SPS_BEAM_STATE='$SPS_BEAM_STATE' \
-SPS_BEAM_LOG_DIR='$SPS_BEAM_LOG_DIR'; exec $cmd >> '$HOME/sps_beam_watcher.log' 2>&1"
+SPS_BEAM_LOG_DIR='$SPS_BEAM_LOG_DIR' SPS_SPILL_STATE='$SPS_SPILL_STATE' \
+SPS_SPILL_LOG_DIR='$SPS_SPILL_LOG_DIR'; exec $cmd >> '$HOME/sps_beam_watcher.log' 2>&1"
 
     local pid=''
     if [ "${USE_SYSTEMD_RUN:-1}" = "1" ] && command -v systemd-run >/dev/null 2>&1; then

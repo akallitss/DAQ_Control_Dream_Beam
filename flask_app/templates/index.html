@@ -527,10 +527,63 @@
       <div class="panel h-100">
         <div class="panel-header">
           <span class="panel-title">Per-cycle Trend</span>
-          <span class="panel-header-note">extracted intensity &amp; spill length — last 6 h</span>
+          <span class="panel-header-note" id="sps-trend-note">extracted intensity &amp; spill length — last 6 h</span>
         </div>
         <div class="panel-body">
           <div id="sps-trend-plot" style="width:100%;height:320px;"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- H4 barrier (T2 TAX) — access candidates on our own line -->
+    <div class="col-12">
+      <div class="panel h-100">
+        <div class="panel-header">
+          <span class="panel-title">H4 Barrier — T2 TAX
+            <span class="badge bg-warning text-dark ms-2">TEST</span></span>
+          <span class="ms-auto panel-header-note" id="sps-tax-note">…</span>
+        </div>
+        <div class="panel-body">
+          <div class="run-stats mb-2">
+            <div class="stat">
+              <div class="stat-label">H4 line</div>
+              <div class="stat-value" id="sps-tax-state" style="font-size:1.6rem;">—</div>
+            </div>
+            <div class="stat">
+              <div class="stat-label">TAX position</div>
+              <div class="stat-value" id="sps-tax-pos" style="font-size:1.1rem;">—</div>
+            </div>
+            <div class="stat">
+              <div class="stat-label">In this state</div>
+              <div class="stat-value" id="sps-tax-since" style="font-size:1.1rem;">—</div>
+            </div>
+            <div class="stat">
+              <div class="stat-label">Blocked spans (24 h)</div>
+              <div class="stat-value" id="sps-tax-count" style="font-size:1.1rem;">—</div>
+            </div>
+          </div>
+          <div id="sps-tax-plot" style="width:100%;height:260px;"></div>
+          <div class="table-responsive mt-2" style="max-height:220px;overflow-y:auto;">
+            <table class="table table-sm table-dark mb-0" style="font-size:0.85rem;">
+              <thead><tr><th>Start</th><th>End</th><th>Duration</th><th>Peak (mm)</th></tr></thead>
+              <tbody id="sps-tax-intervals"><tr><td colspan="4" class="text-muted">…</td></tr></tbody>
+            </table>
+          </div>
+          <p class="text-muted small mb-0 mt-2">
+            <span class="font-monospace">XTAX_022_023:POSITION_MEAS</span> — parks near
+            <span class="font-monospace">−140 mm</span> with beam going to H4 and drives to
+            <span class="font-monospace">+141 mm</span> to block it. Spans below are
+            <em>access candidates</em>: the position says the line is blocked, not why —
+            confirm against the H4 flux counters. ⚠ H4/H6/H8 have no
+            <span class="font-monospace">XB&lt;line&gt;.XTAX</span> variable; this standalone
+            motor name is the only read-out of H4's barrier.
+          </p>
+          <p class="text-muted small mb-0 mt-2">
+            <b>Proxied from the n_TOF x17 DAQ</b>, which polls NXCALS directly — banco is not
+            TN-trusted, so it cannot reach <span class="font-monospace">cs-ccr-nxcals*</span>
+            itself. This panel is blank whenever the x17 Flask server is down; the rest of the
+            tab is unaffected.
+          </p>
         </div>
       </div>
     </div>
@@ -2475,34 +2528,155 @@ async function spsRenderTrend() {
     { x: h.time, y: h.extracted, name: "Extracted / cycle", type: "scatter",
       mode: "markers", marker: { color: "#4dabe8", size: 4 } },
   ];
+  // Beam actually reaching our zone. THE point of this trace is where it is
+  // absent: the SPS markers carry on across an access while this drops to zero,
+  // and no SPS-side variable shows that, because only our branch closes.
+  if (h.beam_here_time && h.beam_here_time.length) {
+    traces.push({ x: h.beam_here_time, y: h.beam_here_counts,
+                  name: "Counts in our zone", type: "scatter", mode: "lines",
+                  yaxis: "y3", line: { color: "#5cc98a", width: 1 },
+                  hovertemplate: "%{x|%H:%M:%S}<br>%{y:,.0f} counts<extra></extra>" });
+  }
   if (h.spill_time && h.spill_time.length) {
     traces.push({ x: h.spill_time, y: h.spill_len_ms.map(v => v == null ? null : v / 1000),
                   name: "Spill length (s)", mode: "lines", yaxis: "y2",
                   line: { color: "#c98500", width: 2 } });
   }
+  // Shade the access windows so they read as events, not as a missing line.
+  const shapes = (h.no_beam_windows || []).map(w => ({
+    type: "rect", xref: "x", yref: "paper", x0: w.from, x1: w.to, y0: 0, y1: 1,
+    fillcolor: "rgba(224,92,75,0.13)", line: { width: 0 }, layer: "below",
+  }));
+  const note = document.getElementById("sps-trend-note");
+  if (note) {
+    const n = (h.no_beam_windows || []).length;
+    note.textContent = n
+      ? `${n} no-beam window(s) shaded — SPS delivering, our zone counting nothing`
+      : "extracted intensity & spill length — last 6 h";
+  }
   Plotly.react("sps-trend-plot", traces, {
-    ...SPS_BASE_LAYOUT, uirevision: "sps-trend",
+    ...SPS_BASE_LAYOUT, uirevision: "sps-trend", shapes,
     xaxis: { ...SPS_AXIS },
     yaxis: { title: { text: "Extracted (10¹⁰ p)", font: { size: 13, color: "#4dabe8" } },
              ...SPS_AXIS, rangemode: "tozero" },
     yaxis2: { title: { text: "Spill length (s)", font: { size: 13, color: "#c98500" } },
               ...SPS_AXIS, overlaying: "y", side: "right", rangemode: "tozero", showgrid: false },
+    // Third axis, hidden: the zone counts share the plot only so the reader can
+    // line them up in time with the SPS trace. Their absolute scale is a scaler
+    // rate in arbitrary units and would just crowd the axis furniture.
+    yaxis3: { ...SPS_AXIS, overlaying: "y", side: "right", rangemode: "tozero",
+              showgrid: false, showticklabels: false, visible: false },
   }, SPS_CFG);
 }
 
-function spsRenderAll() { spsRenderTimeline(); spsRenderProfile(); spsRenderTrend(); }
+// H4 barrier. Both endpoints are PROXIES to the x17 DAQ (banco cannot reach
+// NXCALS). Differs from the x17 original in one way: there the live state rides
+// along in /sps/status, here it needs its own fetch, because banco's own
+// sps_state.json comes from the lxplus bridge and carries no h4_tax block.
+async function spsUpdateTax() {
+  const set = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v; };
+  const stateEl = document.getElementById("sps-tax-state");
+  if (!stateEl) return;
+  let t = null;
+  try { t = await (await fetch("/sps/tax_state")).json(); } catch (e) { t = null; }
+  if (!t || t.position_mm == null) {
+    set("sps-tax-state", "—");
+    set("sps-tax-pos", "—");
+    set("sps-tax-since", "—");
+    set("sps-tax-note", (t && t.error) ? t.error : "no data yet");
+    stateEl.className = "stat-value text-muted";
+    return;
+  }
+  const label = { open: "OPEN", blocked: "BLOCKED", moving: "MOVING" }[t.state] || "—";
+  set("sps-tax-state", label);
+  stateEl.className = "stat-value " + (t.state === "open" ? "text-success"
+                       : t.state === "blocked" ? "text-danger" : "text-warning");
+  stateEl.style.fontSize = "1.6rem";
+  set("sps-tax-pos", t.position_mm.toFixed(1) + " mm");
+  // seconds_in_state is only resolvable inside the poll's lookback window
+  set("sps-tax-since", t.state_older_than_window ? "> " + Math.round(t.window_s / 60) + " min"
+      : t.seconds_in_state == null ? "—"
+      : t.seconds_in_state < 90 ? Math.round(t.seconds_in_state) + " s"
+      : (t.seconds_in_state / 60).toFixed(0) + " min");
+  set("sps-tax-note", t.var);
+}
+
+async function spsRenderTax() {
+  if (typeof Plotly === "undefined") return;
+  if (!document.getElementById("sps-tax-plot")) return;
+  let h;
+  try { h = await (await fetch("/sps/tax_history?hours=24")).json(); } catch (e) { return; }
+  if (!h || !h.success) return;
+  const body = document.getElementById("sps-tax-intervals");
+  const ivs = h.intervals || [];
+  const cnt = document.getElementById("sps-tax-count");
+  if (cnt) cnt.textContent = String(ivs.length);
+  if (body) {
+    body.innerHTML = ivs.length
+      ? ivs.slice().reverse().map(iv =>
+          `<tr><td>${iv.start_str}</td><td>${iv.ongoing ? "<em>ongoing</em>" : iv.end_str}</td>` +
+          `<td>${iv.minutes} min</td><td>${iv.pos_max.toFixed(1)}</td></tr>`).join("")
+      : `<tr><td colspan="4" class="text-muted">${h.note || "no blocked spans in this window"}</td></tr>`;
+  }
+  Plotly.react("sps-tax-plot", [
+    { x: h.time, y: h.position_mm, name: "TAX position", mode: "lines",
+      line: { color: "#4dabe8", width: 2 } },
+  ], {
+    ...SPS_BASE_LAYOUT, uirevision: "sps-tax",
+    xaxis: { ...SPS_AXIS },
+    yaxis: { title: { text: "Position (mm)", font: { size: 13, color: "#4dabe8" } }, ...SPS_AXIS },
+    shapes: [
+      { type: "line", xref: "paper", x0: 0, x1: 1, yref: "y",
+        y0: h.open_max_mm, y1: h.open_max_mm,
+        line: { color: "#3fb950", width: 1, dash: "dot" } },
+      { type: "line", xref: "paper", x0: 0, x1: 1, yref: "y",
+        y0: h.block_min_mm, y1: h.block_min_mm,
+        line: { color: "#e5534b", width: 1, dash: "dot" } },
+    ],
+    annotations: [
+      { xref: "paper", x: 0.005, y: h.open_max_mm, yanchor: "bottom", showarrow: false,
+        text: "open ↓", font: { size: 10, color: "#3fb950" } },
+      { xref: "paper", x: 0.005, y: h.block_min_mm, yanchor: "top", showarrow: false,
+        text: "blocked ↑", font: { size: 10, color: "#e5534b" } },
+    ],
+  }, SPS_CFG);
+}
+
+// spsRenderTax is deliberately NOT here — see the split intervals at the bottom.
+function spsRenderAll() {
+  spsRenderTimeline(); spsRenderProfile(); spsRenderTrend();
+  spsUpdateTax();
+}
 
 // Plotly can't size a plot in a hidden tab (display:none -> 0 width), so draw on show.
 (() => {
   const tab = document.querySelector('a[href="#beam2"]');
-  if (tab) tab.addEventListener("shown.bs.tab", () => spsUpdateStatus().then(spsRenderAll));
+  if (tab) tab.addEventListener("shown.bs.tab",
+    () => spsUpdateStatus().then(() => { spsRenderAll(); spsRenderTax(); }));
 })();
 
 // Only poll while the tab is visible — the state file carries a ~130 kB timeline.
+const spsTabActive = () => document.getElementById("beam2").classList.contains("active");
+
 setInterval(() => {
-  if (!document.getElementById("beam2").classList.contains("active")) return;
+  if (!spsTabActive()) return;
   spsUpdateStatus().then(spsRenderAll);
 }, 15000);
+
+// The barrier's two feeds move at very different speeds, so they are polled
+// separately rather than both riding the 15 s status loop:
+//
+//   tiles   /sps/tax_state    ~300 B   -> 5 s
+//   trace   /sps/tax_history  ~100 kB  -> 60 s
+//
+// Freshness is bounded by NXCALS, not by us: the archive's own ingestion lag is
+// a MEASURED 14-23 s, and mx17 polls it every ~27 s, so the newest sample here
+// is 23-43 s old no matter how fast this loop runs. 5 s just removes the client
+// from the error budget. The 24 h trace changes far more slowly than that, and
+// at 100 kB it was the expensive half of the old 15 s poll — moving it to 60 s
+// cuts this tab's steady-state traffic ~4x while making the tiles fresher.
+setInterval(() => { if (spsTabActive()) spsUpdateTax(); },  5000);
+setInterval(() => { if (spsTabActive()) spsRenderTax(); }, 60000);
 </script>
 
 <!-- ===== Disk Space tab JS ===== -->

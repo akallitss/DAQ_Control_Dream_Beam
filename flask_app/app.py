@@ -37,6 +37,9 @@ from monitor import DaqMonitor, fetch_chat_id, get_bot_username
 from beam_monitor.beam_intensity_controller import (BEAM_LOG_DIR, BEAM_STATE_PATH,
                                                     NXCALS_PYTHON, BEAM_UNIT,
                                                     PULSE_THRESHOLD_E10)
+from sps_monitor.sps_spill_controller import (SPS_LOG_DIR, SPS_STATE_PATH, SPS_UNIT,
+                                              EXTRACTED_DEST, SPILL_THRESHOLD_E10,
+                                              H4_BEAM_COUNTERS, H4_COUNT_VARS)
 
 # Repo root (parent of flask_app/) — no per-machine edit needed.
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -1446,7 +1449,13 @@ def system_stats_history():
 # minutes means the chain is broken somewhere (lxplus watcher dead, Kerberos
 # expired, EOS unreachable) and the on/off answer is UNKNOWN, not the last one
 # seen. Same cutoff as get_beam_watcher_status() in daq_status.py.
-BEAM_STALE_S = float(os.environ.get("SPS_BEAM_STALE_S", 180))
+# 300 s, not the original 180: the watcher publishes every 30 s, but the Beam2
+# spill poll shares its thread and takes ~80 s when it runs, so a normal cycle can
+# legitimately be ~110 s old before the bridge's own 20 s poll is added. 180 left
+# under a minute of margin and flapped to "unknown" on 2026-07-27. This matches
+# BEAM_OFF_GAP_S: we declare beam off after 5 min without a spill, and the state
+# unknown after 5 min without an update.
+BEAM_STALE_S = float(os.environ.get("SPS_BEAM_STALE_S", 300))
 
 
 def _beam_read_state():
@@ -1559,6 +1568,194 @@ def beam_history():
         })
     except Exception as e:
         return jsonify({"success": False, "message": str(e)}), 500
+
+
+# ---------------------------------------------------------------------------
+# Beam2 tab — SPS slow-extraction spill structure + H4 line state
+# ---------------------------------------------------------------------------
+# Where the Beam tab answers "how much beam per spill", this answers "what does
+# the spill look like, and is it reaching H4". The NXCALS polling happens inside
+# the lxplus beam_watcher process (it borrows that Spark session); Flask only
+# reads what beam_bridge.py pulled down from EOS. See sps_monitor/.
+
+def _sps_read_state():
+    """The SPS monitor's latest published state, or a disconnected stub.
+
+    Applies the same payload-timestamp staleness rule as _beam_read_state(), and
+    for the same reason: the bridge rewrites the local copy on every poll, so a
+    frozen state from a dead lxplus watcher still looks freshly written on disk.
+    When stale, spill_on and h4_open are forced to None — an old "SPILLING" or
+    "line open" is worse than an honest "unknown".
+    """
+    try:
+        with open(SPS_STATE_PATH) as f:
+            state = json.load(f)
+    except Exception:
+        return {"connected": False, "stale": True, "age_s": None,
+                "last_error": "no SPS spill data yet — is the beam watcher "
+                              "(and the bridge) running?",
+                "unit": SPS_UNIT, "spill_on": None, "h4_open": None}
+
+    try:
+        stamp = state.get("timestamp") or state.get("updated")
+        age = (datetime.now() - datetime.fromisoformat(stamp)).total_seconds()
+    except Exception:
+        age = None
+    state["age_s"] = age
+    state["stale"] = age is None or age > BEAM_STALE_S
+    if state["stale"]:
+        state["spill_on"] = None
+        state["h4_open"] = None
+        if not state.get("last_error"):
+            state["last_error"] = (
+                f"SPS spill state has not been updated for {_fmt_age(age)} "
+                "— is the lxplus watcher / beam bridge running?"
+                if age is not None else
+                "SPS spill state has no usable timestamp — cannot tell if it is current")
+    return state
+
+
+@app.route("/sps/status")
+def sps_status():
+    """Latest SPS spill summary, including the stitched extraction-rate timeline,
+    the newest single-cycle spill profile and the H4 line state."""
+    return jsonify(_sps_read_state())
+
+
+@app.route("/sps/history")
+def sps_history():
+    """Per-cycle spill history from the CSVs: extracted intensity, effective
+    spill length and duty factor, one row per SPS cycle."""
+    import glob
+    hours = request.args.get("hours", default=6.0, type=float)
+    max_points = request.args.get("max_points", default=3000, type=int)
+    empty = {"success": True, "time": [], "extracted": [], "spill_time": [],
+             "spill_len_ms": [], "duty": [], "unit": SPS_UNIT}
+    try:
+        files = sorted(glob.glob(os.path.join(SPS_LOG_DIR, "sps_spill_*.csv")))
+        if not files:
+            return jsonify(empty)
+        df = pd.concat([pd.read_csv(f) for f in files[-2:]], ignore_index=True)
+        df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+        df = df.dropna(subset=["timestamp"])
+        df = df.sort_values("timestamp").drop_duplicates(subset=["timestamp"])
+        if hours and hours > 0:
+            df = df[df["timestamp"] >= datetime.now() - timedelta(hours=hours)]
+        if df.empty:
+            return jsonify(empty)
+        # Only extracting cycles carry a spill; dump/other cycles are plotted as
+        # zero-intensity markers so the supercycle gaps stay visible.
+        if len(df) > max_points:
+            df = df.iloc[:: (len(df) // max_points) + 1]
+        ext = df[df["destination"] == EXTRACTED_DEST]
+        out = {
+            "success": True,
+            "time": df["timestamp"].dt.strftime("%Y-%m-%d %H:%M:%S").tolist(),
+            "extracted": df["extracted_e10"].fillna(0).round(1).tolist(),
+            "spill_time": ext["timestamp"].dt.strftime("%Y-%m-%d %H:%M:%S").tolist(),
+            "spill_len_ms": ext["spill_len_ms"].round(0).where(
+                ext["spill_len_ms"].notna(), None).tolist(),
+            "duty": ext["duty_factor"].round(4).where(
+                ext["duty_factor"].notna(), None).tolist(),
+            "unit": SPS_UNIT,
+        }
+
+        # Beam ACTUALLY reaching our zone, spill by spill. Plotted alongside what
+        # the SPS extracted, this is what makes an access visible: the SPS trace
+        # carries on while this one drops out. Nothing else in the tab shows that,
+        # because every SPS-side variable is blind to our branch being closed.
+        avail = [c for c in H4_BEAM_COUNTERS if c in ext.columns]
+        if avail:
+            delivered = ext[ext["extracted_e10"] >= SPILL_THRESHOLD_E10]
+            seen = delivered[avail].fillna(0).sum(axis=1)
+            out["beam_here_time"] = delivered["timestamp"].dt.strftime(
+                "%Y-%m-%d %H:%M:%S").tolist()
+            out["beam_here_counts"] = seen.round(0).tolist()
+            out["beam_here_vars"] = [H4_COUNT_VARS[c] for c in avail]
+            # Contiguous runs of "SPS delivered but we saw nothing", which is the
+            # access signature. Short single-cycle dropouts are statistical at
+            # these rates, so a run has to last a few minutes to be reported.
+            gaps, start, last = [], None, None
+            for t, v in zip(delivered["timestamp"], seen):
+                if v <= 0:
+                    start = t if start is None else start
+                    last = t
+                else:
+                    if start is not None and (last - start).total_seconds() >= 300:
+                        gaps.append((start, last))
+                    start = None
+            if start is not None and (last - start).total_seconds() >= 300:
+                gaps.append((start, last))
+            out["no_beam_windows"] = [
+                {"from": a.strftime("%Y-%m-%d %H:%M:%S"),
+                 "to": b.strftime("%Y-%m-%d %H:%M:%S"),
+                 "minutes": round((b - a).total_seconds() / 60, 1)}
+                for a, b in gaps]
+        return jsonify(out)
+    except Exception as e:
+        return jsonify({"success": False, "message": str(e)}), 500
+
+
+# ---------------------------------------------------------------------------
+# H4 barrier (T2 TAX) — PROXIED from the n_TOF x17 DAQ, not computed here.
+# ---------------------------------------------------------------------------
+# The barrier variable is XTAX_022_023:POSITION_MEAS, which lives in NXCALS.
+# NXCALS is on the CERN Technical Network and banco is not TN-trusted (it IS on
+# the GPN — that is a different grant), so `cs-ccr-nxcals*:19093` answers "No
+# route to host" here. mx17 IS TN-trusted, already polls the TAX, writes the
+# per-day CSVs and computes the blocked spans, so we forward its finished
+# answer instead of standing up a second Spark session behind a tunnel.
+#
+# Use the DNS NAME, never the address: mx17 has no static reservation, its
+# lease is sticky by MAC only, and it has already moved .103 -> .17 once.
+X17_BASE = os.environ.get("X17_FLASK_URL", "http://ntof-x17-daq.dyndns.cern.ch:5001")
+X17_TIMEOUT_S = float(os.environ.get("X17_FLASK_TIMEOUT_S", "8"))
+
+
+def _x17_get(path, params=None):
+    """GET a JSON endpoint on the x17 DAQ. Returns (obj, error_string)."""
+    from urllib.parse import urlencode
+    from urllib.request import urlopen
+    url = f"{X17_BASE}{path}"
+    if params:
+        url += "?" + urlencode(params)
+    try:
+        with urlopen(url, timeout=X17_TIMEOUT_S) as r:
+            return json.loads(r.read().decode("utf-8")), None
+    except Exception as e:
+        return None, f"{type(e).__name__}: {e}"
+
+
+@app.route("/sps/tax_history")
+def sps_tax_history():
+    """H4 barrier trace + blocked spans, forwarded from mx17.
+
+    The spans are ACCESS CANDIDATES, not confirmed accesses: the position says
+    the line is blocked, it does not say why. Confirmation needs the H4 flux
+    counters — see docs/H4_ACCESS_INFERENCE.md on the x17 repo."""
+    params = {"hours": request.args.get("hours", "24")}
+    if "max_points" in request.args:
+        params["max_points"] = request.args["max_points"]
+    obj, err = _x17_get("/sps/tax_history", params)
+    if obj is None:
+        # Degrade to the same empty shape the panel already handles, so an mx17
+        # restart shows "unreachable" instead of breaking the rest of the tab.
+        return jsonify({"success": True, "time": [], "position_mm": [],
+                        "intervals": [],
+                        "note": f"x17 DAQ unreachable — {err}"})
+    return jsonify(obj)
+
+
+@app.route("/sps/tax_state")
+def sps_tax_state():
+    """Live barrier state (the h4_tax block of mx17's SPS status).
+
+    Separate from /sps/tax_history on purpose: this is small and polled on the
+    tile cadence, the history is ~100 kB and polled on the plot cadence."""
+    obj, err = _x17_get("/sps/status")
+    if obj is None:
+        return jsonify({"error": f"x17 DAQ unreachable — {err}"})
+    return jsonify(obj.get("h4_tax") or {"error": "x17 published no h4_tax block"})
 
 
 # ===========================================================================

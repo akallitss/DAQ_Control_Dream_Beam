@@ -85,6 +85,10 @@ BEAM_OFF_GAP_S = 300.0   # no spill for this long -> beam considered OFF. SPS
                          # supercycles space SFTPRO spills up to a few minutes
                          # apart, so this must exceed the longest normal gap.
 KRB_RENEW_S = 4 * 3600.0  # try `kinit -R` this often to keep the ticket alive
+# How often the SPS spill monitor (Beam2 tab) may run on this thread. It is much
+# heavier than the beam query and shares the loop, so it gets its own, slower
+# cadence — see _poll_sps() for the measurement that set this.
+SPS_POLL_S = float(os.environ.get("SPS_SPILL_POLL_S", "120"))
 
 
 class BeamIntensityMonitor:
@@ -105,6 +109,19 @@ class BeamIntensityMonitor:
         self._last_point = None      # (unix_ts, value) newest point of any size
         self._last_pulse = None      # (unix_ts, value) newest point >= threshold
         self._last_krb_renew = 0.0
+        # SPS slow-extraction spill monitor (the Beam2 tab). It has no Spark
+        # session of its own — pytimber is a ~1.3 GB JVM and one is already
+        # running right here, so it borrows self.db. Every call into it is
+        # wrapped: an SPS failure must never disturb the primary beam logging,
+        # which is what the run bookkeeping and the beam-on/off answer depend on.
+        self._sps = None
+        self._last_sps_poll = 0.0
+        self._sps_poll_s = None
+        try:
+            from sps_monitor.sps_spill_controller import SpsSpillMonitor
+            self._sps = SpsSpillMonitor(logger=self.log)
+        except Exception as e:
+            self.log(f"SPS spill monitor unavailable (beam feed unaffected): {e}")
 
     # ---------------- NXCALS session ----------------
 
@@ -215,6 +232,11 @@ class BeamIntensityMonitor:
             "beam_off_gap_s": BEAM_OFF_GAP_S,
             "poll_s": self.poll_s,
             "query_s": round(query_s, 2),
+            # How long the Beam2 spill poll takes on this same thread, and how
+            # often it is allowed to run. These two set the worst-case age of
+            # this state file, so they belong next to it rather than buried.
+            "sps_poll_s": self._sps_poll_s,
+            "sps_poll_interval_s": SPS_POLL_S if self._sps is not None else None,
             "krb_valid_until": krb_exp.isoformat(timespec="seconds") if krb_exp else None,
             "csv_path": self._csv_path(),
             "last_error": None,
@@ -304,6 +326,40 @@ class BeamIntensityMonitor:
             "last_error": self.last_error,
         })
 
+    # ---------------- SPS spill monitor (borrows self.db) ----------------
+
+    def _poll_sps(self):
+        """Run one SPS spill poll on our Spark session, at most every SPS_POLL_S.
+
+        The rate limit is not tidiness, it is the beam feed's responsiveness. The
+        spill poll pulls per-cycle ARRAYS (~1800 floats per cycle over a 330 s
+        window) and appends the profile archive to EOS, which measured ~80 s —
+        and it shares this thread, so running it every pass stretched the beam
+        publish cadence from 30 s to 111 s and pushed the GUI over its 180 s
+        staleness cutoff (observed 2026-07-27). Spills arrive one per ~40 s
+        supercycle and the published state carries a 330 s timeline, so a slower
+        spill cadence loses nothing; a slow beam cadence costs the on/off answer.
+
+        Swallows everything: the spill monitor is an add-on and must not be able
+        to break beam logging or the reconnect logic below.
+        """
+        if self._sps is None:
+            return
+        now = time.time()
+        if now - self._last_sps_poll < SPS_POLL_S:
+            return
+        self._last_sps_poll = now
+        try:
+            t0 = time.time()
+            self._sps.poll(self.db)
+            self._sps_poll_s = round(time.time() - t0, 1)
+        except Exception as e:
+            self.log(f"SPS poll failed (beam feed unaffected): {e}")
+            try:
+                self._sps.write_error(e)
+            except Exception:
+                pass
+
     # ---------------- poll loop ----------------
 
     def run_blocking(self):
@@ -322,6 +378,9 @@ class BeamIntensityMonitor:
                 self._renew_kerberos()
                 state = self._poll_once()
                 self._write_state(state)
+                # Beam state is published FIRST, so the spill add-on can only
+                # ever delay the next poll, never withhold a beam update.
+                self._poll_sps()
             except Exception as e:
                 # Query died (kerberos expiry, network blip, Spark session loss).
                 # Renew the ticket now and rebuild the session on the next pass.

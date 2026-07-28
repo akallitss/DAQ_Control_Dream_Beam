@@ -385,7 +385,14 @@
       <div class="panel h-100">
         <div class="panel-header">
           <span class="panel-title">Beam Intensity Trend</span>
-          <span class="panel-header-note">protons per spill — last 6 h from the log</span>
+          <span class="panel-header-note">protons per spill, from the log</span>
+          <select id="beam-range" class="form-select form-select-sm ms-auto" style="width:auto;">
+            <option value="6" selected>last 6 h</option>
+            <option value="24">last 24 h</option>
+            <option value="72">last 3 d</option>
+            <option value="168">last 7 d</option>
+            <option value="336">last 14 d</option>
+          </select>
         </div>
         <div class="panel-body">
           <div id="beam-plot" style="width:100%;height:380px;"></div>
@@ -527,7 +534,14 @@
       <div class="panel h-100">
         <div class="panel-header">
           <span class="panel-title">Per-cycle Trend</span>
-          <span class="panel-header-note" id="sps-trend-note">extracted intensity &amp; spill length — last 6 h</span>
+          <span class="panel-header-note" id="sps-trend-note">extracted intensity &amp; spill length</span>
+          <select id="sps-range" class="form-select form-select-sm ms-auto" style="width:auto;">
+            <option value="6" selected>last 6 h</option>
+            <option value="24">last 24 h</option>
+            <option value="72">last 3 d</option>
+            <option value="168">last 7 d</option>
+            <option value="336">last 14 d</option>
+          </select>
         </div>
         <div class="panel-body">
           <div id="sps-trend-plot" style="width:100%;height:320px;"></div>
@@ -2306,10 +2320,18 @@ async function beamUpdateStatus() {
     : `<span style="color:var(--bad);">OFF</span> · ${beamFmtAge(d.seconds_since_pulse)}`;
 }
 
+// Range comes from the picker. The server loads per-day CSVs to cover it, so a
+// 14 d request really does read 15 files — see beam_history() in app.py.
+const beamRangeHours = () => {
+  const el = document.getElementById("beam-range");
+  return el ? el.value : "6";
+};
+
 async function beamRenderPlot() {
   if (typeof Plotly === "undefined") return;
   let h;
-  try { h = await (await fetch("/beam/history?hours=6&max_points=3000")).json(); } catch (e) { return; }
+  try { h = await (await fetch(`/beam/history?hours=${beamRangeHours()}&max_points=3000`)).json(); }
+  catch (e) { return; }
   if (!h || !h.success) return;
   const axis = { gridcolor: '#242e39', zerolinecolor: '#38434f', linecolor: '#38434f' };
   const win = h.delivery_window_min || 10;
@@ -2358,6 +2380,12 @@ async function beamRenderPlot() {
 // (re)render when a tab showing a beam plot is shown.
 ["#beam", "#overview"].forEach(sel =>
   document.querySelector(`a[href="${sel}"]`).addEventListener("shown.bs.tab", beamRenderPlot));
+
+// Range picker: redraw immediately rather than waiting for the refresh timer.
+(() => {
+  const el = document.getElementById("beam-range");
+  if (el) el.addEventListener("change", beamRenderPlot);
+})();
 
 // Refresh the history plot on a timer, but only while a tab that shows it is visible.
 setInterval(() => {
@@ -2519,10 +2547,16 @@ function spsRenderProfile() {
   }, SPS_CFG);
 }
 
+const spsRangeHours = () => {
+  const el = document.getElementById("sps-range");
+  return el ? el.value : "6";
+};
+
 async function spsRenderTrend() {
   if (typeof Plotly === "undefined") return;
   let h;
-  try { h = await (await fetch("/sps/history?hours=6&max_points=3000")).json(); } catch (e) { return; }
+  try { h = await (await fetch(`/sps/history?hours=${spsRangeHours()}&max_points=3000`)).json(); }
+  catch (e) { return; }
   if (!h || !h.success || !document.getElementById("sps-trend-plot")) return;
   const traces = [
     { x: h.time, y: h.extracted, name: "Extracted / cycle", type: "scatter",
@@ -2653,6 +2687,8 @@ function spsRenderAll() {
   const tab = document.querySelector('a[href="#beam2"]');
   if (tab) tab.addEventListener("shown.bs.tab",
     () => spsUpdateStatus().then(() => { spsRenderAll(); spsRenderTax(); }));
+  const range = document.getElementById("sps-range");
+  if (range) range.addEventListener("change", spsRenderTrend);
 })();
 
 // Only poll while the tab is visible — the state file carries a ~130 kB timeline.

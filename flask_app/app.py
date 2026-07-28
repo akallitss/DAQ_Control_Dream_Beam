@@ -1520,7 +1520,13 @@ def beam_history():
         files = sorted(glob.glob(os.path.join(BEAM_LOG_DIR, "beam_intensity_*.csv")))
         if not files:
             return jsonify({"success": True, "time": [], "intensity": [], "unit": BEAM_UNIT})
-        df = pd.concat([pd.read_csv(f) for f in files[-2:]], ignore_index=True)
+        # Load enough per-day files to cover `hours`. This was a flat files[-2:],
+        # which silently capped EVERY request at ~2 days however large `hours`
+        # was: a 336 h request returned 07-27..07-28 and looked exactly like an
+        # archive that simply stopped there. The +2 covers the partial day at
+        # each end and gives the rolling window its left-edge context.
+        keep = max(2, int(hours // 24) + 2)
+        df = pd.concat([pd.read_csv(f) for f in files[-keep:]], ignore_index=True)
         df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
         df = df.dropna(subset=["timestamp"])
         # Early watcher versions could re-log the lookback window on restart:
@@ -1635,7 +1641,10 @@ def sps_history():
         files = sorted(glob.glob(os.path.join(SPS_LOG_DIR, "sps_spill_*.csv")))
         if not files:
             return jsonify(empty)
-        df = pd.concat([pd.read_csv(f) for f in files[-2:]], ignore_index=True)
+        # See the note in beam_history(): a flat files[-2:] capped every request
+        # at ~2 days regardless of `hours`.
+        keep = max(2, int(hours // 24) + 2)
+        df = pd.concat([pd.read_csv(f) for f in files[-keep:]], ignore_index=True)
         df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
         df = df.dropna(subset=["timestamp"])
         df = df.sort_values("timestamp").drop_duplicates(subset=["timestamp"])

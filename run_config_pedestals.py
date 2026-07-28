@@ -100,17 +100,23 @@ class Config(RunConfigBase):
         # Seconds to wait after the HV ramp completes, before starting the DAQ,
         # to let the detectors settle. Bump this if pedestals look unstable.
         ped_settle_time = 30
+        # Excluded detectors are listed at 0 V rather than omitted. set_hvs()
+        # treats v0 == 0 as "power the channel off", so this actively de-energises
+        # a station that has been pulled out; omitting it would leave its channels
+        # at whatever the previous run left them. That is exactly what happened on
+        # 2026-07-27: P2_IN was removed from the beam line while 8:0/8:1 sat
+        # powered at 200 V from the 14:27 pedestal run, because the old version of
+        # this loop simply skipped non-included detectors.
         ped_hvs = {}
         for det in self.detectors:
-            if det['name'] not in self.included_detectors:
-                continue
             if str(det.get('det_type', '')).startswith('scintillator'):
                 continue  # PMTs: no HV needed for pedestals
             hv_channels = det.get('hv_channels')
             if not isinstance(hv_channels, dict):
                 continue  # detectors with no CAEN HV
+            volts = ped_voltage if det['name'] in self.included_detectors else 0
             for slot, channel in hv_channels.values():
-                ped_hvs.setdefault(str(slot), {})[str(channel)] = ped_voltage
+                ped_hvs.setdefault(str(slot), {})[str(channel)] = volts
 
         self.sub_runs = [
             {

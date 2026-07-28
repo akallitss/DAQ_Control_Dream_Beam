@@ -184,7 +184,8 @@ if RUN_PLAN in ('mesh_scan', 'drift_then_mesh'):
 # Structure: BEAM_SCAN_NOMINAL_SUBRUNS sub-runs at the operating point (the
 # primary physics dataset), then BEAM_SCAN_POINTS points stepping every P2
 # detector's mesh DOWN by BEAM_SCAN_MESH_STEP_V, drift following so each
-# detector's own drift gap stays constant (P2_IN 210 V, P2_MID/P2_OUT 250 V).
+# detector's own drift gap stays constant (300 V on all three P2 stations since
+# the 2026-07-27 move to a uniform 450 mesh / 750 drift point).
 #
 # Downward only: drift is already at its 700 V maximum at the operating point,
 # so holding the gap constant while raising mesh is not possible.
@@ -199,9 +200,14 @@ if RUN_PLAN in ('mesh_scan', 'drift_then_mesh'):
 BEAM_HV_SCAN = (os.environ.get('DAQ_BEAM_HV_SCAN', '0') == '1'
                 or RUN_PLAN in ('mesh_scan', 'drift_then_mesh'))
 # Detectors whose mesh AND drift step together (gap held constant → isolates gain).
-# P2_IN is deliberately excluded — it is parked off (0 V), has no gain to scan, and
-# stepping its 0 V setpoint down would go negative and fail the range assert.
-BEAM_SCAN_DETS = ('P2_IN', 'P2_MID', 'P2_OUT')  # all three step DOWN (safe: P2_IN 400->lower stays < its 490 mesh / 700 drift max)
+# P2_IN was excluded on 2026-07-27 because it was parked at 0 V and stepping a
+# 0 V setpoint DOWN goes negative and fails the range assert. It is back in the
+# beam line and back at 750/450 as of 2026-07-28, so that blocker is gone — but
+# the scan set is left at MID+OUT deliberately, to keep new scans comparable with
+# the 2026-07-26/27 series that defined them. P2_IN simply sits at its operating
+# point and is read out throughout. Add 'P2_IN' here to scan all three together
+# (safe: it steps DOWN from 450/750, well under its 450 mesh / 900 drift maxima).
+BEAM_SCAN_DETS = ('P2_MID', 'P2_OUT')  # step together (safe: lower always stays under the mesh/drift maxima)
 # Env-overridable so a finer or continuation gain scan needs no code edit, e.g.
 # DAQ_MESH_STEP_V=5 DAQ_MESH_POINTS=12 DAQ_MESH_SUBRUN_MIN=10 DAQ_MESH_NOMINAL=1
 # gives a 5 V scan 450..390 (13 mesh points incl. the nominal) at 10 min each.
@@ -222,8 +228,8 @@ BEAM_SCAN_SUBRUN_MIN = int(os.environ.get('DAQ_MESH_SUBRUN_MIN', '20'))     # mi
 # efficiency-vs-drift curve rises out of zero and flattens onto its plateau. On
 # 2026-07-24 (Alexandra) the P2 drift ceiling was opened to 900 V (MAX_HV) for
 # this. Mesh stays at last run's operating value (P2_MID/P2_OUT 450). Only
-# BEAM_DRIFT_SCAN_DETS move; the two uRWELL references stay fixed at 600/420 as
-# the tracking telescope, and P2_IN stays parked off.
+# BEAM_DRIFT_SCAN_DETS move; the two uRWELL references stay fixed as the tracking
+# telescope, and P2_IN holds at its operating point (it is read out, not scanned).
 # Default 10 points 450..900 in 50 V steps, 10 min each (~100 min DAQ) — sized to
 # the 2.5 h beam window of 2026-07-24.
 BEAM_DRIFT_SCAN = (os.environ.get('DAQ_BEAM_DRIFT_SCAN', '0') == '1'
@@ -281,7 +287,10 @@ BEAM_2D_SCAN = (os.environ.get('DAQ_BEAM_2D_SCAN', '0') == '1'
 # BEAM_DRIFT_SCAN_DETS any more — the 1D drift scan keeps its own committed set.
 # Both axes move only these detectors; the uRWELL references stay fixed at
 # 600/420 as the tracking telescope.
-BEAM_2D_SCAN_DETS = ('P2_IN', 'P2_MID', 'P2_OUT')
+# P2_IN dropped 2026-07-27 (removed from the beam line, parked at 0 V). It is
+# back in and back at 750/450 as of 2026-07-28; the 2D set is left at MID+OUT so
+# a repeat grid matches drift_mesh_2d_2. Re-add 'P2_IN' to map all three.
+BEAM_2D_SCAN_DETS = ('P2_MID', 'P2_OUT')
 BEAM_2D_DRIFT_START_V = int(os.environ.get('DAQ_2D_DRIFT_START_V', '450'))  # first drift point (450 = drift-mesh, zero field)
 BEAM_2D_DRIFT_STEP_V  = int(os.environ.get('DAQ_2D_DRIFT_STEP_V',  '50'))   # V per outer point, stepping UP
 BEAM_2D_DRIFT_POINTS  = int(os.environ.get('DAQ_2D_DRIFT_POINTS',  '5'))    # default 450, 500, 550, 600, 650
@@ -331,14 +340,46 @@ POST_SUBRUN_PAUSE_MIN = 0   # optional pause AFTER each sub-run (minutes); 0 = n
 # unsafe on P2_OUT: 440 V mesh exceeds its 420 V maximum.
 # ---------------------------------------------------------------------------
 OPERATING_HV = {
-    'P2_IN':  {'drift': 700, 'mesh': 450},   # gap = 250 V. 2026-07-25: uniform P2
-                                             # operating point (450/700) with MID/OUT
-                                             # for the high-stat run. Above yesterday's
-                                             # 430 mesh — watch its current.
-    'P2_MID': {'drift': 700, 'mesh': 450},   # gap = 250 V; drift scanned up to 900
-    'P2_OUT': {'drift': 700, 'mesh': 450},   # gap = 250 V; drift scanned up to 900
-    'EIC_uRWELL_front': {'drift': 600, 'resist': 420},   # uRWELL-inter
-    'EIC_uRWELL_back':  {'drift': 600, 'resist': 420},   # uRWELL-strip
+    # 2026-07-27 (Alexandra): P2 nominal drift 700 -> 750 (gap 250 -> 300 V) and
+    # uRWELL drift 600 -> 620 for the long efficiency run — informed by the
+    # overnight 2D drift x mesh map (drift_mesh_2d_2). All held at mesh 450.
+    # P2_IN was removed from the beam line 2026-07-27 ~15:00 and parked at 0 V;
+    # REINSTATED 2026-07-28 (Alexandra) at the same 750/450 point as MID/OUT, so
+    # all three P2 stations share one operating point again. Both this entry and
+    # included_detectors below matter, and independently: _operating_hvs() walks
+    # DET_HV, NOT included_detectors, so a station left at 0 here would be read
+    # out dark (zero hits, no error) even though its FEU is in the .cfg.
+    # P2_IN has not been powered since it came out — watch 8:0/8:1 current on the
+    # first ramp (the 8:1 mesh channel current-limited at ~146 V on 2026-07-26
+    # before it was repaired), and park it back at 0 V here if it draws or trips.
+    # 2026-07-28 (Alexandra): the chamber in the P2_IN position is a NEW
+    # metallic-mesh Micromegas, not the repaired CERN bulk. Same strip mapping
+    # and same HV connector mapping, so DET_HV and the FEU-3 cabling below are
+    # unchanged. It was parked at 0 while uncharacterised; MEASURED 2026-07-28 by
+    # p2in_hvrange_1 (200-370 V) + p2in_hvrange_2 (350-450 V), 17 points total.
+    #
+    # Efficiency (fraction of triggers with a P2_IN hit, P2_MID at nominal as the
+    # reference plateau = 95.1%):
+    #   400 V 63.9% | 410 V 76.2% | 420 V 84.9% | 430 V 90.3% | 440 V 93.2% |
+    #   450 V 94.9%  — i.e. 450 V matches P2_MID's 95.1% to within 0.2%.
+    #
+    # 440 rather than 450: 440 already reaches 98% of the plateau, and the mesh
+    # micro-discharge RATE (samples >0.3 uA in ~8.5 min) triples per 10 V —
+    # 420:1, 430:3, 440:6, 450:17. So the last 1.6% of efficiency costs 3x the
+    # discharge rate. Nothing tripped at any point and the spark amplitude did
+    # NOT grow from 440 to 450 (max 1.48 vs 1.09 uA), so 450 is viable if the
+    # extra efficiency is ever wanted — this is a margin choice on a new chamber,
+    # not a limit. 440 also keeps 10 V of headroom under the 450 V mesh ceiling.
+    #
+    # Drift 740 = gap 300 V, INHERITED from P2_MID/P2_OUT and NOT yet verified
+    # for this chamber — the whole scan held the gap at 300. The drift scan that
+    # would test it (quick_scripts/make_p2in_drift_gui_config.py, staged) did not
+    # fit in the 2026-07-28 morning window. Treat the gap as provisional.
+    'P2_IN':  {'drift': 740, 'mesh': 440},   # gap = 300 V (mesh measured; gap provisional)
+    'P2_MID': {'drift': 750, 'mesh': 450},   # gap = 300 V
+    'P2_OUT': {'drift': 750, 'mesh': 450},   # gap = 300 V
+    'EIC_uRWELL_front': {'drift': 620, 'resist': 420},   # uRWELL-inter
+    'EIC_uRWELL_back':  {'drift': 620, 'resist': 420},   # uRWELL-strip
 }
 
 # Maximum safe voltage per detector/role. Asserted against OPERATING_HV at
@@ -366,8 +407,11 @@ MAX_HV = {
                                              # drift 700 -> 900 (Alexandra 2026-07-25)
     'P2_MID': {'drift': 900, 'mesh': 450},   # mesh ceiling lowered 510 -> 450 (Alexandra 2026-07-24)
     'P2_OUT': {'drift': 900, 'mesh': 450},
-    'EIC_uRWELL_front': {'drift': 600, 'resist': 420},
-    'EIC_uRWELL_back':  {'drift': 600, 'resist': 420},
+    # uRWELL drift ceiling 600 -> 620 on 2026-07-27 (Alexandra), for the new
+    # 620 V operating point. Crate SVMax on 8:6/8:7 is 1000, so the crate does
+    # not clamp it. First time above 600 — watch both drift currents on the ramp.
+    'EIC_uRWELL_front': {'drift': 620, 'resist': 420},
+    'EIC_uRWELL_back':  {'drift': 620, 'resist': 420},
 }
 # ---------------------------------------------------------------------------
 # P2_IN alive-check (DAQ_P2IN_CHECK=1): a short fixed-HV run to confirm the
@@ -862,18 +906,23 @@ class Config(RunConfigBase):
             'board_thickness': 5,  # mm  Thickness of PCB for test boards  Guess!
         }
 
-        # P2_IN dropped from the readout 2026-07-24 (Alexandra) — under
-        # investigation. It stays CABLED (its detector dict below is unchanged,
-        # cfg Feu 3), so re-including it later needs only this list; its HV is
-        # parked off in OPERATING_HV. Excluding it here drops FEU 3 from the .cfg
-        # (get_active_feu_connectors → included_feus), cutting the readout to
-        # FEUs 1/4/5. The external TCM trigger has no trigger_feu, so losing
-        # FEU 3 does not touch the trigger/sync chain.
+        # Which detectors are read out. This list drives the .cfg FEU set
+        # (get_active_feu_connectors -> included_feus), so dropping a station
+        # here drops its FEU from the readout entirely. The external TCM trigger
+        # has no trigger_feu, so adding or removing FEU 3 (P2_IN) does not touch
+        # the trigger/sync chain. run_config_pedestals.py imports this list too:
+        # included detectors get the 200 V pedestal bias, excluded ones get 0 V.
         if P2IN_CHECK:
             # Alive-check: read out P2_IN + the two uRWELL references only.
             self.included_detectors = ['EIC_uRWELL_front', 'P2_IN', 'EIC_uRWELL_back']
         else:
-            # Full 5-plane telescope — P2_IN reinstated 2026-07-24.
+            # Full 5-plane telescope: the two uRWELL references plus all three P2
+            # stations. P2_IN was out of the readout 2026-07-24 (under
+            # investigation) and physically out of the beam line 2026-07-27
+            # ~15:00; REINSTATED 2026-07-28 (Alexandra), so FEU 3 is back and the
+            # readout is FEUs 1/3/4/5. Its HV is restored to 750/450 in
+            # OPERATING_HV above — both edits are required, and pedestals must be
+            # retaken now that FEU 3 is back in the readout.
             self.included_detectors = ['EIC_uRWELL_front', 'P2_IN', 'P2_MID',
                                        'P2_OUT', 'EIC_uRWELL_back']
 
@@ -884,10 +933,13 @@ class Config(RunConfigBase):
         #   cfg Feu 4 = Id 102 (.114) -> P2_MID
         #   cfg Feu 5 = Id 103 (.115) -> P2_OUT
         # P2: four connectors, each a bot/top Dream pair filling FEU Dream conn
-        # 1-8 IN ORDER; all rotated_inverted. MID/OUT are cabled on connectors
-        # 4-7; P2_IN is on 4,5,6,8 (connector 8 in place of 7, confirmed
-        # 2026-07-24). The Dream-channel assignment is by index, so which physical
-        # connector sits on which readout channel is correct for each.
+        # 1-8 IN ORDER; all rotated_inverted. All three stations are cabled on
+        # connectors 4-7: P2_IN was recabled 4,5,6,8 -> 4,5,6,7 sequential on
+        # 2026-07-26 (Alexandra), retiring the connector-8 workaround of
+        # 2026-07-24. Retake pedestals after this change — the previous set was
+        # taken with FEU 3 conn 8 active and conn 7 dark. The Dream-channel
+        # assignment is by index, so which physical connector sits on which
+        # readout channel is correct for each.
         def _p2_dream_feus(feu, conns=(4, 5, 6, 7)):
             return {
                 f'c_{conn}_{pos}': (feu, 2 * i + (1 if pos == 'bot' else 2))
@@ -943,8 +995,8 @@ class Config(RunConfigBase):
                 'det_center_coords': {'x': 0, 'y': 0, 'z': DET_Z_MM['P2_IN']},
                 'det_orientation': {'x': 0, 'y': 0, 'z': 0},
                 'hv_channels': DET_HV['P2_IN'],
-                'dream_feus': _p2_dream_feus(3, (4, 5, 6, 8)),
-                'dream_feu_orientation': _p2_orientation((4, 5, 6, 8)),
+                'dream_feus': _p2_dream_feus(3),
+                'dream_feu_orientation': _p2_orientation(),
             },
             {
                 'name': 'P2_MID',

@@ -121,6 +121,11 @@ def run_watcher(config: dict):
     exclude_runs = set(config['exclude_runs']) if config.get('exclude_runs') else set()
 
     poll_interval  = config.get('poll_interval',  10)
+    # Wait for daq_control's .subrun_complete marker before processing a sub-run,
+    # instead of trusting the .fdf size-stability heuristic (see _scan_once).
+    # Costs one sub-run of latency; prevents silently truncated decodes.
+    require_subrun_complete = config.get('require_subrun_complete', True)
+    subrun_complete_grace_s = config.get('subrun_complete_grace_s', 30)
     stale_run_days = config.get('stale_run_days',  4)
     free_threads   = config.get('free_threads',    2)
     n_threads      = max(1, (os.cpu_count() or 1) - free_threads)
@@ -134,6 +139,7 @@ def run_watcher(config: dict):
         print(f"[watcher] exclude_runs  : {sorted(exclude_runs)}")
     print(f"[watcher] pipeline      : decode={do_decode}  analyze={do_analyze}  combine={do_combine}")
     print(f"[watcher] threads       : {n_threads}  poll={poll_interval}s  stale_after={stale_run_days}d")
+    print(f"[watcher] subrun gate   : require_subrun_complete={require_subrun_complete}")
     print(f"[watcher] pedestal      : loc={pedestal_loc}  base={pedestal_base_dir or '(same as raw)'}")
 
     checked_stale_runs: set = set()
@@ -180,6 +186,33 @@ def run_watcher(config: dict):
                 raw_dir = subrun_dir / raw_inner
                 if not raw_dir.exists():
                     continue
+
+                # Only process a sub-run once daq_control has marked it finished.
+                #
+                # The size-stability test below ("same .fdf sizes on two
+                # consecutive polls") is NOT a completion test: the DREAM DAQ
+                # buffers and flushes each .fdf in large, irregular bursts, so a
+                # file that is still being written sits at a constant size for
+                # minutes at a time. Two polls 10 s apart then look identical and
+                # the file_num is decoded early — and because
+                # _get_processed_file_nums() marks it done, it is never revisited.
+                # Measured on eff_drift_ab_1/ab_00_d750 (2026-07-27): decoded at
+                # 15:49 with 535 k events out of the 2.2 M the 19-min sub-run
+                # eventually held — 25 % of the data, silently.
+                # This bites hardest at low beam rate, where the flush gaps are
+                # longest relative to poll_interval.
+                # daq_control writes the marker a few seconds BEFORE the DAQ's
+                # final .fdf flush lands (measured: marker 16:03:04, last .fdf
+                # write 16:03:11), so also require the marker to have aged past
+                # subrun_complete_grace_s. The size-stability test below would
+                # very likely catch this anyway; this makes it not depend on
+                # flush timing at all.
+                if require_subrun_complete:
+                    marker = subrun_dir / '.subrun_complete'
+                    if not marker.exists():
+                        continue
+                    if time.time() - marker.stat().st_mtime < subrun_complete_grace_s:
+                        continue
 
                 ped_dir = _resolve_pedestal_dir(raw_dir, pedestal_loc, pedestal_base_dir)
 

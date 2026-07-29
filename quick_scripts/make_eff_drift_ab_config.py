@@ -69,7 +69,12 @@ config.run_name = RUN_NAME
 config.run_out_dir = f'{config.data_out_dir}{RUN_NAME}/'
 config.processor_info['run_dir'] = config.run_out_dir
 config.hv_info['run_out_dir'] = config.run_out_dir
-config.dream_daq_info['run_directory'] = config.run_out_dir
+# RunCtrl's own fdf staging dir, NOT run_out_dir: pointing it at the run
+# output tree makes the DAQ write its fdfs loose in each subrun while
+# copy_on_fly writes a second copy into raw_daq_data/ — a full duplicate
+# that the Disk Space tab cannot attribute to a component or reclaim.
+# Same re-derivation as run_config_beam.py:1103.
+config.dream_daq_info['run_directory'] = f'{config.base_out_dir}dream_run/{RUN_NAME}/'
 config.dream_daq_info['data_out_dir'] = config.run_out_dir
 config.power_off_hv_at_end = True
 config.resume = False

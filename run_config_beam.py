@@ -916,15 +916,28 @@ class Config(RunConfigBase):
             # Alive-check: read out P2_IN + the two uRWELL references only.
             self.included_detectors = ['EIC_uRWELL_front', 'P2_IN', 'EIC_uRWELL_back']
         else:
-            # Full 5-plane telescope: the two uRWELL references plus all three P2
-            # stations. P2_IN was out of the readout 2026-07-24 (under
-            # investigation) and physically out of the beam line 2026-07-27
-            # ~15:00; REINSTATED 2026-07-28 (Alexandra), so FEU 3 is back and the
-            # readout is FEUs 1/3/4/5. Its HV is restored to 750/450 in
-            # OPERATING_HV above — both edits are required, and pedestals must be
-            # retaken now that FEU 3 is back in the readout.
-            self.included_detectors = ['EIC_uRWELL_front', 'P2_IN', 'P2_MID',
-                                       'P2_OUT', 'EIC_uRWELL_back']
+            # uRWELL references ONLY — readout is cfg FEU 1 (Id 68).
+            #
+            # 2026-07-30 (Alexandra): the three P2 stations were recabled onto the
+            # VMM DAQ, so their DREAM FEUs (3/4/5 = Ids 101/102/103) now sit on
+            # disconnected connectors. Left in, each wrote ~430 MB/min of empty
+            # events (measured on run_21: 4 FDFs, 3 of them dead weight).
+            # Dropping the names here removes those FEUs from included_feus and
+            # so from the .cfg readout; set_active_feus comments them out and
+            # they keep PdFile/ZsFile None, so the existing pedestal set stays
+            # valid for FEU 1.
+            #
+            # Their HV is deliberately UNAFFECTED and still ramped by this DAQ:
+            # _operating_hvs() walks DET_HV, not this list. The CAEN crate is on
+            # banco's DAQ LAN, so banco must keep biasing the stations that the
+            # VMM DAQ reads out.
+            #
+            # History: P2_IN was out of the readout 2026-07-24 (under
+            # investigation), physically out of the beam line 2026-07-27 ~15:00,
+            # REINSTATED 2026-07-28 (Alexandra) making the readout FEUs 1/3/4/5,
+            # until this recabling. If a station is ever cabled back to DREAM,
+            # restore its name here AND retake pedestals — the FEU set changes.
+            self.included_detectors = ['EIC_uRWELL_front', 'EIC_uRWELL_back']
 
         # Cabling confirmed at the beam 2026-07-22 (Alexandra). Cfg FEU numbers
         # are TCM input ports; Id/IP from RackTcm.cfg:

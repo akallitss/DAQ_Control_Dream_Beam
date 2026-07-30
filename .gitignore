@@ -222,6 +222,9 @@ config/processor_config.json
 config/qa_config.json
 config/gui_run_config.json
 config/json_run_configs/
+# Shared secret + HV ceilings for the VMM DAQ's combined-run trigger routes
+# (flask_app/vmm_trigger.py). Contains a token — never commit it.
+config/vmm_trigger.json
 
 # Runtime state written by the GUI / watchers — machine-specific, never shared
 # (logs/*.log is covered by the *.log rule above; these are the JSON siblings,
@@ -243,3 +246,9 @@ flask_app/local/
 
 # Runtime state: P2_IN mesh operating point, written by quick_scripts/chain_p2in_drift.py
 .p2in_mesh_op
+
+# Timestamped hand-backups taken before live edits on the DAQ machine
+# (e.g. stop_dream.sh.bak-hidepid-260730). Local safety nets, never shared.
+*.bak-*
+# Stop-request flag dropped by bash_scripts/stop_run.sh; runtime state.
+.stop_run

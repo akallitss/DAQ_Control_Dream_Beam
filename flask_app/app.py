@@ -2140,5 +2140,20 @@ def is_dream_daq_running():
     # return saw_start and not saw_complete
 
 
+# ---------------------------------------------------------------------------
+# Combined VMM + Dream runs: /vmm_trigger/start and /vmm_trigger/stop, so the
+# VMM DAQ (dedippce185) can fire a paired Dream run under the same run name and
+# hand over the per-subrun P2-basket HV schedule. Purely additive and passive —
+# both routes are token- and IP-guarded by gitignored config/vmm_trigger.json,
+# and nothing here runs unless that route is called. Dream's own GUI, DAQ and
+# standalone runs are untouched. Source of truth for the module lives in the VMM
+# repo (docs/dream_side/vmm_trigger.py); re-copy it after any edit there.
+# MUST stay above the __main__ block below — code after socketio.run() would not
+# execute until the server shuts down, so the routes would never register.
+import vmm_trigger
+vmm_trigger.register(app, BASE_DIR, CONFIG_RUN_DIR, BASH_DIR,
+                     VENV_PYTHON, _save_current_run)
+
+
 if __name__ == "__main__":
     socketio.run(app, host="0.0.0.0", port=5001)

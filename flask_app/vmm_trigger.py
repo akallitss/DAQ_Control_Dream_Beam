@@ -204,6 +204,21 @@ def register(app, base_dir, config_run_dir, bash_dir, venv_python,
 
         _retarget_run_name(run_cfg, run_name)
         run_cfg['triggered_by'] = f'vmm_daq@{request.remote_addr}'
+
+        # Optional HV hold across a SEQUENCE of runs. A chip-configuration scan
+        # changes only the config file, so powering the crate down and ramping
+        # back up between every run costs ~4 min each and cycles the detectors
+        # needlessly. The VMM side can ask for the crate to stay biased.
+        #
+        # Default UNCHANGED (Dream own config, normally True): only an explicit
+        # false holds HV on, and the caller is then responsible for the LAST run
+        # of its sequence powering off. Logged either way, so a crate left
+        # biased is always traceable to a request.
+        if 'power_off_hv_at_end' in data:
+            run_cfg['power_off_hv_at_end'] = bool(data['power_off_hv_at_end'])
+            if not run_cfg['power_off_hv_at_end']:
+                print(f'[vmm_trigger] {run_name}: HV HOLD requested - crate '
+                      f'stays biased at the end of this run')
         run_cfg['sub_runs'] = [
             {**template_sr,
              'sub_run_name': sr.get('sub_run_name', f'sub_run_{i}'),
